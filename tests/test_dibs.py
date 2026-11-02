@@ -193,6 +193,23 @@ def test_wrong_holder_and_stale_epoch_fail(tmp_path):
         registry.release("task-one", "agent-a", granted.token, "1", at(1))
 
 
+def test_epoch_mismatch_message_names_both_epochs_and_never_says_stale(tmp_path):
+    registry = make_registry(tmp_path)
+    registry.offer("task-one", "a synthetic task", T0)
+    granted = registry.claim("task-one", "agent-a", 60, at(0))
+    with pytest.raises(RefusalError) as caught:
+        registry.release("task-one", "agent-a", granted.token, 7, at(1))
+    message = str(caught.value)
+    assert "does not match the standing epoch 1" in message
+    assert "7" in message
+    assert "stale" not in message
+    with pytest.raises(RefusalError) as caught:
+        registry.renew("task-one", "agent-a", granted.token, "1", 30, at(1))
+    message = str(caught.value)
+    assert "does not match the standing epoch 1" in message
+    assert "stale" not in message
+
+
 def test_the_registry_stores_only_the_token_hash(tmp_path):
     registry = make_registry(tmp_path)
     registry.offer("task-one", "a synthetic task", T0)
@@ -332,6 +349,52 @@ def test_invalid_times_to_live_are_refused(tmp_path, bad_ttl):
         registry.renew("task-one", "agent-a", granted.token, 1, bad_ttl, at(1))
 
 
+def test_ttl_ceiling_is_the_contract_number_and_is_enforced(tmp_path):
+    assert core.TTL_MAX == 31536000
+    registry = make_registry(tmp_path)
+    registry.offer("task-one", "a synthetic task", T0)
+    granted = registry.claim("task-one", "agent-a", core.TTL_MAX, T0)
+    assert granted.expires_at == T0 + timedelta(seconds=core.TTL_MAX)
+    with pytest.raises(InvalidTtlError):
+        registry.claim("task-one", "agent-b", core.TTL_MAX + 1, at(1))
+    with pytest.raises(InvalidTtlError):
+        registry.renew(
+            "task-one", "agent-a", granted.token, 1, core.TTL_MAX + 1, at(1)
+        )
+
+
+@pytest.mark.parametrize("huge", [10**12, 10**18])
+def test_huge_ttl_is_refused_as_a_typed_error(tmp_path, huge):
+    registry = make_registry(tmp_path)
+    registry.offer("task-one", "a synthetic task", T0)
+    with pytest.raises(InvalidTtlError):
+        registry.claim("task-one", "agent-a", huge, T0)
+    granted = registry.claim("task-one", "agent-a", 60, T0)
+    with pytest.raises(InvalidTtlError):
+        registry.renew("task-one", "agent-a", granted.token, 1, huge, at(1))
+
+
+def test_repeated_renewals_end_in_a_typed_error_at_the_representable_edge(tmp_path):
+    start = datetime(9999, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    path = tmp_path / "registry.json"
+    registry = Registry(path)
+    registry.offer("task-one", "a synthetic task", start)
+    granted = registry.claim("task-one", "agent-a", 8640000, start)
+    renewals = 0
+    with pytest.raises(InvalidTtlError):
+        while True:
+            registry.renew("task-one", "agent-a", granted.token, 1, 8640000, start)
+            renewals += 1
+            assert renewals < 10
+    assert renewals == 2
+    before = path.read_bytes()
+    with pytest.raises(InvalidTtlError):
+        registry.renew("task-one", "agent-a", granted.token, 1, 8640000, start)
+    assert path.read_bytes() == before
+    kinds = [event["kind"] for event in registry.history("task-one")]
+    assert kinds == ["offered", "claimed", "renewed", "renewed"]
+
+
 def test_note_bound_is_enforced_at_the_bound(tmp_path):
     registry = make_registry(tmp_path)
     registry.offer("task-one", "n" * 200, T0)
@@ -445,6 +508,8 @@ def test_damage_wrong_types(tmp_path):
         lambda doc: doc["items"][0].update(expires_at=99),
         lambda doc: doc["items"][0].update(expires_at="not an instant"),
         lambda doc: doc["items"][0].update(expires_at="2031-05-04T12:00:00"),
+        lambda doc: doc["items"][0].update(status=[]),
+        lambda doc: doc["history"][0].update(kind={}),
         lambda doc: doc["history"][0].update(seq="1"),
     ]
     for index, change in enumerate(cases):
@@ -501,6 +566,18 @@ def test_damage_truncated_and_empty_documents(tmp_path):
     assert_corrupt_and_unchanged(empty_dir, "")
     list_dir = fresh_valid_dir(tmp_path, "list-case")
     assert_corrupt_and_unchanged(list_dir, "[1, 2, 3]")
+
+
+def test_damage_event_holder_name_message_names_the_event(tmp_path):
+    directory, text = mutated(
+        tmp_path, "case", lambda doc: doc["history"][1].update(holder="Bad Name")
+    )
+    path = directory / "registry.json"
+    path.write_text(text, encoding="utf-8")
+    registry = Registry(path)
+    with pytest.raises(CorruptRegistryError) as caught:
+        registry.board(at(1))
+    assert "a history event holds an invalid holder id" in str(caught.value)
 
 
 def test_registry_survives_a_reopen_between_operations(tmp_path):
@@ -659,6 +736,19 @@ def test_cli_surface_carries_no_time_override_flag(tmp_path):
     assert "--at" not in help_text
     path = str(tmp_path / "registry.json")
     run_cli("--registry", path, "offer", "task-one", "--now", "2031-01-01", expect=2)
+
+
+def test_cli_huge_ttl_prints_one_error_line_and_no_traceback(tmp_path):
+    path = str(tmp_path / "registry.json")
+    run_cli("--registry", path, "offer", "task-one")
+    result = run_cli(
+        "--registry", path, "claim", "task-one", "--holder", "agent-a",
+        "--ttl", "1000000000000000000", expect=2,
+    )
+    assert result.stderr.startswith("error: ")
+    assert "Traceback" not in result.stderr
+    assert result.stderr.count("\n") == 1
+    assert result.stdout == ""
 
 
 def test_cli_completed_item_leaves_the_board_but_keeps_its_history(tmp_path):
