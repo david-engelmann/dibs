@@ -64,7 +64,7 @@ def test_offer_claim_release_round_trip(tmp_path):
             "note": "a synthetic task",
             "status": "claimed",
             "holder": "agent-a",
-            "expires_at": core._format_instant(at(61)),
+            "expires_at": core.format_instant(at(61)),
             "epoch": 1,
         }
     ]
@@ -630,7 +630,7 @@ def race_claims(tmp_path, mode, count):
                     mode,
                     str(index),
                     str(registry_path),
-                    core._format_instant(at(10)),
+                    core.format_instant(at(10)),
                     str(result_path),
                 ]
             )

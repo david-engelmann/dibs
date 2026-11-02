@@ -161,9 +161,6 @@ def format_instant(moment):
     return moment.astimezone(timezone.utc).isoformat()
 
 
-_format_instant = format_instant
-
-
 def _parse_instant(text, corrupt):
     if not isinstance(text, str):
         raise corrupt(f"an instant field holds {text!r} instead of text")
