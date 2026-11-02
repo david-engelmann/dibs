@@ -99,12 +99,12 @@ def main(argv=None):
             granted = registry.claim(args.item, args.holder, args.ttl, _now())
             print(f"token {granted.token}")
             print(f"epoch {granted.epoch}")
-            print(f"expires_at {core._format_instant(granted.expires_at)}")
+            print(f"expires_at {core.format_instant(granted.expires_at)}")
         elif args.command == "renew":
             expires = registry.renew(
                 args.item, args.holder, args.token, args.epoch, args.ttl, _now()
             )
-            print(f"expires_at {core._format_instant(expires)}")
+            print(f"expires_at {core.format_instant(expires)}")
         elif args.command == "release":
             registry.release(args.item, args.holder, args.token, args.epoch, _now())
             print(f"released {args.item}")

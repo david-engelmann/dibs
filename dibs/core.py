@@ -11,9 +11,11 @@ complete temporary file over the registry. Reads take a shared lock
 and open the registry fresh each time, and a reader never writes.
 
 Expiry is lazy. There is no daemon and no timer anywhere in this
-module. Every operation takes the current instant as an argument and
-evaluates expiry against it, and a lease is live at instants strictly
-before its expiry instant and expired at the expiry instant itself.
+module. Every operation that evaluates lease state takes the
+current instant as an argument and evaluates expiry against it,
+and a lease is live at instants strictly before its expiry instant
+and expired at the expiry instant itself. History returns the
+recorded events and evaluates nothing.
 
 Possession is proven by a token, not by a name. A successful claim
 returns a fresh token drawn from the secrets module, the registry
@@ -38,6 +40,7 @@ LOCK_SUFFIX = ".lock"
 NAME_MAX = 64
 NOTE_MAX = 200
 TOKEN_BYTES = 32
+TTL_MAX = 365 * 24 * 60 * 60
 
 NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -120,11 +123,22 @@ def validate_name(value, kind):
 
 
 def _validate_ttl(ttl):
-    if not _is_int(ttl) or ttl < 1:
+    if not _is_int(ttl) or ttl < 1 or ttl > TTL_MAX:
         raise InvalidTtlError(
-            f"invalid time to live {ttl!r}, use a positive integer number of seconds"
+            f"invalid time to live {ttl!r}, use a positive integer number "
+            f"of seconds, at most {TTL_MAX}"
         )
     return ttl
+
+
+def _expiry_after(moment, ttl):
+    try:
+        return moment + timedelta(seconds=ttl)
+    except OverflowError:
+        raise InvalidTtlError(
+            f"a time to live of {ttl} seconds runs past the last "
+            f"representable instant"
+        ) from None
 
 
 def _validate_now(now):
@@ -143,8 +157,11 @@ def _validate_note(note):
     return note
 
 
-def _format_instant(moment):
+def format_instant(moment):
     return moment.astimezone(timezone.utc).isoformat()
+
+
+_format_instant = format_instant
 
 
 def _parse_instant(text, corrupt):
@@ -180,27 +197,27 @@ def _corrupt(message):
     return CorruptRegistryError(f"the registry is corrupt, {message}")
 
 
-def _validate_stored_name(value, field):
+def _validate_stored_name(value, field, subject):
     if (
         not isinstance(value, str)
         or len(value) > NAME_MAX
         or not NAME_PATTERN.fullmatch(value)
     ):
-        raise _corrupt(f"an item holds an invalid {field} {value!r}")
+        raise _corrupt(f"{subject} holds an invalid {field} {value!r}")
 
 
 def _validate_item(item):
     if not isinstance(item, dict) or set(item) != ITEM_KEYS:
         raise _corrupt("an item does not carry exactly the recorded fields")
-    _validate_stored_name(item["id"], "item id")
+    _validate_stored_name(item["id"], "item id", "an item")
     if not isinstance(item["note"], str) or len(item["note"]) > NOTE_MAX:
         raise _corrupt(f"item {item['id']!r} holds an invalid note")
     status = item["status"]
-    if status not in ITEM_STATUSES:
+    if not isinstance(status, str) or status not in ITEM_STATUSES:
         raise _corrupt(f"item {item['id']!r} holds an unknown status {status!r}")
     holder = item["holder"]
     if holder is not None:
-        _validate_stored_name(holder, "holder id")
+        _validate_stored_name(holder, "holder id", "an item")
     token_hash = item["token_hash"]
     if token_hash is not None and (
         not isinstance(token_hash, str) or not SHA256_PATTERN.fullmatch(token_hash)
@@ -225,9 +242,9 @@ def _validate_event(event, position):
         raise _corrupt("a history event does not carry exactly the recorded fields")
     if not _is_int(event["seq"]) or event["seq"] != position + 1:
         raise _corrupt("the history sequence does not grow by 1 from 1 without gaps")
-    if event["kind"] not in EVENT_KINDS:
+    if not isinstance(event["kind"], str) or event["kind"] not in EVENT_KINDS:
         raise _corrupt(f"a history event holds an unknown kind {event['kind']!r}")
-    _validate_stored_name(event["item"], "item id")
+    _validate_stored_name(event["item"], "item id", "a history event")
     holder = event["holder"]
     if event["kind"] == "offered":
         if holder is not None:
@@ -235,12 +252,12 @@ def _validate_event(event, position):
     elif holder is None:
         raise _corrupt(f"a {event['kind']} event names no holder")
     else:
-        _validate_stored_name(holder, "holder id")
+        _validate_stored_name(holder, "holder id", "a history event")
     previous = event["previous_holder"]
     if event["kind"] == "taken_over":
         if previous is None:
             raise _corrupt("a taken over event names no previous holder")
-        _validate_stored_name(previous, "holder id")
+        _validate_stored_name(previous, "holder id", "a history event")
     elif previous is not None:
         raise _corrupt("an event that is not a takeover names a previous holder")
     _parse_instant(event["at"], _corrupt)
@@ -365,7 +382,7 @@ class Registry:
                 "kind": kind,
                 "item": item,
                 "holder": holder,
-                "at": _format_instant(now),
+                "at": format_instant(now),
                 "epoch": epoch,
                 "previous_holder": previous,
             }
@@ -400,7 +417,8 @@ class Registry:
             )
         if not _is_int(epoch) or epoch != item["epoch"]:
             raise RefusalError(
-                f"the epoch {epoch!r} is stale, the standing epoch is {item['epoch']}"
+                f"the epoch {epoch!r} presented for item {item['id']!r} does "
+                f"not match the standing epoch {item['epoch']}"
             )
         if not isinstance(token, str) or not hmac.compare_digest(
             _token_hash(token), item["token_hash"]
@@ -461,12 +479,12 @@ class Registry:
                 kind = "taken_over"
                 previous = item["holder"]
             token = secrets.token_urlsafe(TOKEN_BYTES)
-            expires = now + timedelta(seconds=ttl)
+            expires = _expiry_after(now, ttl)
             item["status"] = "claimed"
             item["holder"] = holder
             item["token_hash"] = _token_hash(token)
             item["epoch"] += 1
-            item["expires_at"] = _format_instant(expires)
+            item["expires_at"] = format_instant(expires)
             self._append_event(
                 document, kind, item_id, holder, now, item["epoch"], previous
             )
@@ -483,14 +501,19 @@ class Registry:
         def action(document):
             item = self._standing_lease(document, item_id, now)
             self._check_possession(item, holder, token, epoch)
-            expires = _parse_instant(item["expires_at"], _corrupt) + timedelta(
-                seconds=ttl
-            )
-            item["expires_at"] = _format_instant(expires)
+            expires = _expiry_after(_parse_instant(item["expires_at"], _corrupt), ttl)
+            item["expires_at"] = format_instant(expires)
             self._append_event(document, "renewed", item_id, holder, now, item["epoch"])
             return expires
 
         return self._mutate(now, action)
+
+    @staticmethod
+    def _end_lease(item, status):
+        item["status"] = status
+        item["holder"] = None
+        item["token_hash"] = None
+        item["expires_at"] = None
 
     def release(self, item_id, holder, token, epoch, now):
         """End the standing lease early and return the item to open."""
@@ -500,10 +523,7 @@ class Registry:
         def action(document):
             item = self._standing_lease(document, item_id, now)
             self._check_possession(item, holder, token, epoch)
-            item["status"] = "open"
-            item["holder"] = None
-            item["token_hash"] = None
-            item["expires_at"] = None
+            self._end_lease(item, "open")
             self._append_event(document, "released", item_id, holder, now, item["epoch"])
             return None
 
@@ -517,10 +537,7 @@ class Registry:
         def action(document):
             item = self._standing_lease(document, item_id, now)
             self._check_possession(item, holder, token, epoch)
-            item["status"] = "completed"
-            item["holder"] = None
-            item["token_hash"] = None
-            item["expires_at"] = None
+            self._end_lease(item, "completed")
             self._append_event(
                 document, "completed", item_id, holder, now, item["epoch"]
             )
@@ -528,38 +545,35 @@ class Registry:
 
         return self._mutate(now, action)
 
+    def _board_row(self, item, now):
+        if self._lease_live(item, now):
+            return {
+                "id": item["id"],
+                "note": item["note"],
+                "status": "claimed",
+                "holder": item["holder"],
+                "expires_at": item["expires_at"],
+                "epoch": item["epoch"],
+            }
+        return {
+            "id": item["id"],
+            "note": item["note"],
+            "status": "open",
+            "holder": None,
+            "expires_at": None,
+            "epoch": item["epoch"],
+        }
+
     def board(self, now):
         """Return the open items in offer order, evaluated at the instant."""
         _validate_now(now)
 
         def action(document):
-            rows = []
-            for item in document["items"]:
-                if item["status"] == "completed":
-                    continue
-                if self._lease_live(item, now):
-                    rows.append(
-                        {
-                            "id": item["id"],
-                            "note": item["note"],
-                            "status": "claimed",
-                            "holder": item["holder"],
-                            "expires_at": item["expires_at"],
-                            "epoch": item["epoch"],
-                        }
-                    )
-                else:
-                    rows.append(
-                        {
-                            "id": item["id"],
-                            "note": item["note"],
-                            "status": "open",
-                            "holder": None,
-                            "expires_at": None,
-                            "epoch": item["epoch"],
-                        }
-                    )
-            return rows
+            return [
+                self._board_row(item, now)
+                for item in document["items"]
+                if item["status"] != "completed"
+            ]
 
         return self._read(action)
 
