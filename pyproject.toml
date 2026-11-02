@@ -1,5 +1,17 @@
-# Packaging metadata arrives with the first package in this repo.
-# Until then this file carries the pytest configuration only.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dibs"
+version = "0.1.0"
+description = "Atomic claims with expiring leases for shared agent backlogs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.setuptools]
+packages = ["dibs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
