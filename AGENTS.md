@@ -56,6 +56,6 @@ Verify claims from the thing itself. A result is read from the file on disk, the
 
 The contract for this repo lives in CONTRACT.md and it defines the obligations this repo must meet. Read CONTRACT.md and the README before changing anything in dibs.
 
-Mayfly makes the box, switchyard furnishes it, and wayside remembers where everything was. Dibs owns the expiring claim-lease protocol, the mechanism by which agents claim a resource for a bounded time, with the claim expiring unless it is renewed. This setup slice establishes the repo and its discipline only, and it claims no protocol behaviour and no feature behaviour of any kind.
+Mayfly makes the box, switchyard furnishes it, and wayside remembers where everything was. Dibs owns the expiring claim-lease protocol, the mechanism by which agents claim a resource for a bounded time, with the claim expiring unless it is renewed. Round 1 slice 1 builds that protocol over one registry file in the dibs-registry/1 format, with atomic claims under an exclusive flock, lazy expiry, token possession with hash only storage, epoch fencing, and the claim history recorded in the same document as the state. The event kinds are offered and claimed and renewed and released and completed and taken over, and other repos adopt the format and that vocabulary when they build against this protocol.
 
-The full contract is the first build act of this repo and it arrives with the first feature slice, which is a later slice than this setup slice.
+The full contract landed with Round 1 slice 1 as the amendment in CONTRACT.md, where obligations DB-1 to DB-13 state the protocol semantics and the limits this slice keeps.

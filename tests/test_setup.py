@@ -51,11 +51,11 @@ def _status_section(text):
     return rest if end == -1 else rest[:end]
 
 
-def test_readme_status_states_zero_of_one_hundred():
+def test_readme_status_states_one_of_one_hundred():
     text = read("README.md")
     assert "## Status" in text
     status = _status_section(text)
-    assert "0 of 100" in status
+    assert "1 of 100" in status
     assert "c1533bbc5fcfb803c1511d677d36c3c3925f075d" in status
 
 
