@@ -982,7 +982,7 @@ fn race_worker_entry() {
     let read = |key: &str| std::env::var(key).unwrap_or_default();
     let registry = Registry::new(PathBuf::from(read("DIBS_RACE_REGISTRY")));
     let micros: i128 = read("DIBS_RACE_AT_MICROS").parse().unwrap_or(0);
-    let now = Instant::from_epoch_micros(micros);
+    let now = Instant::from_epoch_micros(micros).unwrap();
     let code = match registry.claim(
         &read("DIBS_RACE_ITEM"),
         &read("DIBS_RACE_HOLDER"),
@@ -993,8 +993,18 @@ fn race_worker_entry() {
             std::fs::write(read("DIBS_RACE_RESULT"), granted.token).unwrap();
             0
         }
-        Err(Error::Refusal(_)) => 3,
-        Err(_) => 4,
+        Err(error) => {
+            // A pin that needs the refusal's words names an
+            // error file, and the worker leaves the message
+            // there before it leaves by exit code.
+            if let Ok(path) = std::env::var("DIBS_RACE_ERROR") {
+                let _ = std::fs::write(path, error.message());
+            }
+            match error {
+                Error::Refusal(_) => 3,
+                _ => 4,
+            }
+        }
     };
     std::process::exit(code);
 }
@@ -1105,6 +1115,117 @@ fn race_on_distinct_items_loses_no_updates() {
     assert!(rows.iter().all(|row| row.status == "claimed"));
 }
 
+/// A staged registry for the lock identity pin: the target
+/// item and the parent item stand first, then the filler
+/// items that make one claim span a wide window, every item
+/// offered in order.
+fn staged_lock_document(fillers: usize) -> String {
+    let mut ids: Vec<String> = vec!["task-target".to_string(), "task-parent".to_string()];
+    for index in 0..fillers {
+        ids.push(format!("item-{index:06}"));
+    }
+    let mut out = String::from("{\"format\": \"dibs-registry/1\", \"items\": [");
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"id\": \"{id}\", \"note\": \"\", \"status\": \"open\", \
+             \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}"
+        ));
+    }
+    out.push_str("], \"history\": [");
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"seq\": {}, \"kind\": \"offered\", \"item\": \"{id}\", \
+             \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
+             \"previous_holder\": null}}",
+            index + 1
+        ));
+    }
+    out.push_str("]}");
+    out
+}
+
+#[test]
+fn lock_file_deleted_mid_claim_aborts_the_claim() {
+    let dir = temp_dir("lock-identity");
+    let registry_path = dir.join("registry.json");
+    std::fs::write(&registry_path, staged_lock_document(16_000)).unwrap();
+    let lock_path = dir.join("registry.json.lock");
+    let error_path = dir.join("worker-error.txt");
+    let at_micros = at(10).epoch_micros().unwrap().to_string();
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("race_worker_entry")
+        .arg("--nocapture")
+        .env("DIBS_RACE_WORKER", "1")
+        .env("DIBS_RACE_REGISTRY", &registry_path)
+        .env("DIBS_RACE_ITEM", "task-target")
+        .env("DIBS_RACE_HOLDER", "agent-victim")
+        .env("DIBS_RACE_AT_MICROS", &at_micros)
+        .env("DIBS_RACE_RESULT", dir.join("result-victim.txt"))
+        .env("DIBS_RACE_ERROR", &error_path)
+        .spawn()
+        .unwrap();
+    // Wait until the worker stands inside its claim, then
+    // delete the lock file it holds. A claim spanning sixteen
+    // thousand items leaves a wide window between the lock and
+    // the publish, and the deletion lands inside it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !lock_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker never created the lock file"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::remove_file(&lock_path).unwrap();
+    // A second claim locks a fresh file at the lock path and
+    // proceeds while the first claim still holds the deleted
+    // file, and the second claim must stand.
+    let registry = Registry::new(registry_path.clone());
+    let granted = registry
+        .claim("task-parent", "agent-parent", 600, &at(10))
+        .unwrap();
+    assert_eq!(granted.epoch, 1);
+    // The first claim aborts on the lock identity check before
+    // it can publish, so its success can never be erased.
+    let code = child.wait().unwrap().code().unwrap_or(-1);
+    assert_eq!(code, 4, "the victim claim must abort, not land");
+    let message = std::fs::read_to_string(&error_path).unwrap();
+    assert!(
+        message.contains("is not the file this command locked"),
+        "{message}"
+    );
+    assert!(
+        message.contains("the registry was left unchanged"),
+        "{message}"
+    );
+    // The victim claim left no trace. The target stands open
+    // at epoch 0, the history is the offers and the parent
+    // claim alone, gapless, and the registry still works.
+    let rows = registry.board(&at(20)).unwrap();
+    let target = rows.iter().find(|row| row.id == "task-target").unwrap();
+    assert_eq!(target.status, "open");
+    assert_eq!(target.epoch, 0);
+    let events = registry.history(None).unwrap();
+    assert_eq!(events.len(), 16_003);
+    assert!(events
+        .iter()
+        .all(|event| event.item != "task-target" || event.kind == "offered"));
+    let seqs: Vec<i128> = events.iter().map(|event| event.seq).collect();
+    assert_eq!(seqs, (1..=16_003).collect::<Vec<i128>>());
+    let claimed = registry
+        .claim("task-target", "agent-parent", 600, &at(30))
+        .unwrap();
+    assert_eq!(claimed.epoch, 1);
+}
+
 struct CliOutput {
     code: i32,
     stdout: String,
@@ -1173,8 +1294,7 @@ fn cli_round_trip_and_exit_codes() {
             "task-one",
             "--holder",
             "agent-a",
-            "--token",
-            token,
+            &format!("--token={token}"),
             "--epoch",
             "1",
             "--ttl",
@@ -1246,14 +1366,137 @@ fn cli_round_trip_and_exit_codes() {
             "task-one",
             "--holder",
             "agent-a",
-            "--token",
-            token,
+            &format!("--token={token}"),
             "--epoch",
             "1",
         ],
         0,
     );
     assert_eq!(released.stdout, "released task-one\n");
+}
+
+#[test]
+fn cli_integer_arguments_take_the_python_grammar() {
+    let dir = temp_dir("cli-unicode-int");
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    run_cli(&["--registry", path, "offer", "task-one"], 0);
+    // Arabic-Indic digits carry the time to live.
+    let claimed = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "٤٢",
+        ],
+        0,
+    );
+    let token = claimed
+        .stdout
+        .lines()
+        .next()
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1
+        .to_string();
+    // An em space wrapped Arabic-Indic epoch and a Devanagari
+    // time to live carry the renew.
+    let renewed = run_cli(
+        &[
+            "--registry",
+            path,
+            "renew",
+            "task-one",
+            "--holder",
+            "agent-a",
+            &format!("--token={token}"),
+            "--epoch",
+            "\u{2003}١\u{2003}",
+            "--ttl",
+            "३०",
+        ],
+        0,
+    );
+    assert!(renewed.stdout.starts_with("expires_at "));
+    run_cli(
+        &[
+            "--registry",
+            path,
+            "release",
+            "task-one",
+            "--holder",
+            "agent-a",
+            &format!("--token={token}"),
+            "--epoch",
+            "1",
+        ],
+        0,
+    );
+    // Fullwidth digits wrapped in no break spaces carry the
+    // second claim, and a Devanagari epoch its release.
+    let claimed = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "\u{a0}４２\u{a0}",
+        ],
+        0,
+    );
+    let token = claimed
+        .stdout
+        .lines()
+        .next()
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1
+        .to_string();
+    run_cli(
+        &[
+            "--registry",
+            path,
+            "release",
+            "task-one",
+            "--holder",
+            "agent-a",
+            &format!("--token={token}"),
+            "--epoch",
+            "२",
+        ],
+        0,
+    );
+    // A negative time to live in Arabic-Indic digits is taken
+    // as the option's value, not mistaken for an option, and
+    // the library refuses it with the value rendered in ASCII
+    // digits, as the Python surface refused it.
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "-٤٢",
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid time to live -42"),
+        "{}",
+        refused.stderr
+    );
 }
 
 #[test]
@@ -1337,8 +1580,7 @@ fn cli_completed_item_leaves_the_board_but_keeps_its_history() {
             "task-one",
             "--holder",
             "agent-a",
-            "--token",
-            token,
+            &format!("--token={token}"),
             "--epoch",
             "1",
         ],

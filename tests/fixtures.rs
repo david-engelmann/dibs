@@ -57,6 +57,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn expect_error<T>(result: dibs::Result<T>) -> Error {
+    match result {
+        Ok(_) => panic!("the operation succeeded where a refusal was expected"),
+        Err(error) => error,
+    }
+}
+
+/// Stage one hand written document in a scratch directory and
+/// open it there.
+fn staged_document(tag: &str, text: &str) -> (PathBuf, Registry) {
+    let dir = temp_dir(tag);
+    let path = dir.join("registry.json");
+    std::fs::write(&path, text).unwrap();
+    let registry = Registry::new(path);
+    (dir, registry)
+}
+
+/// A document holding one claimed item under a known token,
+/// with the expiry spelled as the case under test names it.
+fn claimed_document(expires_at: &str) -> String {
+    format!(
+        "{{\"format\": \"dibs-registry/1\", \"items\": [{{\"id\": \"task-one\", \
+         \"note\": \"\", \"status\": \"claimed\", \"holder\": \"agent-a\", \
+         \"token_hash\": \"{}\", \"epoch\": 1, \"expires_at\": \"{}\"}}], \
+         \"history\": []}}",
+        dibs::token_hash("standing-token"),
+        expires_at
+    )
+}
+
 #[test]
 fn fixture_hashes_match_the_manifest_inventory() {
     let inventory: [(&str, usize, &str); 8] = [
@@ -448,6 +478,249 @@ fn epoch_increment_is_checked_at_the_magnitudes() {
     assert_eq!(granted.epoch, 1000000000000000000i128);
     let rows = registry.board(&t0()).unwrap();
     assert_eq!(rows[0].epoch, 1000000000000000000i128);
+}
+
+#[test]
+fn claim_at_the_unsigned_top_is_refused_and_changes_nothing() {
+    let text = "{\"format\": \"dibs-registry/1\", \"items\": [{\"id\": \"task-one\", \
+         \"note\": \"\", \"status\": \"open\", \"holder\": null, \"token_hash\": null, \
+         \"epoch\": 18446744073709551615, \"expires_at\": null}], \"history\": []}";
+    let (dir, registry) = staged_document("epoch-top-claim", text);
+    let error = expect_error(registry.claim("task-one", "agent-a", 60, &t0()));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert!(
+        error.message().contains("18446744073709551615"),
+        "{}",
+        error.message()
+    );
+    assert!(
+        error.message().contains("no epoch past it can be assigned"),
+        "{}",
+        error.message()
+    );
+    assert_eq!(
+        std::fs::read(dir.join("registry.json")).unwrap(),
+        text.as_bytes()
+    );
+}
+
+#[test]
+fn claim_below_the_unsigned_top_assigns_the_top_and_then_fences() {
+    let text = "{\"format\": \"dibs-registry/1\", \"items\": [{\"id\": \"task-one\", \
+         \"note\": \"\", \"status\": \"open\", \"holder\": null, \"token_hash\": null, \
+         \"epoch\": 18446744073709551614, \"expires_at\": null}], \"history\": []}";
+    let (_, registry) = staged_document("epoch-top-minus-one", text);
+    let granted = registry.claim("task-one", "agent-a", 60, &t0()).unwrap();
+    assert_eq!(granted.epoch, 18446744073709551615i128);
+    let rows = registry.board(&t0()).unwrap();
+    assert_eq!(rows[0].epoch, 18446744073709551615i128);
+    registry
+        .release(
+            "task-one",
+            "agent-a",
+            &granted.token,
+            18446744073709551615i128,
+            &at(1),
+        )
+        .unwrap();
+    let error = expect_error(registry.claim("task-one", "agent-b", 60, &at(2)));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    let rows = registry.board(&at(3)).unwrap();
+    assert_eq!(rows[0].status, "open");
+    assert_eq!(rows[0].epoch, 18446744073709551615i128);
+}
+
+#[test]
+fn renewal_past_the_utc_edge_is_refused_and_changes_nothing() {
+    // The standing expiry reads 22:30 at an offset of minus one
+    // hour, which is 23:30 in UTC. One more hour of lease lands
+    // in UTC year 10000, outside the representable range, even
+    // though the wall clock year stays 9999.
+    let text = claimed_document("9999-12-31T22:30:00-01:00");
+    let (dir, registry) = staged_document("utc-edge-renewal", &text);
+    let now = Instant::from_civil(9999, 12, 31, 21, 0, 0, 0, Some(-3_600_000_000)).unwrap();
+    let error =
+        expect_error(registry.renew("task-one", "agent-a", "standing-token", 1, 3600, &now));
+    assert!(matches!(error, Error::InvalidTtl(_)), "{error:?}");
+    assert_eq!(
+        std::fs::read(dir.join("registry.json")).unwrap(),
+        text.as_bytes()
+    );
+}
+
+#[test]
+fn a_now_outside_the_utc_range_is_refused() {
+    // Midnight opening year 1 at an offset of plus one hour is
+    // 23:00 on the last day of year 0 in UTC, and half past
+    // eleven closing year 9999 at an offset of minus one hour
+    // is year 10000 in UTC. Neither instant can be recorded.
+    let dir = temp_dir("utc-range-now");
+    let registry = Registry::new(dir.join("registry.json"));
+    let early = Instant::from_civil(1, 1, 1, 0, 0, 0, 0, Some(3_600_000_000)).unwrap();
+    let error = expect_error(registry.offer("task-one", "a synthetic task", &early));
+    assert!(matches!(error, Error::InvalidRequest(_)), "{error:?}");
+    let error = expect_error(registry.board(&early));
+    assert!(matches!(error, Error::InvalidRequest(_)), "{error:?}");
+    let late = Instant::from_civil(9999, 12, 31, 23, 30, 0, 0, Some(-3_600_000_000)).unwrap();
+    let error = expect_error(registry.offer("task-one", "a synthetic task", &late));
+    assert!(matches!(error, Error::InvalidRequest(_)), "{error:?}");
+    // The same wall clock fields in UTC itself stand inside the
+    // range and work.
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+}
+
+#[test]
+fn renewal_straddling_the_year_line_inside_utc_still_stands() {
+    // The standing expiry reads 22:30 at an offset of plus one
+    // hour, which is 21:30 in UTC. One more hour lands at 22:30
+    // in UTC, inside the range, and the renewal stands.
+    let text = claimed_document("9999-12-31T22:30:00+01:00");
+    let (_, registry) = staged_document("utc-edge-control", &text);
+    let now = Instant::from_civil(9999, 12, 31, 20, 0, 0, 0, Some(0)).unwrap();
+    let expires = registry
+        .renew("task-one", "agent-a", "standing-token", 1, 3600, &now)
+        .unwrap();
+    assert_eq!(dibs::format_instant(&expires), "9999-12-31T22:30:00+00:00");
+    let rows = registry.board(&now).unwrap();
+    assert_eq!(
+        rows[0].expires_at.as_deref(),
+        Some("9999-12-31T22:30:00+00:00")
+    );
+}
+
+#[test]
+fn stored_week_date_spellings_read_at_their_boundary() {
+    // Week dates in the family the Python reader accepted, the
+    // basic form with a weekday, the basic form without one,
+    // and the extended form. Each names its expiry, and the
+    // lease is live strictly before it and expired at it.
+    let spellings: [(&str, (i64, i64, i64)); 3] = [
+        ("2031W183T12:01:00+00:00", (2031, 4, 30)),
+        ("2031W18T12:01:00+00:00", (2031, 4, 28)),
+        ("2031-W18-3T12:01:00+00:00", (2031, 4, 30)),
+    ];
+    for (index, (spelling, (year, month, day))) in spellings.iter().enumerate() {
+        let text = claimed_document(spelling);
+        let (_, registry) = staged_document(&format!("week-date-{index}"), &text);
+        let boundary = Instant::from_civil(*year, *month, *day, 12, 1, 0, 0, Some(0)).unwrap();
+        let live = registry.board(&boundary.plus_seconds(-1)).unwrap();
+        assert_eq!(live[0].status, "claimed", "{spelling}");
+        assert_eq!(live[0].expires_at.as_deref(), Some(*spelling));
+        let expired = registry.board(&boundary).unwrap();
+        assert_eq!(expired[0].status, "open", "{spelling}");
+    }
+}
+
+/// A generated registry of the given number of offered items,
+/// written out as text the way the scale cases stage it.
+fn generated_document(count: usize) -> String {
+    let mut out = String::from("{\"format\": \"dibs-registry/1\", \"items\": [");
+    for index in 0..count {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"id\": \"item-{index:06}\", \"note\": \"\", \"status\": \"open\", \
+             \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}"
+        ));
+    }
+    out.push_str("], \"history\": [");
+    for index in 0..count {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"seq\": {}, \"kind\": \"offered\", \"item\": \"item-{index:06}\", \
+             \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
+             \"previous_holder\": null}}",
+            index + 1
+        ));
+    }
+    out.push_str("]}");
+    out
+}
+
+#[test]
+fn board_over_a_large_registry_stays_inside_a_generous_bound() {
+    // The port as first built validated a document in time
+    // quadratic in the item count, and a board over sixteen
+    // thousand items took over seventeen seconds in this
+    // profile on the build machine. Validation is linear in
+    // the count, and the same board lands far inside the bound.
+    let count = 16_000usize;
+    let text = generated_document(count);
+    let (_, registry) = staged_document("scale-board", &text);
+    let started = std::time::Instant::now();
+    let rows = registry.board(&t0()).unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(rows.len(), count);
+    assert_eq!(rows[0].id, "item-000000");
+    assert_eq!(rows[count - 1].id, "item-015999");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "board over {count} items took {elapsed:?}"
+    );
+}
+
+#[test]
+fn offset_at_the_i64_edges_is_refused_not_panicked() {
+    assert!(Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(i64::MIN)).is_none());
+    assert!(Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(i64::MAX)).is_none());
+    assert!(Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(86_400_000_000)).is_none());
+    assert!(Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(-86_400_000_000)).is_none());
+    // The largest offsets inside a day still build.
+    assert!(Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(86_399_999_999)).is_some());
+    assert!(Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(-86_399_999_999)).is_some());
+}
+
+#[test]
+fn epoch_micros_refuses_counts_it_cannot_hold() {
+    // A count naming a day count past the width the type holds
+    // is refused, where the port as first built wrapped it and
+    // read back a different count.
+    assert!(Instant::from_epoch_micros(i128::MAX).is_none());
+    assert!(Instant::from_epoch_micros(i128::MIN).is_none());
+    let counts = [
+        0i128,
+        -1,
+        t0().epoch_micros().unwrap(),
+        Instant::from_civil(9999, 12, 31, 23, 59, 59, 999999, Some(0))
+            .unwrap()
+            .epoch_micros()
+            .unwrap(),
+        Instant::from_civil(1, 1, 1, 0, 0, 0, 0, Some(0))
+            .unwrap()
+            .epoch_micros()
+            .unwrap(),
+    ];
+    for count in counts {
+        let built = Instant::from_epoch_micros(count).unwrap();
+        assert_eq!(built.epoch_micros(), Some(count));
+    }
+}
+
+#[test]
+fn format_instant_renders_naive_and_aware_instants() {
+    let naive = Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, None).unwrap();
+    assert_eq!(dibs::format_instant(&naive), "2031-05-04T12:00:00");
+    let naive_micros = Instant::from_civil(2031, 5, 4, 12, 0, 0, 123456, None).unwrap();
+    assert_eq!(
+        dibs::format_instant(&naive_micros),
+        "2031-05-04T12:00:00.123456"
+    );
+    assert_eq!(dibs::format_instant(&t0()), "2031-05-04T12:00:00+00:00");
+}
+
+#[test]
+fn aware_instants_compare_by_the_instant_not_the_offset() {
+    let utc = Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(0)).unwrap();
+    let shifted = Instant::from_civil(2031, 5, 4, 13, 0, 0, 0, Some(3_600_000_000)).unwrap();
+    assert_eq!(utc, shifted);
+    assert_eq!(utc.cmp(&shifted), std::cmp::Ordering::Equal);
+    let naive = Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, None).unwrap();
+    assert_ne!(utc, naive);
 }
 
 #[test]
