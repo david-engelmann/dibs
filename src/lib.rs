@@ -29,9 +29,11 @@
 //! and the reshapings, and the error messages and the stored bytes
 //! reproduce the Python behaviour they name.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -442,12 +444,32 @@ fn iso_weeks_in_year(year: i64) -> i64 {
 /// taken. Comparisons between aware instants compare the instant
 /// itself, never the wall clock fields, exactly as comparisons
 /// between the aware datetimes of the Python implementation did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Eq)]
 pub struct Instant {
     days: i64,
     secs: i64,
     micros: i64,
     offset_micros: Option<i64>,
+}
+
+impl PartialEq for Instant {
+    /// Two aware instants are equal when they name the same
+    /// instant, whatever offsets they carry, as the aware
+    /// datetimes of the Python implementation compared. Two
+    /// naive instants are equal when their wall clock fields
+    /// agree, and a naive instant never equals an aware one.
+    /// Equality therefore agrees with the Ord implementation
+    /// wherever that implementation compares the instants
+    /// themselves.
+    fn eq(&self, other: &Self) -> bool {
+        match (self.epoch_micros(), other.epoch_micros()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => {
+                self.days == other.days && self.secs == other.secs && self.micros == other.micros
+            }
+            _ => false,
+        }
+    }
 }
 
 const DAY_MICROS: i128 = 86_400_000_000;
@@ -479,7 +501,7 @@ impl Instant {
             return None;
         }
         if let Some(offset) = offset_micros {
-            if offset.abs() >= 86_400_000_000 {
+            if offset.unsigned_abs() >= 86_400_000_000 {
                 return None;
             }
         }
@@ -513,14 +535,20 @@ impl Instant {
     }
 
     /// The aware UTC instant at a count of microseconds since
-    /// the epoch.
-    pub fn from_epoch_micros(micros: i128) -> Instant {
-        Instant {
-            days: micros.div_euclid(DAY_MICROS) as i64,
+    /// the epoch, or None when the count names a day count the
+    /// type cannot hold, so a count this constructor accepts is
+    /// a count it reads back whole and never a wrapped one.
+    pub fn from_epoch_micros(micros: i128) -> Option<Instant> {
+        let days = micros.div_euclid(DAY_MICROS);
+        if days < i64::MIN as i128 || days > i64::MAX as i128 {
+            return None;
+        }
+        Some(Instant {
+            days: days as i64,
             secs: (micros.rem_euclid(DAY_MICROS) / 1_000_000) as i64,
             micros: (micros.rem_euclid(DAY_MICROS) % 1_000_000) as i64,
             offset_micros: Some(0),
-        }
+        })
     }
 
     /// The instant itself as microseconds since the epoch, or
@@ -557,17 +585,26 @@ impl Instant {
     /// The instant a time to live added to this one names, or
     /// None when the addition runs past the last representable
     /// instant, the refusal the protocol raises as an invalid time
-    /// to live. The check runs on the resulting wall clock date,
-    /// as the Python datetime overflow did.
+    /// to live. The check runs on the UTC instant the stored
+    /// rendering will carry, not on the wall clock fields the
+    /// offset preserves, because a wall clock year inside the
+    /// range can still name a UTC year outside it, and the stored
+    /// form is the UTC rendering.
     fn expiry_after(&self, ttl: i64) -> Option<Instant> {
         let shifted = self.shift_micros(ttl as i128 * 1_000_000);
-        let (year, _, _) = civil_from_days(shifted.days);
-        if (1..=9999).contains(&year) {
+        let epoch = shifted.epoch_micros()?;
+        if days_representable(epoch.div_euclid(DAY_MICROS)) {
             Some(shifted)
         } else {
             None
         }
     }
+}
+
+/// Whether a count of days since the epoch names a date inside
+/// the representable years, 1 to 9999.
+fn days_representable(days: i128) -> bool {
+    days >= days_from_civil(1, 1, 1) as i128 && days <= days_from_civil(9999, 12, 31) as i128
 }
 
 impl PartialOrd for Instant {
@@ -594,13 +631,23 @@ impl Ord for Instant {
 }
 
 fn validate_now(now: &Instant) -> Result<()> {
-    if now.is_naive() {
-        Err(Error::InvalidRequest(
-            "the current instant must be a timezone aware datetime".to_string(),
-        ))
-    } else {
-        Ok(())
+    let epoch = match now.epoch_micros() {
+        Some(epoch) => epoch,
+        None => {
+            return Err(Error::InvalidRequest(
+                "the current instant must be a timezone aware datetime".to_string(),
+            ))
+        }
+    };
+    // The instant is recorded in its UTC rendering, so it must
+    // stand inside the representable years in UTC, whatever the
+    // wall clock year its offset carries.
+    if !days_representable(epoch.div_euclid(DAY_MICROS)) {
+        return Err(Error::InvalidRequest(
+            "the current instant falls outside the representable range in UTC".to_string(),
+        ));
     }
+    Ok(())
 }
 
 fn expiry_after(moment: &Instant, ttl: i64) -> Result<Instant> {
@@ -611,17 +658,26 @@ fn expiry_after(moment: &Instant, ttl: i64) -> Result<Instant> {
     })
 }
 
-/// Render an instant the way the Python isoformat rendered the
-/// same instant converted to UTC, with the T separator, six
-/// fraction digits when the microsecond count is nonzero and
-/// none when it is zero, and the UTC offset spelled out.
+/// Render an instant the way the Python isoformat rendered it,
+/// an aware instant converted to UTC with the UTC offset spelled
+/// out, and a naive instant as its own wall clock fields with no
+/// offset suffix. The separator is a T, and the fraction carries
+/// six digits when the microsecond count is nonzero and none
+/// when it is zero.
 pub fn format_instant(moment: &Instant) -> String {
-    let epoch = moment.epoch_micros().expect("a formatted instant is aware");
-    let days = epoch.div_euclid(DAY_MICROS);
-    let rest = epoch.rem_euclid(DAY_MICROS);
-    let (year, month, day) = civil_from_days(days as i64);
-    let secs = (rest / 1_000_000) as i64;
-    let micros = (rest % 1_000_000) as i64;
+    let (days, secs, micros, suffix) = match moment.epoch_micros() {
+        Some(epoch) => {
+            let rest = epoch.rem_euclid(DAY_MICROS);
+            (
+                epoch.div_euclid(DAY_MICROS) as i64,
+                (rest / 1_000_000) as i64,
+                (rest % 1_000_000) as i64,
+                "+00:00",
+            )
+        }
+        None => (moment.days, moment.secs, moment.micros, ""),
+    };
+    let (year, month, day) = civil_from_days(days);
     let mut out = format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
         secs / 3600,
@@ -631,7 +687,7 @@ pub fn format_instant(moment: &Instant) -> String {
     if micros != 0 {
         out.push_str(&format!(".{micros:06}"));
     }
-    out.push_str("+00:00");
+    out.push_str(suffix);
     out
 }
 
@@ -707,9 +763,22 @@ impl Cursor {
     }
 }
 
+/// The day count an ISO week date names, the Monday of its
+/// first week stepped by whole weeks and weekdays, or None when
+/// the week or the weekday stands outside the year.
+fn week_date_days(year: i64, week: i64, weekday: i64) -> Option<i64> {
+    if week < 1 || week > iso_weeks_in_year(year) || !(1..=7).contains(&weekday) {
+        return None;
+    }
+    let jan4 = days_from_civil(year, 1, 4);
+    let week_one_monday = jan4 - (iso_weekday(jan4) - 1);
+    Some(week_one_monday + (week - 1) * 7 + (weekday - 1))
+}
+
 fn parse_date(cursor: &mut Cursor) -> Option<i64> {
     // Extended form, YYYY-MM-DD and the week forms, or the basic
-    // form YYYYMMDD. The year is always four digits.
+    // forms YYYYMMDD and YYYYWWW and YYYYWWWD. The year is
+    // always four digits.
     if cursor.chars.get(4) == Some(&'-') {
         let year = cursor.digits(4)?;
         cursor.expect('-')?;
@@ -722,12 +791,7 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
             } else {
                 1
             };
-            if week < 1 || week > iso_weeks_in_year(year) || !(1..=7).contains(&weekday) {
-                return None;
-            }
-            let jan4 = days_from_civil(year, 1, 4);
-            let week_one_monday = jan4 - (iso_weekday(jan4) - 1);
-            return Some(week_one_monday + (week - 1) * 7 + (weekday - 1));
+            return week_date_days(year, week, weekday);
         }
         let month = cursor.digits(2)?;
         cursor.expect('-')?;
@@ -742,6 +806,16 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
         Some(days_from_civil(year, month, day))
     } else {
         let year = cursor.digits(4)?;
+        if cursor.peek() == Some('W') {
+            cursor.take();
+            let week = cursor.digits(2)?;
+            let weekday = if cursor.peek().is_some_and(|c| c.is_ascii_digit()) {
+                cursor.digits(1)?
+            } else {
+                1
+            };
+            return week_date_days(year, week, weekday);
+        }
         let month = cursor.digits(2)?;
         let day = cursor.digits(2)?;
         if !(1..=9999).contains(&year)
@@ -834,7 +908,7 @@ impl Instant {
         offset_micros: Option<i64>,
     ) -> Option<Instant> {
         if let Some(offset) = offset_micros {
-            if offset.abs() >= 86_400_000_000 {
+            if offset.unsigned_abs() >= 86_400_000_000 {
                 return None;
             }
         }
@@ -998,8 +1072,9 @@ impl<'de> serde::Deserialize<'de> for Value {
                 A: serde::de::MapAccess<'de>,
             {
                 let mut entries: Vec<(String, Value)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
                 while let Some(key) = map.next_key::<String>()? {
-                    if entries.iter().any(|(seen, _)| *seen == key) {
+                    if !seen.insert(key.clone()) {
                         return Err(serde::de::Error::custom(format!(
                             "dibs-duplicate-key\x1f{key}"
                         )));
@@ -1347,16 +1422,15 @@ fn validate_document(value: &Value) -> Result<Document> {
         _ => return Err(corrupt("the history field is not a list".to_string())),
     };
     let mut items = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for item_value in item_values {
         let item = validate_item(item_value)?;
-        if seen.contains(&item.id) {
+        if !seen.insert(item.id.clone()) {
             return Err(corrupt(format!(
                 "item {} stands in the backlog twice",
                 py_repr(&item.id)
             )));
         }
-        seen.push(item.id.clone());
         items.push(item);
     }
     let mut history = Vec::new();
@@ -1636,14 +1710,64 @@ fn decode_utf32(bytes: &[u8], little_endian: bool) -> std::result::Result<String
     Ok(out)
 }
 
+/// Open the temporary file a publish stages its document in.
+/// The open creates the file exclusively, so a plant standing
+/// at the temporary name, a symlink to a victim file among
+/// them, fails the publish instead of being followed and
+/// written through.
+fn open_publish_temp(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
 /// One backlog in one registry file, opened fresh on every call.
 pub struct Registry {
     path: PathBuf,
     lock_path: PathBuf,
 }
 
+/// The lock a command holds, with the path it locked. Holding
+/// the descriptor is not enough on its own, because the file at
+/// the lock path can be deleted and replaced while a command
+/// works, and a later command then locks the replacement and
+/// works concurrently against the same registry. The guard
+/// therefore knows how to check that the file it holds is still
+/// the file at the path, by device and inode.
 struct LockGuard {
-    _file: File,
+    file: File,
+    lock_path: PathBuf,
+}
+
+impl LockGuard {
+    /// Whether the file this guard holds is the file standing
+    /// at the lock path now.
+    fn identity_holds(&self) -> bool {
+        let held = match self.file.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return false,
+        };
+        let standing = match std::fs::metadata(&self.lock_path) {
+            Ok(metadata) => metadata,
+            Err(_) => return false,
+        };
+        held.dev() == standing.dev() && held.ino() == standing.ino()
+    }
+
+    /// Refuse to go on when the held lock is not the file at
+    /// the lock path, because anything this command published
+    /// could then be overwritten by the command that locked the
+    /// standing file, and a success of this command could be
+    /// erased without a trace.
+    fn verify(&self) -> Result<()> {
+        if self.identity_holds() {
+            Ok(())
+        } else {
+            Err(Error::Failure(format!(
+                "the lock file at {} is not the file this command locked, \
+                 so the registry was left unchanged",
+                self.lock_path.display()
+            )))
+        }
+    }
 }
 
 impl Registry {
@@ -1664,29 +1788,51 @@ impl Registry {
     }
 
     fn locked(&self, exclusive: bool) -> Result<LockGuard> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o644)
-            .open(&self.lock_path)
-            .map_err(|err| {
+        // The identity of the locked file is checked as soon as
+        // the lock stands. A mismatch means the file at the path
+        // was deleted and replaced under this command, so the
+        // command locks the standing file on a bounded retry
+        // instead of working under a file no other command can
+        // see, and refuses when the path will not settle.
+        for attempt in 1..=5 {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o644)
+                .open(&self.lock_path)
+                .map_err(|err| {
+                    Error::Failure(format!(
+                        "the lock file beside the registry cannot be opened, {err}"
+                    ))
+                })?;
+            let result = if exclusive {
+                file.lock_exclusive()
+            } else {
+                file.lock_shared()
+            };
+            result.map_err(|err| {
                 Error::Failure(format!(
-                    "the lock file beside the registry cannot be opened, {err}"
+                    "the lock file beside the registry cannot be locked, {err}"
                 ))
             })?;
-        let result = if exclusive {
-            file.lock_exclusive()
-        } else {
-            file.lock_shared()
-        };
-        result.map_err(|err| {
-            Error::Failure(format!(
-                "the lock file beside the registry cannot be locked, {err}"
-            ))
-        })?;
-        Ok(LockGuard { _file: file })
+            let guard = LockGuard {
+                file,
+                lock_path: self.lock_path.clone(),
+            };
+            if guard.identity_holds() {
+                return Ok(guard);
+            }
+            if attempt == 5 {
+                return Err(Error::Failure(format!(
+                    "the lock file at {} is not the file this command locked, \
+                     so the registry was left unchanged",
+                    self.lock_path.display()
+                )));
+            }
+        }
+        unreachable!()
     }
 
     /// Read and strictly validate the registry, or start empty.
@@ -1727,19 +1873,22 @@ impl Registry {
         let temp = self
             .path
             .with_file_name(format!(".{name}.tmp-{}-{hex}", std::process::id()));
+        let mut created = false;
         let staged = (|| -> std::io::Result<()> {
-            let mut handle = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp)?;
+            let mut handle = open_publish_temp(&temp)?;
+            created = true;
             handle.write_all(text.as_bytes())?;
             handle.sync_all()?;
             std::fs::rename(&temp, &self.path)?;
             Ok(())
         })();
         if let Err(err) = staged {
-            let _ = std::fs::remove_file(&temp);
+            // Only the temporary file this publish created is
+            // removed. A failure to create it means whatever
+            // stands at the name belongs to someone else.
+            if created {
+                let _ = std::fs::remove_file(&temp);
+            }
             return Err(Error::Failure(format!(
                 "the registry could not be published, {err}"
             )));
@@ -1770,9 +1919,13 @@ impl Registry {
                 Error::Failure(format!("the registry directory cannot be created, {err}"))
             })?;
         }
-        let _guard = self.locked(true)?;
+        let guard = self.locked(true)?;
         let mut document = self.read_document()?;
         let result = action(&mut document)?;
+        // The publish is the one state change, and it happens
+        // only while the lock this command holds is still the
+        // file at the lock path.
+        guard.verify()?;
         self.publish(&document)?;
         Ok(result)
     }
@@ -1919,6 +2072,20 @@ impl Registry {
                 }
                 kind = "taken_over";
                 previous = document.items[index].holder.clone();
+            }
+            // The epoch this claim assigns must be an epoch the
+            // reader can take back. A stored epoch at the
+            // unsigned top is a document the reader accepts, and
+            // assigning the next epoch would write a document no
+            // reader accepts, so the claim refuses here, before
+            // any state changes.
+            if document.items[index].epoch >= u64::MAX as i128 {
+                return Err(Error::Refusal(format!(
+                    "item {} stands at epoch {}, and no epoch past it can be \
+                     assigned, so the claim is refused",
+                    py_repr(item_id),
+                    document.items[index].epoch
+                )));
             }
             let token = draw_token()?;
             let expires = expiry_after(now, ttl)?;
@@ -2172,4 +2339,42 @@ pub fn check_possession(item: &Item, holder: &str, token: &str, epoch: &Value) -
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// The publish temporary name carries the process id and a
+    /// drawn suffix, so no outside test can know the name a
+    /// publish will choose and plant a file at it. The open the
+    /// publish uses is pinned here instead, at the helper the
+    /// publish itself calls.
+    #[test]
+    fn publish_temp_open_refuses_a_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!("dibs-unit-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "victim bytes").unwrap();
+        let temp = dir.join("staged.tmp");
+        std::os::unix::fs::symlink(&victim, &temp).unwrap();
+        // A plant at the name fails the open, and the victim
+        // keeps its bytes.
+        assert!(open_publish_temp(&temp).is_err());
+        let mut text = String::new();
+        File::open(&victim)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "victim bytes");
+        // A name nothing stands at opens and takes the write.
+        std::fs::remove_file(&temp).unwrap();
+        let mut handle = open_publish_temp(&temp).unwrap();
+        handle.write_all(b"staged bytes").unwrap();
+        drop(handle);
+        assert_eq!(std::fs::read(&temp).unwrap(), b"staged bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
