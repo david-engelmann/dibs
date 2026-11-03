@@ -37,6 +37,13 @@ class EmptyBytesInt(int):
         return b""
 
 
+class ForgedBitLengthInt(int):
+    """An int whose bit_length reports a small width."""
+
+    def bit_length(self):
+        return 8
+
+
 def test_the_full_lifecycle_through_the_binding(tmp_path):
     registry = str(tmp_path / "registry.json")
 
@@ -141,7 +148,10 @@ def test_refusals_raise_with_the_library_messages(tmp_path):
 
     with pytest.raises(dibs.RefusalError) as oversized_epoch:
         dibs.release(registry, "task-one", "alice", token, 2**200, T0)
-    assert "does not match the standing epoch 1" in str(oversized_epoch.value)
+    assert str(oversized_epoch.value) == (
+        "the epoch 170141183460469231731687303715884105727 presented for "
+        "item 'task-one' does not match the standing epoch 1"
+    )
 
     with pytest.raises(dibs.InvalidTtlError) as capped_ttl:
         dibs.claim(registry, "task-two", "alice", 10**5000, T0)
@@ -234,6 +244,12 @@ def test_wide_integer_digits_come_from_the_value_not_its_methods(tmp_path):
             registry, "task-two", "alice", ForgedBytesInt(-(10**5000)), T0
         )
     assert str(forged_negative.value) == "invalid time to live -" + whole + tail
+
+    with pytest.raises(dibs.InvalidTtlError) as forged_width:
+        dibs.claim(
+            registry, "task-two", "alice", ForgedBitLengthInt(10**5000), T0
+        )
+    assert str(forged_width.value) == "invalid time to live " + whole + tail
 
     board = rows_by_id(dibs.board(registry, T0))
     assert "task-two" not in board
