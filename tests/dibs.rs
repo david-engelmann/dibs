@@ -1083,6 +1083,22 @@ fn cross_validation_damage_shapes() {
         // The standing item names a holder its history never
         // ended with.
         Box::new(|doc| doc["items"][0]["holder"] = serde_json::json!("agent-z")),
+        // A takeover opens the recorded history at epoch 1,
+        // where no lease it could take over ever stood, since
+        // a first claim carries epoch 1 and a takeover carries
+        // one past the claim it replaces.
+        Box::new(|doc| {
+            let history = doc["history"].as_array_mut().unwrap();
+            history.truncate(7);
+            history.push(serde_json::json!({
+                "seq": 99, "kind": "taken_over", "item": "task-two", "holder": "agent-a",
+                "at": "2031-05-04T12:00:00+00:00", "epoch": 1, "previous_holder": "agent-z"
+            }));
+            doc["items"][1]["status"] = serde_json::json!("claimed");
+            doc["items"][1]["holder"] = serde_json::json!("agent-a");
+            doc["items"][1]["token_hash"] = serde_json::json!(dibs::token_hash("staged-token"));
+            doc["items"][1]["expires_at"] = serde_json::json!("2031-05-04T12:01:00+00:00");
+        }),
     ];
     for (index, change) in cases.iter().enumerate() {
         let (directory, text) = cross_mutated(&base, &format!("case-{index}"), change);
@@ -1221,6 +1237,39 @@ fn cross_validation_accepts_a_history_that_opens_mid_life() {
     let registry = Registry::new(dir.join("registry.json"));
     let granted = registry.claim("task-two", "agent-b", 60, &at(1)).unwrap();
     assert_eq!(granted.epoch, 2);
+    let rows = registry.board(&at(2)).unwrap();
+    assert_eq!(rows[0].status, "claimed");
+    assert_eq!(rows[0].epoch, 2);
+
+    // A history may also open with the takeover itself, at
+    // the epoch the takeover assigned, which never stands
+    // below 2 because the lease it took over was a claim and
+    // a first claim carries epoch 1.
+    let dir = temp_dir("cross-mid-life-takeover");
+    let taken = serde_json::json!({
+        "format": "dibs-registry/1",
+        "items": [{
+            "id": "task-three", "note": "", "status": "claimed", "holder": "agent-b",
+            "token_hash": dibs::token_hash("takeover-token"), "epoch": 2,
+            "expires_at": "2031-05-04T12:01:00+00:00"
+        }],
+        "history": [{
+            "seq": 1, "kind": "taken_over", "item": "task-three", "holder": "agent-b",
+            "at": "2031-05-04T12:00:00+00:00", "epoch": 2, "previous_holder": "agent-a"
+        }]
+    });
+    std::fs::write(
+        dir.join("registry.json"),
+        serde_json::to_string(&taken).unwrap(),
+    )
+    .unwrap();
+    let registry = Registry::new(dir.join("registry.json"));
+    let rows = registry.board(&t0()).unwrap();
+    assert_eq!(rows[0].status, "claimed");
+    assert_eq!(rows[0].epoch, 2);
+    registry
+        .renew("task-three", "agent-b", "takeover-token", 2, 60, &at(1))
+        .unwrap();
     let rows = registry.board(&at(2)).unwrap();
     assert_eq!(rows[0].status, "claimed");
     assert_eq!(rows[0].epoch, 2);
