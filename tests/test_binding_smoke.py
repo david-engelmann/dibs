@@ -251,6 +251,12 @@ def test_wide_integer_digits_come_from_the_value_not_its_methods(tmp_path):
         )
     assert str(forged_width.value) == "invalid time to live " + whole + tail
 
+    with pytest.raises(dibs.InvalidTtlError) as negative_width:
+        dibs.claim(
+            registry, "task-two", "alice", ForgedBitLengthInt(-(10**5000)), T0
+        )
+    assert str(negative_width.value) == "invalid time to live -" + whole + tail
+
     board = rows_by_id(dibs.board(registry, T0))
     assert "task-two" not in board
     assert board["task-one"]["status"] == "open"
