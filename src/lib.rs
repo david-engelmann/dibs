@@ -935,8 +935,15 @@ impl Instant {
 /// offsets under a Z or signed components that normalize inside
 /// a day. An Err is the unparseable case, and an Ok instant with
 /// no offset is the naive case, and the two stay distinct
-/// because the corruption messages name them distinctly.
-fn parse_instant(text: &str) -> std::result::Result<Instant, ()> {
+/// because the corruption messages name them distinctly. The
+/// parser is public so the Python binding can hand it the
+/// instant text a Python caller passes, and the one parser
+/// stays the only parser. The unit error is deliberate, because
+/// the parse carries exactly two outcomes the callers must not
+/// blur, a refusal and a naive instant, and that distinction
+/// rides on the Ok value rather than on an error payload.
+#[allow(clippy::result_unit_err)]
+pub fn parse_instant(text: &str) -> std::result::Result<Instant, ()> {
     let mut cursor = Cursor {
         chars: text.chars().collect(),
         pos: 0,
