@@ -1497,7 +1497,18 @@ fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<(
                 // chain names a previous holder from before
                 // the recorded history, and nothing recorded
                 // stands against that name, so it is taken as
-                // it stands.
+                // it stands. One floor still binds it, because
+                // a takeover replaces a claim and a first claim
+                // carries epoch 1, so no takeover in any life
+                // the writers write carries an epoch below 2.
+                if event.kind == "taken_over" && event.epoch < 2 {
+                    return Err(corrupt(format!(
+                        "a taken over event on item {} carries epoch {}, and no \
+                         takeover stands below epoch 2",
+                        py_repr(&event.item),
+                        event.epoch
+                    )));
+                }
                 let chain = match event.kind.as_str() {
                     "offered" => Chain {
                         phase: "open",
