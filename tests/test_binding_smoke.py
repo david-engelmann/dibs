@@ -23,6 +23,20 @@ def rows_by_id(rows):
     return {row["id"]: row for row in rows}
 
 
+class ForgedBytesInt(int):
+    """An int whose to_bytes hands back the bytes of a small number."""
+
+    def to_bytes(self, length=1, byteorder="big", *, signed=False):
+        return int.to_bytes(60, 8, byteorder, signed=True)
+
+
+class EmptyBytesInt(int):
+    """An int whose to_bytes hands back no bytes at all."""
+
+    def to_bytes(self, length=1, byteorder="big", *, signed=False):
+        return b""
+
+
 def test_the_full_lifecycle_through_the_binding(tmp_path):
     registry = str(tmp_path / "registry.json")
 
@@ -194,3 +208,33 @@ def test_integer_arguments_refuse_booleans(tmp_path):
     assert "task-two" not in board
     assert board["task-one"]["status"] == "claimed"
     assert board["task-one"]["expires_at"] == "2031-05-04T13:00:00+00:00"
+
+
+def test_wide_integer_digits_come_from_the_value_not_its_methods(tmp_path):
+    registry = str(tmp_path / "registry.json")
+    dibs.offer(registry, "task-one", T0)
+
+    whole = "1" + "0" * 5000
+    tail = ", use a positive integer number of seconds, at most 31536000"
+
+    with pytest.raises(dibs.InvalidTtlError) as forged:
+        dibs.claim(registry, "task-two", "alice", ForgedBytesInt(10**5000), T0)
+    assert str(forged.value) == "invalid time to live " + whole + tail
+
+    with pytest.raises(dibs.InvalidTtlError) as empty:
+        dibs.claim(registry, "task-two", "alice", EmptyBytesInt(10**5000), T0)
+    assert str(empty.value) == "invalid time to live " + whole + tail
+
+    with pytest.raises(dibs.InvalidTtlError) as negative:
+        dibs.claim(registry, "task-two", "alice", -(10**5000), T0)
+    assert str(negative.value) == "invalid time to live -" + whole + tail
+
+    with pytest.raises(dibs.InvalidTtlError) as forged_negative:
+        dibs.claim(
+            registry, "task-two", "alice", ForgedBytesInt(-(10**5000)), T0
+        )
+    assert str(forged_negative.value) == "invalid time to live -" + whole + tail
+
+    board = rows_by_id(dibs.board(registry, T0))
+    assert "task-two" not in board
+    assert board["task-one"]["status"] == "open"
