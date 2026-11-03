@@ -1,0 +1,25 @@
+[package]
+name = "dibs"
+version = "0.1.0"
+edition = "2021"
+description = "Atomic claims with expiring leases for shared agent backlogs"
+license = "MIT"
+
+[lib]
+name = "dibs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dibs"
+path = "src/bin/dibs.rs"
+
+[[bin]]
+name = "codepoint_scan"
+path = "src/bin/codepoint_scan.rs"
+
+[dependencies]
+serde = "1"
+serde_json = "1"
+sha2 = "0.10"
+fs2 = "0.4"
+getrandom = "0.3"

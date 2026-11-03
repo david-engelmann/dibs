@@ -1,0 +1,115 @@
+{
+  "format": "dibs-registry/1",
+  "items": [
+    {
+      "id": "task-alpha",
+      "note": "alpha payload",
+      "status": "open",
+      "holder": null,
+      "token_hash": null,
+      "epoch": 0,
+      "expires_at": null
+    },
+    {
+      "id": "task-beta",
+      "note": "beta payload",
+      "status": "claimed",
+      "holder": "agent-a",
+      "token_hash": "18f493a7123c61aa6d1f22bc16a903fbb5f27b16c0de870c5a8591a637668af6",
+      "epoch": 1,
+      "expires_at": "2031-05-04T12:10:04+00:00"
+    },
+    {
+      "id": "task-gamma",
+      "note": "gamma payload",
+      "status": "claimed",
+      "holder": "agent-c",
+      "token_hash": "cdbe6da92389f9dc0a09dbcf56b282caec02206729f982c8ff8e544ab4b93c83",
+      "epoch": 1,
+      "expires_at": "2031-05-04T12:00:35+00:00"
+    },
+    {
+      "id": "task-delta",
+      "note": "delta payload",
+      "status": "completed",
+      "holder": null,
+      "token_hash": null,
+      "epoch": 1,
+      "expires_at": null
+    }
+  ],
+  "history": [
+    {
+      "seq": 1,
+      "kind": "offered",
+      "item": "task-alpha",
+      "holder": null,
+      "at": "2031-05-04T12:00:00+00:00",
+      "epoch": 0,
+      "previous_holder": null
+    },
+    {
+      "seq": 2,
+      "kind": "offered",
+      "item": "task-beta",
+      "holder": null,
+      "at": "2031-05-04T12:00:01+00:00",
+      "epoch": 0,
+      "previous_holder": null
+    },
+    {
+      "seq": 3,
+      "kind": "offered",
+      "item": "task-gamma",
+      "holder": null,
+      "at": "2031-05-04T12:00:02+00:00",
+      "epoch": 0,
+      "previous_holder": null
+    },
+    {
+      "seq": 4,
+      "kind": "offered",
+      "item": "task-delta",
+      "holder": null,
+      "at": "2031-05-04T12:00:03+00:00",
+      "epoch": 0,
+      "previous_holder": null
+    },
+    {
+      "seq": 5,
+      "kind": "claimed",
+      "item": "task-beta",
+      "holder": "agent-a",
+      "at": "2031-05-04T12:00:04+00:00",
+      "epoch": 1,
+      "previous_holder": null
+    },
+    {
+      "seq": 6,
+      "kind": "claimed",
+      "item": "task-gamma",
+      "holder": "agent-c",
+      "at": "2031-05-04T12:00:05+00:00",
+      "epoch": 1,
+      "previous_holder": null
+    },
+    {
+      "seq": 7,
+      "kind": "claimed",
+      "item": "task-delta",
+      "holder": "agent-d",
+      "at": "2031-05-04T12:00:06+00:00",
+      "epoch": 1,
+      "previous_holder": null
+    },
+    {
+      "seq": 8,
+      "kind": "completed",
+      "item": "task-delta",
+      "holder": "agent-d",
+      "at": "2031-05-04T12:00:10+00:00",
+      "epoch": 1,
+      "previous_holder": null
+    }
+  ]
+}

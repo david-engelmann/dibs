@@ -1,0 +1,43 @@
+{
+  "format": "dibs-registry/1",
+  "items": [
+    {
+      "id": "task-alpha",
+      "note": "first payload",
+      "status": "claimed",
+      "holder": "agent-b",
+      "token_hash": "2adb0780bd56168f86c23ae786ce305930cbea54f9b1eac8e649621aedb2d085",
+      "epoch": 2,
+      "expires_at": "2031-05-04T12:12:00+00:00"
+    }
+  ],
+  "history": [
+    {
+      "seq": 1,
+      "kind": "offered",
+      "item": "task-alpha",
+      "holder": null,
+      "at": "2031-05-04T12:00:00+00:00",
+      "epoch": 0,
+      "previous_holder": null
+    },
+    {
+      "seq": 2,
+      "kind": "claimed",
+      "item": "task-alpha",
+      "holder": "agent-a",
+      "at": "2031-05-04T12:00:00+00:00",
+      "epoch": 1,
+      "previous_holder": null
+    },
+    {
+      "seq": 3,
+      "kind": "taken_over",
+      "item": "task-alpha",
+      "holder": "agent-b",
+      "at": "2031-05-04T12:02:00+00:00",
+      "epoch": 2,
+      "previous_holder": "agent-a"
+    }
+  ]
+}
