@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "dibs"
+version = "0.1.0"
+description = "Atomic claims with expiring leases for shared agent backlogs"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+
+[tool.maturin]
+module-name = "dibs._dibs"
+python-source = "../python"
