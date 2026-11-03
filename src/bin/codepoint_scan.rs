@@ -18,10 +18,15 @@
 //! error at exit 2, where the setup scanner let the failure escape
 //! as a traceback at exit 1. The walk excludes directories by name
 //! below the scan root, so the name of an ancestor of the root can
-//! never exclude the root itself, and every file in the tree is
-//! scanned, whatever its name or suffix, apart from the known
+//! never exclude the root itself, and every file the walk reaches
+//! is scanned, whatever its name or suffix, apart from the known
 //! binary suffixes, and a file that does not decode as UTF-8 fails
-//! the scan loudly instead of passing unseen.
+//! the scan loudly instead of passing unseen. Two limits of the
+//! walk stand named rather than fixed, exactly as they stood under
+//! the setup scanner. A directory that stands in the tree only as
+//! a symlink is not descended into, so the files beneath it pass
+//! unscanned, and a FIFO standing in the tree blocks the read that
+//! reaches it.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

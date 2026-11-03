@@ -148,10 +148,12 @@ fn is_option_like(token: &str) -> bool {
     }
     // A token in the shape of a negative number is positional,
     // as argparse's negative number matcher holds when no
-    // option looks like a negative number.
+    // option looks like a negative number. The digits of that
+    // shape are the decimal digits of the Python grammar, the
+    // same set the integer conversion below accepts.
     let body = &token[1..];
     let digits: String = body.chars().filter(|c| *c != '.').collect();
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+    if !digits.is_empty() && digits.chars().all(|c| py_digit_value(c).is_some()) {
         return false;
     }
     true
@@ -191,14 +193,104 @@ struct SubArgs {
     extras: Vec<String>,
 }
 
+/// The decimal digit ranges of the Unicode character set,
+/// each ten codepoints wide with the digit value standing at
+/// the offset inside its range, as probed against the Python
+/// runtime the conversion mirrors, Python 3.12.3 carrying
+/// Unicode 15.0.0. The Python int conversion accepts a digit
+/// from any of these families and no other numeric character.
+const DECIMAL_DIGIT_RANGES: [(u32, u32); 68] = [
+    (0x0030, 0x0039),
+    (0x0660, 0x0669),
+    (0x06f0, 0x06f9),
+    (0x07c0, 0x07c9),
+    (0x0966, 0x096f),
+    (0x09e6, 0x09ef),
+    (0x0a66, 0x0a6f),
+    (0x0ae6, 0x0aef),
+    (0x0b66, 0x0b6f),
+    (0x0be6, 0x0bef),
+    (0x0c66, 0x0c6f),
+    (0x0ce6, 0x0cef),
+    (0x0d66, 0x0d6f),
+    (0x0de6, 0x0def),
+    (0x0e50, 0x0e59),
+    (0x0ed0, 0x0ed9),
+    (0x0f20, 0x0f29),
+    (0x1040, 0x1049),
+    (0x1090, 0x1099),
+    (0x17e0, 0x17e9),
+    (0x1810, 0x1819),
+    (0x1946, 0x194f),
+    (0x19d0, 0x19d9),
+    (0x1a80, 0x1a89),
+    (0x1a90, 0x1a99),
+    (0x1b50, 0x1b59),
+    (0x1bb0, 0x1bb9),
+    (0x1c40, 0x1c49),
+    (0x1c50, 0x1c59),
+    (0xa620, 0xa629),
+    (0xa8d0, 0xa8d9),
+    (0xa900, 0xa909),
+    (0xa9d0, 0xa9d9),
+    (0xa9f0, 0xa9f9),
+    (0xaa50, 0xaa59),
+    (0xabf0, 0xabf9),
+    (0xff10, 0xff19),
+    (0x104a0, 0x104a9),
+    (0x10d30, 0x10d39),
+    (0x11066, 0x1106f),
+    (0x110f0, 0x110f9),
+    (0x11136, 0x1113f),
+    (0x111d0, 0x111d9),
+    (0x112f0, 0x112f9),
+    (0x11450, 0x11459),
+    (0x114d0, 0x114d9),
+    (0x11650, 0x11659),
+    (0x116c0, 0x116c9),
+    (0x11730, 0x11739),
+    (0x118e0, 0x118e9),
+    (0x11950, 0x11959),
+    (0x11c50, 0x11c59),
+    (0x11d50, 0x11d59),
+    (0x11da0, 0x11da9),
+    (0x11f50, 0x11f59),
+    (0x16a60, 0x16a69),
+    (0x16ac0, 0x16ac9),
+    (0x16b50, 0x16b59),
+    (0x1d7ce, 0x1d7d7),
+    (0x1d7d8, 0x1d7e1),
+    (0x1d7e2, 0x1d7eb),
+    (0x1d7ec, 0x1d7f5),
+    (0x1d7f6, 0x1d7ff),
+    (0x1e140, 0x1e149),
+    (0x1e2f0, 0x1e2f9),
+    (0x1e4f0, 0x1e4f9),
+    (0x1e950, 0x1e959),
+    (0x1fbf0, 0x1fbf9),
+];
+
+/// The value of one character under the Python int conversion,
+/// a decimal digit in any family of the table above, or None
+/// for any other character.
+fn py_digit_value(c: char) -> Option<u32> {
+    let n = c as u32;
+    DECIMAL_DIGIT_RANGES
+        .iter()
+        .find(|&&(low, high)| n >= low && n <= high)
+        .map(|&(low, _)| n - low)
+}
+
 /// Python's int conversion for the numeric arguments: optional
-/// surrounding whitespace, an optional sign, digits with single
-/// underscores between them. The value is kept whole, at 128 bit
-/// width when it fits and as its canonical digit text when it
-/// does not, so a later validation prints the number the caller
-/// typed rather than a parser failure.
+/// surrounding whitespace from the Unicode whitespace set, an
+/// optional sign, decimal digits from any family of the table
+/// above with single underscores between them. The value is
+/// kept whole, at 128 bit width when it fits and as its
+/// canonical digit text when it does not, so a later validation
+/// prints the number the caller typed rather than a parser
+/// failure.
 fn python_int(text: &str) -> Option<Value> {
-    let trimmed = text.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'));
+    let trimmed = text.trim_matches(|c: char| c.is_whitespace());
     let (negative, body) = if let Some(rest) = trimmed.strip_prefix('-') {
         (true, rest)
     } else if let Some(rest) = trimmed.strip_prefix('+') {
@@ -220,8 +312,8 @@ fn python_int(text: &str) -> Option<Value> {
             }
             previous_underscore = true;
             previous_digit = false;
-        } else if ch.is_ascii_digit() {
-            digits.push(ch);
+        } else if let Some(value) = py_digit_value(ch) {
+            digits.push(char::from_digit(value, 10).unwrap());
             previous_digit = true;
             previous_underscore = false;
             seen_digit = true;
