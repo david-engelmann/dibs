@@ -77,14 +77,18 @@ fn refuse_boolean(value: &Bound<'_, PyAny>, name: &str) -> PyResult<()> {
 /// digits of an integer to text conversion and a refusal past
 /// that cap must still print the number whole, and because a
 /// text conversion would print whatever an overridden __str__
-/// says rather than the digits of the value.
+/// says rather than the digits of the value. The two operations
+/// run on the int type itself with the value passed to them,
+/// never on the value, so an override of either method on a
+/// subclass of int cannot stand in for the arithmetic either.
 fn decimal_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
-    let bits: usize = value.call_method0("bit_length")?.extract()?;
+    let int_type = value.py().get_type::<PyInt>();
+    let bits: usize = int_type.call_method1("bit_length", (value,))?.extract()?;
     let byte_count = bits / 8 + 2;
     let signed = PyDict::new(value.py());
     signed.set_item("signed", true)?;
-    let bytes: Vec<u8> = value
-        .call_method("to_bytes", (byte_count, "big"), Some(&signed))?
+    let bytes: Vec<u8> = int_type
+        .call_method("to_bytes", (value, byte_count, "big"), Some(&signed))?
         .extract()?;
     let negative = bytes.first().is_some_and(|byte| byte & 0x80 != 0);
     let mut magnitude = bytes;
@@ -99,10 +103,15 @@ fn decimal_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
             carry = widened >> 8;
         }
     }
-    let first = magnitude
-        .iter()
-        .position(|byte| *byte != 0)
-        .unwrap_or(magnitude.len() - 1);
+    // A magnitude with no nonzero byte is the value zero, and
+    // its digits are 0. Naming that case outright keeps the
+    // scan for the first nonzero byte from ever subtracting
+    // from the length of an empty magnitude, whatever a
+    // conversion hands back.
+    let first = match magnitude.iter().position(|byte| *byte != 0) {
+        Some(index) => index,
+        None => return Ok("0".to_string()),
+    };
     let mut current: Vec<u8> = magnitude[first..].to_vec();
     let mut digits: Vec<u8> = Vec::new();
     while !current.is_empty() {
@@ -308,6 +317,14 @@ fn claim(
 /// and the token argument is the issued token, and the ttl
 /// argument is the added lease length in seconds, and the now
 /// argument is the current instant as ISO 8601 text.
+///
+/// The argument count is deliberate, because this signature
+/// mirrors the library renew call one for one, and the binding
+/// translates that call rather than restructuring it, so
+/// gathering the arguments into a parameter struct of the
+/// binding's own invention would add a shape the library does
+/// not have, and the too many arguments allow below carries
+/// this reason.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn renew(
