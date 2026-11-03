@@ -68,6 +68,68 @@ fn refuse_boolean(value: &Bound<'_, PyAny>, name: &str) -> PyResult<()> {
     }
 }
 
+/// The canonical decimal text of an integer too wide for the
+/// 128 bit width, taken from the value arithmetically.
+///
+/// The digits come from the integer operations bit_length and
+/// to_bytes and a base conversion here, never from a text
+/// conversion of the value, because the interpreter caps the
+/// digits of an integer to text conversion and a refusal past
+/// that cap must still print the number whole, and because a
+/// text conversion would print whatever an overridden __str__
+/// says rather than the digits of the value.
+fn decimal_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
+    let bits: usize = value.call_method0("bit_length")?.extract()?;
+    let byte_count = bits / 8 + 2;
+    let signed = PyDict::new(value.py());
+    signed.set_item("signed", true)?;
+    let bytes: Vec<u8> = value
+        .call_method("to_bytes", (byte_count, "big"), Some(&signed))?
+        .extract()?;
+    let negative = bytes.first().is_some_and(|byte| byte & 0x80 != 0);
+    let mut magnitude = bytes;
+    if negative {
+        for byte in magnitude.iter_mut() {
+            *byte = !*byte;
+        }
+        let mut carry = 1u16;
+        for byte in magnitude.iter_mut().rev() {
+            let widened = *byte as u16 + carry;
+            *byte = widened as u8;
+            carry = widened >> 8;
+        }
+    }
+    let first = magnitude
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(magnitude.len() - 1);
+    let mut current: Vec<u8> = magnitude[first..].to_vec();
+    let mut digits: Vec<u8> = Vec::new();
+    while !current.is_empty() {
+        let mut remainder = 0u32;
+        let mut next: Vec<u8> = Vec::with_capacity(current.len());
+        for byte in &current {
+            let acc = (remainder << 8) | *byte as u32;
+            let quotient = acc / 10;
+            remainder = acc % 10;
+            if !next.is_empty() || quotient != 0 {
+                next.push(quotient as u8);
+            }
+        }
+        digits.push(b'0' + remainder as u8);
+        current = next;
+    }
+    if digits.is_empty() {
+        digits.push(b'0');
+    }
+    digits.reverse();
+    let mut text: String = digits.iter().map(|byte| *byte as char).collect();
+    if negative && text != "0" {
+        text.insert(0, '-');
+    }
+    Ok(text)
+}
+
 /// Keep an integer argument whole, at 128 bit width when it fits
 /// and as its canonical decimal text when it does not, the way
 /// the command line converter keeps it, so a later library
@@ -79,8 +141,7 @@ fn integer_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         Ok(number) => Ok(Value::Int(number)),
         Err(err) => {
             if value.is_instance_of::<PyInt>() {
-                let text = value.str()?.extract::<String>()?;
-                Ok(Value::BigInt(text))
+                Ok(Value::BigInt(decimal_text(value)?))
             } else {
                 Err(err)
             }

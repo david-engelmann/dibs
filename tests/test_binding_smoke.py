@@ -125,6 +125,17 @@ def test_refusals_raise_with_the_library_messages(tmp_path):
         "the standing epoch 1"
     )
 
+    with pytest.raises(dibs.RefusalError) as oversized_epoch:
+        dibs.release(registry, "task-one", "alice", token, 2**200, T0)
+    assert "does not match the standing epoch 1" in str(oversized_epoch.value)
+
+    with pytest.raises(dibs.InvalidTtlError) as capped_ttl:
+        dibs.claim(registry, "task-two", "alice", 10**5000, T0)
+    assert str(capped_ttl.value).startswith("invalid time to live 1")
+    assert str(capped_ttl.value).endswith(
+        "use a positive integer number of seconds, at most 31536000"
+    )
+
     with pytest.raises(dibs.InvalidNameError) as invalid:
         dibs.offer(registry, "Not A Name", T0)
     assert str(invalid.value) == (
