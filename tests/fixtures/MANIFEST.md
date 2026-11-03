@@ -47,7 +47,7 @@ from dibs import core  # noqa: E402
 from dibs.core import Registry  # noqa: E402
 
 T0 = datetime(2031, 5, 4, 12, 0, 0, tzinfo=timezone.utc)
-OUT = Path.home() / "workspace" / "chat3-dibs-port" / "tests" / "fixtures"
+OUT = Path("tests") / "fixtures"
 
 
 def at(seconds):
