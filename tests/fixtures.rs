@@ -296,6 +296,29 @@ fn fixture_truths_read_back_under_rust() {
 }
 
 #[test]
+fn fixture_registries_pass_the_cross_validation() {
+    // The control for the Round 2 cross validation. Every
+    // registry the Python implementation wrote and froze must
+    // still read clean now that the reader joins the history
+    // to the standing state.
+    let names = [
+        "empty.json",
+        "offers.json",
+        "claimed.json",
+        "renewed.json",
+        "released.json",
+        "completed.json",
+        "taken-over.json",
+        "mixed.json",
+    ];
+    for name in names {
+        let (_, registry) = staged_fixture(&format!("cross-{name}"), name);
+        registry.board(&t0()).unwrap();
+        registry.history(None).unwrap();
+    }
+}
+
+#[test]
 fn fixture_claim_renews_and_completes_under_rust() {
     let (_, registry) = staged_fixture("continue-claimed", "claimed.json");
     let token = "J-55nqLzVcGYFXUo0PG0Y-jSixW_9ub2u_FI3GTSNhw";
