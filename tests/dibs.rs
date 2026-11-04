@@ -1169,6 +1169,66 @@ fn cross_validation_final_holder_message_names_both_holders() {
 }
 
 #[test]
+fn cross_validation_offer_message_names_the_case_that_fires_it() {
+    // An offer that arrives where the chain already holds an
+    // offer is a second offer, and the refusal says so. The
+    // damage family stages that case by repeating the first
+    // recorded event, and the sentence is the standing one.
+    let base = temp_dir("cross-offer-twice");
+    let error = cross_error(&base, "case", |doc| {
+        let offer = doc["history"][0].clone();
+        doc["history"].as_array_mut().unwrap().insert(1, offer);
+    });
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert!(
+        error.message().contains("is offered twice in its history"),
+        "{}",
+        error.message()
+    );
+
+    // A history that opens in the middle of a life holds no
+    // offer at all, so an offer that arrives after the opening
+    // event is the first offer the record carries, standing
+    // away from the first place. The refusal names that case
+    // and does not call the item offered twice.
+    let dir = temp_dir("cross-offer-misplaced");
+    let document = serde_json::json!({
+        "format": "dibs-registry/1",
+        "items": [{
+            "id": "task-one", "note": "", "status": "claimed", "holder": "agent-a",
+            "token_hash": dibs::token_hash("mid-life-token"), "epoch": 1,
+            "expires_at": "2031-05-04T12:01:00+00:00"
+        }],
+        "history": [
+            {
+                "seq": 1, "kind": "claimed", "item": "task-one", "holder": "agent-a",
+                "at": "2031-05-04T12:00:00+00:00", "epoch": 1, "previous_holder": null
+            },
+            {
+                "seq": 2, "kind": "offered", "item": "task-one", "holder": null,
+                "at": "2031-05-04T12:00:30+00:00", "epoch": 0, "previous_holder": null
+            }
+        ]
+    });
+    std::fs::write(
+        dir.join("registry.json"),
+        serde_json::to_string(&document).unwrap(),
+    )
+    .unwrap();
+    let registry = Registry::new(dir.join("registry.json"));
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert!(
+        error
+            .message()
+            .contains("does not stand first in its history"),
+        "{}",
+        error.message()
+    );
+    assert!(!error.message().contains("twice"), "{}", error.message());
+}
+
+#[test]
 fn cross_validation_accepts_a_history_that_opens_mid_life() {
     // The reader has always taken a standing item on its own
     // fields, so a recorded history may open in the middle of

@@ -1451,11 +1451,18 @@ fn validate_document(value: &Value) -> Result<Document> {
 /// The standing of one item history as the cross validation
 /// replays it. The phase names the state the chain stands in,
 /// in the status words of the format, and the holder and the
-/// epoch are the standing facts the chain has reached.
+/// epoch are the standing facts the chain has reached. The
+/// saw offer flag records whether an offer stands at the
+/// head of the recorded events, so an offer that arrives
+/// later is refused for the reason that fits its case, as a
+/// second offer where one already stands or as an offer out
+/// of its place where the chain opened in the middle of a
+/// life and holds no offer at all.
 struct Chain {
     phase: &'static str,
     holder: Option<String>,
     epoch: i128,
+    saw_offer: bool,
 }
 
 /// Join the two halves of the document the per field
@@ -1514,21 +1521,25 @@ fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<(
                         phase: "open",
                         holder: None,
                         epoch: event.epoch,
+                        saw_offer: true,
                     },
                     "claimed" | "taken_over" | "renewed" => Chain {
                         phase: "claimed",
                         holder: event.holder.clone(),
                         epoch: event.epoch,
+                        saw_offer: false,
                     },
                     "released" => Chain {
                         phase: "open",
                         holder: None,
                         epoch: event.epoch,
+                        saw_offer: false,
                     },
                     _ => Chain {
                         phase: "completed",
                         holder: None,
                         epoch: event.epoch,
+                        saw_offer: false,
                     },
                 };
                 chains.insert(event.item.as_str(), chain);
@@ -1543,8 +1554,14 @@ fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<(
         }
         match event.kind.as_str() {
             "offered" => {
+                if chain.saw_offer {
+                    return Err(corrupt(format!(
+                        "item {} is offered twice in its history",
+                        py_repr(&event.item)
+                    )));
+                }
                 return Err(corrupt(format!(
-                    "item {} is offered twice in its history",
+                    "an offered event on item {} does not stand first in its history",
                     py_repr(&event.item)
                 )));
             }
