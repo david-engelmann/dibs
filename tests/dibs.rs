@@ -951,6 +951,423 @@ fn damage_event_holder_name_message_names_the_event() {
     );
 }
 
+/// A registry holding two full lives, written by the library
+/// itself. One item stands claimed by its third holder after a
+/// release and a takeover, and one item stands completed. The
+/// cross validation damage family edits this document one
+/// disagreement at a time.
+fn rich_valid_dir(base: &Path, name: &str) -> PathBuf {
+    let directory = base.join(name);
+    std::fs::create_dir_all(&directory).unwrap();
+    let registry = Registry::new(directory.join("registry.json"));
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    let first = registry.claim("task-one", "agent-a", 60, &at(1)).unwrap();
+    registry
+        .renew("task-one", "agent-a", &first.token, 1, 60, &at(2))
+        .unwrap();
+    registry
+        .release("task-one", "agent-a", &first.token, 1, &at(3))
+        .unwrap();
+    registry.claim("task-one", "agent-b", 60, &at(4)).unwrap();
+    // The second lease runs out at second 64, so the claim at
+    // second 200 takes the item over.
+    let third = registry.claim("task-one", "agent-c", 60, &at(200)).unwrap();
+    registry
+        .renew("task-one", "agent-c", &third.token, 3, 60, &at(201))
+        .unwrap();
+    registry
+        .offer("task-two", "another synthetic task", &t0())
+        .unwrap();
+    let done = registry.claim("task-two", "agent-a", 60, &at(1)).unwrap();
+    registry
+        .complete("task-two", "agent-a", &done.token, 1, &at(2))
+        .unwrap();
+    directory
+}
+
+/// Renumber the history of an edited document so the sequence
+/// still grows by 1 from 1, which the per field validation
+/// demands before the cross validation ever runs.
+fn renumber(doc: &mut serde_json::Value) {
+    for (index, event) in doc["history"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        event["seq"] = serde_json::json!(index + 1);
+    }
+}
+
+fn cross_mutated(
+    base: &Path,
+    name: &str,
+    change: impl Fn(&mut serde_json::Value),
+) -> (PathBuf, String) {
+    let directory = rich_valid_dir(base, name);
+    let mut document: serde_json::Value = serde_json::from_str(&valid_text(&directory)).unwrap();
+    change(&mut document);
+    renumber(&mut document);
+    (directory, serde_json::to_string(&document).unwrap())
+}
+
+#[test]
+fn cross_validation_damage_shapes() {
+    let base = temp_dir("damage-cross");
+    let cases: Vec<DamageEdit> = vec![
+        // An event names an item that does not stand.
+        Box::new(|doc| {
+            doc["history"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "seq": 99, "kind": "offered", "item": "task-ghost", "holder": null,
+                    "at": "2031-05-04T12:00:00+00:00", "epoch": 0, "previous_holder": null
+                }));
+        }),
+        // A claim carries the standing epoch of its chain
+        // instead of one past it.
+        Box::new(|doc| doc["history"][4]["epoch"] = serde_json::json!(1)),
+        // An item is offered a second time.
+        Box::new(|doc| {
+            let offer = doc["history"][0].clone();
+            doc["history"].as_array_mut().unwrap().insert(1, offer);
+        }),
+        // An event stands after the item completed.
+        Box::new(|doc| {
+            doc["history"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "seq": 99, "kind": "renewed", "item": "task-two", "holder": "agent-a",
+                    "at": "2031-05-04T12:00:00+00:00", "epoch": 1, "previous_holder": null
+                }));
+        }),
+        // A plain claim stands where a lease already stands,
+        // a shape the writers record as a takeover.
+        Box::new(|doc| doc["history"][6]["kind"] = serde_json::json!("claimed")),
+        // A takeover stands where no lease stands.
+        Box::new(|doc| {
+            doc["history"][4]["kind"] = serde_json::json!("taken_over");
+            doc["history"][4]["previous_holder"] = serde_json::json!("agent-a");
+        }),
+        // A takeover names a previous holder who does not stand.
+        Box::new(|doc| doc["history"][5]["previous_holder"] = serde_json::json!("agent-z")),
+        // A renew stands where no lease stands.
+        Box::new(|doc| doc["history"][4]["kind"] = serde_json::json!("renewed")),
+        // A release stands where no lease stands.
+        Box::new(|doc| doc["history"][4]["kind"] = serde_json::json!("released")),
+        // A completion stands where no lease stands.
+        Box::new(|doc| doc["history"][4]["kind"] = serde_json::json!("completed")),
+        // A renew names a holder who does not stand.
+        Box::new(|doc| doc["history"][2]["holder"] = serde_json::json!("agent-b")),
+        // A release names a holder who does not stand.
+        Box::new(|doc| doc["history"][3]["holder"] = serde_json::json!("agent-b")),
+        // A claim jumps the epoch by more than one.
+        Box::new(|doc| doc["history"][1]["epoch"] = serde_json::json!(3)),
+        // A renew carries an epoch that does not stand.
+        Box::new(|doc| doc["history"][2]["epoch"] = serde_json::json!(2)),
+        // The standing item reads open where its history ends
+        // claimed.
+        Box::new(|doc| {
+            doc["items"][0]["status"] = serde_json::json!("open");
+            doc["items"][0]["holder"] = serde_json::Value::Null;
+            doc["items"][0]["token_hash"] = serde_json::Value::Null;
+            doc["items"][0]["expires_at"] = serde_json::Value::Null;
+        }),
+        // The standing item carries an epoch its history never
+        // reached.
+        Box::new(|doc| doc["items"][0]["epoch"] = serde_json::json!(4)),
+        // The standing item names a holder its history never
+        // ended with.
+        Box::new(|doc| doc["items"][0]["holder"] = serde_json::json!("agent-z")),
+        // A takeover opens the recorded history at epoch 1,
+        // where no lease it could take over ever stood, since
+        // a first claim carries epoch 1 and a takeover carries
+        // one past the claim it replaces.
+        Box::new(|doc| {
+            let history = doc["history"].as_array_mut().unwrap();
+            history.truncate(7);
+            history.push(serde_json::json!({
+                "seq": 99, "kind": "taken_over", "item": "task-two", "holder": "agent-a",
+                "at": "2031-05-04T12:00:00+00:00", "epoch": 1, "previous_holder": "agent-z"
+            }));
+            doc["items"][1]["status"] = serde_json::json!("claimed");
+            doc["items"][1]["holder"] = serde_json::json!("agent-a");
+            doc["items"][1]["token_hash"] = serde_json::json!(dibs::token_hash("staged-token"));
+            doc["items"][1]["expires_at"] = serde_json::json!("2031-05-04T12:01:00+00:00");
+        }),
+    ];
+    for (index, change) in cases.iter().enumerate() {
+        let (directory, text) = cross_mutated(&base, &format!("case-{index}"), change);
+        assert_corrupt_and_unchanged(&directory, &text);
+    }
+}
+
+fn cross_error(base: &Path, name: &str, change: impl Fn(&mut serde_json::Value)) -> Error {
+    let (directory, text) = cross_mutated(base, name, change);
+    let path = directory.join("registry.json");
+    std::fs::write(&path, text).unwrap();
+    let registry = Registry::new(path);
+    expect_error(registry.board(&at(1)))
+}
+
+#[test]
+fn cross_validation_orphan_event_names_the_item() {
+    let base = temp_dir("cross-orphan");
+    let error = cross_error(&base, "case", |doc| {
+        doc["history"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "seq": 99, "kind": "offered", "item": "task-ghost", "holder": null,
+                "at": "2031-05-04T12:00:00+00:00", "epoch": 0, "previous_holder": null
+            }));
+    });
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert!(
+        error
+            .message()
+            .contains("names item 'task-ghost', which does not stand in the backlog"),
+        "{}",
+        error.message()
+    );
+}
+
+#[test]
+fn cross_validation_claim_epoch_message_names_both_epochs() {
+    let base = temp_dir("cross-claim-epoch");
+    let error = cross_error(&base, "case", |doc| {
+        doc["history"][1]["epoch"] = serde_json::json!(3);
+    });
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert!(
+        error
+            .message()
+            .contains("carries epoch 3, not one past the standing epoch 0"),
+        "{}",
+        error.message()
+    );
+}
+
+#[test]
+fn cross_validation_final_holder_message_names_both_holders() {
+    let base = temp_dir("cross-final-holder");
+    let error = cross_error(&base, "case", |doc| {
+        doc["items"][0]["holder"] = serde_json::json!("agent-z");
+    });
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert!(
+        error
+            .message()
+            .contains("stands held by 'agent-z', not by 'agent-c' as its history ends"),
+        "{}",
+        error.message()
+    );
+}
+
+#[test]
+fn cross_validation_offer_message_names_the_case_that_fires_it() {
+    // An offer that arrives where the chain already holds an
+    // offer is a second offer, and the refusal says so. The
+    // damage family stages that case by repeating the first
+    // recorded event, and the sentence is the standing one.
+    let base = temp_dir("cross-offer-twice");
+    let error = cross_error(&base, "case", |doc| {
+        let offer = doc["history"][0].clone();
+        doc["history"].as_array_mut().unwrap().insert(1, offer);
+    });
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert!(
+        error.message().contains("is offered twice in its history"),
+        "{}",
+        error.message()
+    );
+
+    // A history that opens in the middle of a life holds no
+    // offer at all, so an offer that arrives after the opening
+    // event is the first offer the record carries, standing
+    // away from the first place. The refusal names that case
+    // and does not call the item offered twice.
+    let dir = temp_dir("cross-offer-misplaced");
+    let document = serde_json::json!({
+        "format": "dibs-registry/1",
+        "items": [{
+            "id": "task-one", "note": "", "status": "claimed", "holder": "agent-a",
+            "token_hash": dibs::token_hash("mid-life-token"), "epoch": 1,
+            "expires_at": "2031-05-04T12:01:00+00:00"
+        }],
+        "history": [
+            {
+                "seq": 1, "kind": "claimed", "item": "task-one", "holder": "agent-a",
+                "at": "2031-05-04T12:00:00+00:00", "epoch": 1, "previous_holder": null
+            },
+            {
+                "seq": 2, "kind": "offered", "item": "task-one", "holder": null,
+                "at": "2031-05-04T12:00:30+00:00", "epoch": 0, "previous_holder": null
+            }
+        ]
+    });
+    std::fs::write(
+        dir.join("registry.json"),
+        serde_json::to_string(&document).unwrap(),
+    )
+    .unwrap();
+    let registry = Registry::new(dir.join("registry.json"));
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert!(
+        error
+            .message()
+            .contains("does not stand first in its history"),
+        "{}",
+        error.message()
+    );
+    assert!(!error.message().contains("twice"), "{}", error.message());
+}
+
+#[test]
+fn cross_validation_accepts_a_history_that_opens_mid_life() {
+    // The reader has always taken a standing item on its own
+    // fields, so a recorded history may open in the middle of
+    // a life. The join opens the chain at the first recorded
+    // event, and the writers extend such a history one event
+    // at a time, and every step still reads clean.
+    let dir = temp_dir("cross-mid-life");
+    let claimed = serde_json::json!({
+        "format": "dibs-registry/1",
+        "items": [{
+            "id": "task-one", "note": "", "status": "claimed", "holder": "agent-a",
+            "token_hash": dibs::token_hash("mid-life-token"), "epoch": 1,
+            "expires_at": "2031-05-04T12:01:00+00:00"
+        }],
+        "history": [{
+            "seq": 1, "kind": "claimed", "item": "task-one", "holder": "agent-a",
+            "at": "2031-05-04T12:00:00+00:00", "epoch": 1, "previous_holder": null
+        }]
+    });
+    std::fs::write(
+        dir.join("registry.json"),
+        serde_json::to_string(&claimed).unwrap(),
+    )
+    .unwrap();
+    let registry = Registry::new(dir.join("registry.json"));
+    let rows = registry.board(&t0()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "claimed");
+    assert_eq!(rows[0].epoch, 1);
+    registry
+        .renew("task-one", "agent-a", "mid-life-token", 1, 60, &at(1))
+        .unwrap();
+    registry
+        .release("task-one", "agent-a", "mid-life-token", 1, &at(2))
+        .unwrap();
+    let rows = registry.board(&at(3)).unwrap();
+    assert_eq!(rows[0].status, "open");
+    assert_eq!(rows[0].epoch, 1);
+
+    // A chain that opens with a claim and a release already
+    // recorded reads clean as it stands, and a fresh claim
+    // advances the epoch from the recorded standing epoch.
+    let dir = temp_dir("cross-mid-life-released");
+    let released = serde_json::json!({
+        "format": "dibs-registry/1",
+        "items": [{
+            "id": "task-two", "note": "", "status": "open", "holder": null,
+            "token_hash": null, "epoch": 1, "expires_at": null
+        }],
+        "history": [
+            {
+                "seq": 1, "kind": "claimed", "item": "task-two", "holder": "agent-a",
+                "at": "2031-05-04T12:00:00+00:00", "epoch": 1, "previous_holder": null
+            },
+            {
+                "seq": 2, "kind": "released", "item": "task-two", "holder": "agent-a",
+                "at": "2031-05-04T12:00:30+00:00", "epoch": 1, "previous_holder": null
+            }
+        ]
+    });
+    std::fs::write(
+        dir.join("registry.json"),
+        serde_json::to_string(&released).unwrap(),
+    )
+    .unwrap();
+    let registry = Registry::new(dir.join("registry.json"));
+    let granted = registry.claim("task-two", "agent-b", 60, &at(1)).unwrap();
+    assert_eq!(granted.epoch, 2);
+    let rows = registry.board(&at(2)).unwrap();
+    assert_eq!(rows[0].status, "claimed");
+    assert_eq!(rows[0].epoch, 2);
+
+    // A history may also open with the takeover itself, at
+    // the epoch the takeover assigned, which never stands
+    // below 2 because the lease it took over was a claim and
+    // a first claim carries epoch 1.
+    let dir = temp_dir("cross-mid-life-takeover");
+    let taken = serde_json::json!({
+        "format": "dibs-registry/1",
+        "items": [{
+            "id": "task-three", "note": "", "status": "claimed", "holder": "agent-b",
+            "token_hash": dibs::token_hash("takeover-token"), "epoch": 2,
+            "expires_at": "2031-05-04T12:01:00+00:00"
+        }],
+        "history": [{
+            "seq": 1, "kind": "taken_over", "item": "task-three", "holder": "agent-b",
+            "at": "2031-05-04T12:00:00+00:00", "epoch": 2, "previous_holder": "agent-a"
+        }]
+    });
+    std::fs::write(
+        dir.join("registry.json"),
+        serde_json::to_string(&taken).unwrap(),
+    )
+    .unwrap();
+    let registry = Registry::new(dir.join("registry.json"));
+    let rows = registry.board(&t0()).unwrap();
+    assert_eq!(rows[0].status, "claimed");
+    assert_eq!(rows[0].epoch, 2);
+    registry
+        .renew("task-three", "agent-b", "takeover-token", 2, 60, &at(1))
+        .unwrap();
+    let rows = registry.board(&at(2)).unwrap();
+    assert_eq!(rows[0].status, "claimed");
+    assert_eq!(rows[0].epoch, 2);
+}
+
+#[test]
+fn cross_validation_reads_back_every_written_step() {
+    let dir = temp_dir("cross-round-trip");
+    let registry = make_registry(&dir);
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    assert_eq!(registry.history(None).unwrap().len(), 1);
+    let first = registry.claim("task-one", "agent-a", 60, &at(1)).unwrap();
+    assert_eq!(registry.board(&at(2)).unwrap()[0].status, "claimed");
+    registry
+        .renew("task-one", "agent-a", &first.token, 1, 60, &at(2))
+        .unwrap();
+    registry
+        .release("task-one", "agent-a", &first.token, 1, &at(3))
+        .unwrap();
+    assert_eq!(registry.board(&at(4)).unwrap()[0].status, "open");
+    let second = registry.claim("task-one", "agent-b", 60, &at(5)).unwrap();
+    assert_eq!(second.epoch, 2);
+    // The second lease runs out at second 65, so the claim at
+    // second 200 takes the item over.
+    let third = registry.claim("task-one", "agent-c", 60, &at(200)).unwrap();
+    assert_eq!(third.epoch, 3);
+    registry
+        .complete("task-one", "agent-c", &third.token, 3, &at(201))
+        .unwrap();
+    let events = registry.history(None).unwrap();
+    assert_eq!(events.len(), 7);
+    assert_eq!(events[5].kind, "taken_over");
+    assert_eq!(events[5].previous_holder.as_deref(), Some("agent-b"));
+    assert_eq!(registry.board(&at(202)).unwrap().len(), 0);
+}
+
 #[test]
 fn registry_survives_a_reopen_between_operations() {
     let dir = temp_dir("reopen");

@@ -29,7 +29,7 @@
 //! and the reshapings, and the error messages and the stored bytes
 //! reproduce the Python behaviour they name.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -1444,7 +1444,235 @@ fn validate_document(value: &Value) -> Result<Document> {
     for (position, event_value) in event_values.iter().enumerate() {
         history.push(validate_event(event_value, position)?);
     }
+    validate_history_against_items(&items, &history)?;
     Ok(Document { items, history })
+}
+
+/// The standing of one item history as the cross validation
+/// replays it. The phase names the state the chain stands in,
+/// in the status words of the format, and the holder and the
+/// epoch are the standing facts the chain has reached. The
+/// saw offer flag records whether an offer stands at the
+/// head of the recorded events, so an offer that arrives
+/// later is refused for the reason that fits its case, as a
+/// second offer where one already stands or as an offer out
+/// of its place where the chain opened in the middle of a
+/// life and holds no offer at all.
+struct Chain {
+    phase: &'static str,
+    holder: Option<String>,
+    epoch: i128,
+    saw_offer: bool,
+}
+
+/// Join the two halves of the document the per field
+/// validators checked separately, as the Round 2 amendment
+/// under DB-7 states. Every event must name an item that
+/// stands in the document, the events of one item must replay
+/// a passage of a life the writers write, and the end of each
+/// replay must agree with the standing item, in status and
+/// in epoch and, where the chain ends claimed, in holder. An
+/// item that stands with no events is not refused, and a
+/// chain may open in the middle of a life, because the
+/// reader has always taken a standing item on its own fields
+/// and the writers append single events onto the history
+/// that stands, so the first recorded event opens the chain
+/// wherever it stands and every later event is checked
+/// whole. The pass walks the history once with one chain
+/// standing per item, so its cost grows with the size of the
+/// document and never with its square.
+fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<()> {
+    let standing: HashSet<&str> = items.iter().map(|item| item.id.as_str()).collect();
+    let mut chains: HashMap<&str, Chain> = HashMap::new();
+    for event in history {
+        if !standing.contains(event.item.as_str()) {
+            return Err(corrupt(format!(
+                "a history event names item {}, which does not stand in the backlog",
+                py_repr(&event.item)
+            )));
+        }
+        let chain = match chains.get_mut(event.item.as_str()) {
+            Some(chain) => chain,
+            None => {
+                // The first recorded event opens the chain
+                // wherever it stands. The per field validation
+                // has already fixed the shape of the opening,
+                // an offer with no holder at epoch 0, a lease
+                // event with its holder and an epoch of at
+                // least 1, so the chain takes its standing
+                // from the event itself. A takeover opening a
+                // chain names a previous holder from before
+                // the recorded history, and nothing recorded
+                // stands against that name, so it is taken as
+                // it stands. One floor still binds it, because
+                // a takeover replaces a claim and a first claim
+                // carries epoch 1, so no takeover in any life
+                // the writers write carries an epoch below 2.
+                if event.kind == "taken_over" && event.epoch < 2 {
+                    return Err(corrupt(format!(
+                        "a taken over event on item {} carries epoch {}, and no \
+                         takeover stands below epoch 2",
+                        py_repr(&event.item),
+                        event.epoch
+                    )));
+                }
+                let chain = match event.kind.as_str() {
+                    "offered" => Chain {
+                        phase: "open",
+                        holder: None,
+                        epoch: event.epoch,
+                        saw_offer: true,
+                    },
+                    "claimed" | "taken_over" | "renewed" => Chain {
+                        phase: "claimed",
+                        holder: event.holder.clone(),
+                        epoch: event.epoch,
+                        saw_offer: false,
+                    },
+                    "released" => Chain {
+                        phase: "open",
+                        holder: None,
+                        epoch: event.epoch,
+                        saw_offer: false,
+                    },
+                    _ => Chain {
+                        phase: "completed",
+                        holder: None,
+                        epoch: event.epoch,
+                        saw_offer: false,
+                    },
+                };
+                chains.insert(event.item.as_str(), chain);
+                continue;
+            }
+        };
+        if chain.phase == "completed" {
+            return Err(corrupt(format!(
+                "the history of item {} continues past its completion",
+                py_repr(&event.item)
+            )));
+        }
+        match event.kind.as_str() {
+            "offered" => {
+                if chain.saw_offer {
+                    return Err(corrupt(format!(
+                        "item {} is offered twice in its history",
+                        py_repr(&event.item)
+                    )));
+                }
+                return Err(corrupt(format!(
+                    "an offered event on item {} does not stand first in its history",
+                    py_repr(&event.item)
+                )));
+            }
+            "claimed" | "taken_over" => {
+                if event.kind == "claimed" && chain.phase != "open" {
+                    return Err(corrupt(format!(
+                        "the history of item {} claims a lease that already stands",
+                        py_repr(&event.item)
+                    )));
+                }
+                if event.kind == "taken_over" {
+                    if chain.phase != "claimed" {
+                        return Err(corrupt(format!(
+                            "the history of item {} takes over a lease that does not stand",
+                            py_repr(&event.item)
+                        )));
+                    }
+                    if event.previous_holder.as_deref() != chain.holder.as_deref() {
+                        return Err(corrupt(format!(
+                            "a taken over event on item {} names {} as the previous \
+                             holder, not the standing holder {}",
+                            py_repr(&event.item),
+                            py_repr(event.previous_holder.as_deref().unwrap_or_default()),
+                            py_repr(chain.holder.as_deref().unwrap_or_default())
+                        )));
+                    }
+                }
+                if chain.epoch.checked_add(1) != Some(event.epoch) {
+                    return Err(corrupt(format!(
+                        "a claim event on item {} carries epoch {}, not one past \
+                         the standing epoch {}",
+                        py_repr(&event.item),
+                        event.epoch,
+                        chain.epoch
+                    )));
+                }
+                chain.phase = "claimed";
+                chain.holder = event.holder.clone();
+                chain.epoch = event.epoch;
+            }
+            kind => {
+                if chain.phase != "claimed" {
+                    let verb = match kind {
+                        "renewed" => "renews",
+                        "released" => "releases",
+                        _ => "completes",
+                    };
+                    return Err(corrupt(format!(
+                        "the history of item {} {verb} a lease that does not stand",
+                        py_repr(&event.item)
+                    )));
+                }
+                if event.holder.as_deref() != chain.holder.as_deref() {
+                    return Err(corrupt(format!(
+                        "a {kind} event on item {} names holder {}, not the \
+                         standing holder {}",
+                        py_repr(&event.item),
+                        py_repr(event.holder.as_deref().unwrap_or_default()),
+                        py_repr(chain.holder.as_deref().unwrap_or_default())
+                    )));
+                }
+                if event.epoch != chain.epoch {
+                    return Err(corrupt(format!(
+                        "a {kind} event on item {} carries epoch {}, not the \
+                         standing epoch {}",
+                        py_repr(&event.item),
+                        event.epoch,
+                        chain.epoch
+                    )));
+                }
+                if kind == "released" {
+                    chain.phase = "open";
+                    chain.holder = None;
+                } else if kind == "completed" {
+                    chain.phase = "completed";
+                    chain.holder = None;
+                }
+            }
+        }
+    }
+    for item in items {
+        let chain = match chains.get(item.id.as_str()) {
+            Some(chain) => chain,
+            None => continue,
+        };
+        if item.status != chain.phase {
+            return Err(corrupt(format!(
+                "item {} stands {} where its history ends {}",
+                py_repr(&item.id),
+                item.status,
+                chain.phase
+            )));
+        }
+        if item.epoch != chain.epoch {
+            return Err(corrupt(format!(
+                "item {} stands at epoch {} where its history ends at epoch {}",
+                py_repr(&item.id),
+                item.epoch,
+                chain.epoch
+            )));
+        }
+        if chain.phase == "claimed" && item.holder != chain.holder {
+            return Err(corrupt(format!(
+                "item {} stands held by {}, not by {} as its history ends",
+                py_repr(&item.id),
+                py_repr(item.holder.as_deref().unwrap_or_default()),
+                py_repr(chain.holder.as_deref().unwrap_or_default())
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Escape a string the way Python's json module escapes it with
