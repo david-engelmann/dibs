@@ -12,7 +12,7 @@ The remote seed was verified on 2026-11-02 against the staged seed and its commi
 
 The contract lives in CONTRACT.md. The setup obligations S1 to S5 stand at its head, and the Round 1 amendment below them states the protocol obligations DB-1 to DB-13 together with the probe findings they rest on. The Rust port that opens Round 2 replaces the Python package with a Rust crate that carries the same claim lease protocol over one registry file in the dibs-registry/1 format, with the operations offer and claim and renew and release and complete and board and history through the dibs library and the dibs binary. Claims are atomic under one exclusive flock, expiry is lazy and evaluated at an instant every operation is given, possession is proven by a token whose hash alone is stored, leases are fenced by epoch, and the full claim history is recorded inside the same document as the state.
 
-Closed perfection rounds are 2 of 100. A round counts only when a full cycle of work and audit and review and red team and approval has closed, and seeding and setup are not rounds.
+Closed perfection rounds are 3 of 100. A round counts only when a full cycle of work and audit and review and red team and approval has closed, and seeding and setup are not rounds.
 
 The local gate is cargo test plus the codepoint scan run through cargo, run on the exact final head before any push, with the continuous integration workflow running the same commands as a backstop.
 
