@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "dibs"
 version = "0.1.0"
-description = "Atomic claims with expiring leases for shared agent backlogs"
+description = "Agents call dibs on tasks with expiring leases, so parallel agents can share one backlog without a central boss handing out work."
 license = { text = "MIT" }
 requires-python = ">=3.9"
 
