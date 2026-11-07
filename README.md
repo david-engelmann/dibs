@@ -63,8 +63,8 @@ The examples below run in a new directory with a fresh registry, so every line o
 Two items are offered and one is claimed, and the board shows the claim standing next to the open item.
 
 ```
-dibs --registry backlog.json offer write-docs
-dibs --registry backlog.json offer fix-parser
+dibs --registry backlog.json offer write-docs --note "draft the user guide"
+dibs --registry backlog.json offer fix-parser --note "repair the date grammar"
 dibs --registry backlog.json claim --holder alice --ttl 3600 write-docs
 ```
 
@@ -88,8 +88,8 @@ fix-parser open epoch=0
 The holder renews the lease and then releases it. A renew extends the standing lease from its current expiry by the time to live, never from the instant of the renew. Presenting the token and the epoch is what proves the lease is the holder's to move, and the epoch shown is the one the claim printed.
 
 ```
-dibs --registry backlog.json renew --token GLzH-0Q7SzjISfdBeJcjGa0LXhyVF9DG-Av3B-w6gDA --epoch 1 --extend 1800 write-docs
-dibs --registry backlog.json release --token GLzH-0Q7SzjISfdBeJcjGa0LXhyVF9DG-Av3B-w6gDA --epoch 1 write-docs
+dibs --registry backlog.json renew --holder alice --token GLzH-0Q7SzjISfdBeJcjGa0LXhyVF9DG-Av3B-w6gDA --epoch 1 --ttl 1800 write-docs
+dibs --registry backlog.json release --holder alice --token GLzH-0Q7SzjISfdBeJcjGa0LXhyVF9DG-Av3B-w6gDA --epoch 1 write-docs
 ```
 
 ```
@@ -123,7 +123,7 @@ dibs --registry backlog.json history
 A lease that lapses frees its item on its own. The next claim takes the item over, the epoch rises, and the history records the takeover and names the previous holder. This run claims with a two second lease and waits three seconds before the second claim.
 
 ```
-dibs --registry backlog.json offer water-plants
+dibs --registry backlog.json offer water-plants --note "twice a week"
 dibs --registry backlog.json claim --holder bob --ttl 2 water-plants
 sleep 3
 dibs --registry backlog.json claim --holder carol --ttl 3600 water-plants
@@ -149,11 +149,10 @@ dibs --registry backlog.json history water-plants
 8 taken_over item=water-plants holder=carol at=2026-11-07T14:17:35.682217+00:00 epoch=2 previous_holder=bob
 ```
 
-The registry is read strictly. A document whose format name is wrong refuses every operation as corrupt, reads included, and the file is left exactly as it stands. Here the registry is copied and the copy's format name is changed to dibs-registry/2, and the board read against the copy prints one line on stderr and exits 1.
+The registry is read strictly. A document whose format name is wrong refuses every operation as corrupt, reads included, and the file is left exactly as it stands. Here the registry is written to a copy with the copy's format name changed to dibs-registry/2, and the board read against the copy prints one line on stderr and exits 1.
 
 ```
-cp backlog.json corrupt.json
-sed -i 's/dibs-registry\/1/dibs-registry\/2/' corrupt.json
+sed 's/dibs-registry\/1/dibs-registry\/2/' backlog.json > corrupt.json
 dibs --registry corrupt.json board
 ```
 
