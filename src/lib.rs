@@ -2612,4 +2612,55 @@ mod tests {
         assert_eq!(std::fs::read(&temp).unwrap(), b"staged bytes");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// The DB-14 table in CONTRACT.md states the key constants
+    /// of this crate exactly, in construction order, with the
+    /// status and kind vocabularies beside them. The pin stands
+    /// inside the crate because the constants are private.
+    #[test]
+    fn contract_field_table_matches_the_key_constants() {
+        let text = std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("CONTRACT.md"),
+        )
+        .unwrap();
+        let start = text.find("Obligation DB-14 covers").unwrap();
+        let after = &text[start..];
+        let end = after.find("The cost of working a registry").unwrap();
+        let db14 = after[..end].replace('\n', " ");
+        let field_list = |anchor: &str| -> Vec<String> {
+            let at = db14.find(anchor).unwrap();
+            let rest = &db14[at + anchor.len()..];
+            let stop = rest.find(", in that construction order").unwrap();
+            let phrase = rest[..stop].strip_prefix("exactly the fields ").unwrap();
+            phrase
+                .split(" and ")
+                .flat_map(|part| part.split(", "))
+                .map(|name| name.to_string())
+                .collect()
+        };
+        let vocabulary = |anchor: &str| -> Vec<String> {
+            let at = db14.find(anchor).unwrap();
+            let rest = &db14[at + anchor.len()..];
+            let stop = rest.find('.').unwrap();
+            rest[..stop]
+                .split(" and ")
+                .map(|name| name.to_string())
+                .collect()
+        };
+        let assert_order = |stated: Vec<String>, constants: &[&str]| {
+            let expected: Vec<String> = constants.iter().map(|c| c.to_string()).collect();
+            assert_eq!(stated, expected);
+        };
+        assert_order(
+            field_list("document is one JSON object carrying "),
+            &DOCUMENT_KEYS,
+        );
+        assert_order(field_list("Each item object carries "), &ITEM_KEYS);
+        assert_order(field_list("Each event object carries "), &EVENT_KEYS);
+        assert_order(
+            vocabulary("The status field carries one of "),
+            &ITEM_STATUSES,
+        );
+        assert_order(vocabulary("The kind field carries one of "), &EVENT_KINDS);
+    }
 }
