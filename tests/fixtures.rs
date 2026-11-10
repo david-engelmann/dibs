@@ -87,6 +87,213 @@ fn claimed_document(expires_at: &str) -> String {
     )
 }
 
+/// The DB-14 statement's field lists and vocabularies, as
+/// lists of names in construction order.
+type ContractTable = (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
+/// Read the DB-14 statement out of CONTRACT.md and return its
+/// three field lists in construction order beside the two
+/// vocabularies, as lists of names.
+fn contract_table() -> ContractTable {
+    let text =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("CONTRACT.md"))
+            .unwrap();
+    let start = text.find("Obligation DB-14 covers").unwrap();
+    let after = &text[start..];
+    let end = after.find("The cost of working a registry").unwrap();
+    let db14 = after[..end].replace('\n', " ");
+    let field_list = |anchor: &str| -> Vec<String> {
+        let at = db14.find(anchor).unwrap();
+        let rest = &db14[at + anchor.len()..];
+        let stop = rest.find(", in that construction order").unwrap();
+        let phrase = rest[..stop].strip_prefix("exactly the fields ").unwrap();
+        phrase
+            .split(" and ")
+            .flat_map(|part| part.split(", "))
+            .map(|name| name.to_string())
+            .collect()
+    };
+    let vocabulary = |anchor: &str| -> Vec<String> {
+        let at = db14.find(anchor).unwrap();
+        let rest = &db14[at + anchor.len()..];
+        let stop = rest.find('.').unwrap();
+        rest[..stop]
+            .split(" and ")
+            .map(|name| name.to_string())
+            .collect()
+    };
+    (
+        field_list("document is one JSON object carrying "),
+        field_list("Each item object carries "),
+        field_list("Each event object carries "),
+        vocabulary("The status field carries one of "),
+        vocabulary("The kind field carries one of "),
+    )
+}
+
+/// Check a list of names against the stated set, as a set.
+fn assert_key_set(got: Vec<&str>, stated: &[String], where_: &str) {
+    let stated_set: std::collections::BTreeSet<&str> = stated.iter().map(String::as_str).collect();
+    let got_set: std::collections::BTreeSet<&str> = got.iter().copied().collect();
+    assert_eq!(got_set, stated_set, "{where_}");
+}
+
+#[test]
+fn contract_field_table_matches_the_frozen_fixtures() {
+    let (document_keys, item_keys, event_keys, statuses, kinds) = contract_table();
+    let names = [
+        "empty.json",
+        "offers.json",
+        "claimed.json",
+        "renewed.json",
+        "released.json",
+        "completed.json",
+        "taken-over.json",
+        "mixed.json",
+    ];
+    for name in names {
+        let raw = std::fs::read(fixture_path(name)).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let document = value.as_object().unwrap();
+        assert_key_set(
+            document.keys().map(String::as_str).collect(),
+            &document_keys,
+            name,
+        );
+        for item in document["items"].as_array().unwrap() {
+            assert_key_set(
+                item.as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect(),
+                &item_keys,
+                name,
+            );
+            let status = item["status"].as_str().unwrap();
+            assert!(
+                statuses.iter().any(|stated| stated == status),
+                "{name} carries status {status} outside the table"
+            );
+        }
+        for event in document["history"].as_array().unwrap() {
+            assert_key_set(
+                event
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect(),
+                &event_keys,
+                name,
+            );
+            let kind = event["kind"].as_str().unwrap();
+            assert!(
+                kinds.iter().any(|stated| stated == kind),
+                "{name} carries kind {kind} outside the table"
+            );
+        }
+    }
+}
+
+/// One registry document built by hand from the DB-14 table
+/// alone. One item stands open with no events, one stands
+/// claimed with its lease fields standing, and the two events
+/// the claimed item's life produces stand recorded.
+fn stranger_document(token_spelling: &str) -> String {
+    format!(
+        "{{\"format\": \"dibs-registry/1\", \"items\": [\
+         {{\"id\": \"task-alpha\", \"note\": \"alpha payload\", \"status\": \"open\", \
+         \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}, \
+         {{\"id\": \"task-beta\", \"note\": \"beta payload\", \"status\": \"claimed\", \
+         \"holder\": \"agent-a\", \"{token_spelling}\": \"{}\", \"epoch\": 1, \
+         \"expires_at\": \"2031-05-04T12:10:00+00:00\"}}], \
+         \"history\": [\
+         {{\"seq\": 1, \"kind\": \"offered\", \"item\": \"task-beta\", \
+         \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
+         \"previous_holder\": null}}, \
+         {{\"seq\": 2, \"kind\": \"claimed\", \"item\": \"task-beta\", \
+         \"holder\": \"agent-a\", \"at\": \"2031-05-04T12:00:10+00:00\", \"epoch\": 1, \
+         \"previous_holder\": null}}]}}",
+        dibs::token_hash("stranger-token")
+    )
+}
+
+#[test]
+fn a_document_built_from_the_contract_table_alone_reads_clean() {
+    let (_, registry) = staged_document("stranger-clean", &stranger_document("token_hash"));
+    let rows = registry.board(&t0()).unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    row.status.clone(),
+                    row.holder.clone(),
+                    row.epoch,
+                    row.expires_at.clone(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            ("task-alpha".to_string(), "open".to_string(), None, 0, None,),
+            (
+                "task-beta".to_string(),
+                "claimed".to_string(),
+                Some("agent-a".to_string()),
+                1,
+                Some("2031-05-04T12:10:00+00:00".to_string()),
+            ),
+        ]
+    );
+    let events = registry.history(None).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].seq, 1);
+    assert_eq!(events[0].kind, "offered");
+    assert_eq!(events[0].item, "task-beta");
+    assert_eq!(events[0].holder, None);
+    assert_eq!(events[0].at, "2031-05-04T12:00:00+00:00");
+    assert_eq!(events[0].epoch, 0);
+    assert_eq!(events[0].previous_holder, None);
+    assert_eq!(events[1].seq, 2);
+    assert_eq!(events[1].kind, "claimed");
+    assert_eq!(events[1].item, "task-beta");
+    assert_eq!(events[1].holder.as_deref(), Some("agent-a"));
+    assert_eq!(events[1].at, "2031-05-04T12:00:10+00:00");
+    assert_eq!(events[1].epoch, 1);
+    assert_eq!(events[1].previous_holder, None);
+    let filtered = registry.history(Some("task-beta")).unwrap();
+    assert_eq!(filtered.len(), 2);
+    assert!(registry.history(Some("task-alpha")).unwrap().is_empty());
+}
+
+#[test]
+fn a_document_with_one_field_respelled_refuses_as_corruption() {
+    let text = stranger_document("token-hash");
+    let (dir, registry) = staged_document("stranger-respelled", &text);
+    let path = dir.join("registry.json");
+    let before = std::fs::read(&path).unwrap();
+    for error in [
+        expect_error(registry.board(&t0())),
+        expect_error(registry.history(None)),
+        expect_error(registry.history(Some("task-alpha"))),
+        expect_error(registry.offer("task-gamma", "gamma payload", &t0())),
+        expect_error(registry.claim("task-alpha", "agent-b", 600, &t0())),
+    ] {
+        assert!(
+            matches!(error, Error::Corrupt(_)),
+            "the respelled document refused as {error:?}, not corruption"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
 #[test]
 fn fixture_hashes_match_the_manifest_inventory() {
     let inventory: [(&str, usize, &str); 8] = [
