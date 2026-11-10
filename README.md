@@ -196,9 +196,9 @@ What does not. The command line reads the wall clock on every call and takes no 
 
 What is not built. Expiry is access-only, with no notifications and no watchers. There are no priorities and no queues, and the board lists items in offer order. One registry lives in one file on one machine, serving callers that share its filesystem, and there is no network service and no federation between registries. A lost token has no recovery path. The history is unbounded, with no compaction, pruning, or export, and it grows with every event for as long as the registry lives.
 
-The registry format, dibs-registry/1, is a protocol surface that other programs pin, so its document shape and error text are load-bearing beyond this repo. The Rust test suite carries 131 root tests across every operation and the Python binding smoke test carries 4, and both suites pass on the current head with the binding built the way CI builds it.
+The registry format, dibs-registry/1, is a protocol surface that other programs pin, so its document shape and error text are load-bearing beyond this repo. The Rust test suite carries 135 root tests across every operation and the Python binding smoke test carries 4, and both suites pass on the current head with the binding built the way CI builds it.
 
-Closed perfection rounds are 4 of 100. The program began as a seed commit whose state is independently verifiable against c1533bbc5fcfb803c1511d677d36c3c3925f075d.
+Closed perfection rounds are 5 of 100. The program began as a seed commit whose state is independently verifiable against c1533bbc5fcfb803c1511d677d36c3c3925f075d.
 
 ## License
 
