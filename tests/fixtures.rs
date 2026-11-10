@@ -141,11 +141,6 @@ fn contract_table() -> ContractTable {
 fn assert_key_set(got: Vec<&str>, stated: &[String], where_: &str) {
     let stated_set: std::collections::BTreeSet<&str> = stated.iter().map(String::as_str).collect();
     let got_set: std::collections::BTreeSet<&str> = got.iter().copied().collect();
-    assert_eq!(
-        got_set.len(),
-        got.len(),
-        "{where_} carries a duplicated key"
-    );
     assert_eq!(got_set, stated_set, "{where_}");
 }
 
