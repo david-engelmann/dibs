@@ -198,7 +198,7 @@ What is not built. Expiry is access-only, with no notifications and no watchers.
 
 The registry format, dibs-registry/1, is a protocol surface that other programs pin, so its document shape and error text are load-bearing beyond this repo. The Rust test suite carries 135 root tests across every operation and the Python binding smoke test carries 4, and both suites pass on the current head with the binding built the way CI builds it.
 
-Closed perfection rounds are 42 of 100. The program began as a seed commit whose state is independently verifiable against c1533bbc5fcfb803c1511d677d36c3c3925f075d.
+Closed perfection rounds are 43 of 100. The program began as a seed commit whose state is independently verifiable against c1533bbc5fcfb803c1511d677d36c3c3925f075d.
 
 ## License
 
