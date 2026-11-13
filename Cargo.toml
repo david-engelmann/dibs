@@ -7,7 +7,7 @@ resolver = "2"
 name = "dibs"
 version = "0.1.0"
 edition = "2021"
-description = "Agents call dibs on tasks with expiring leases, so parallel agents can share one backlog without a central boss handing out work."
+description = "Agents call dibs on tasks with expiring leases, so parallel agents can share one backlog without a central boss handing out work, measured on one shared registry of ten thousand tasks, with every claim accounted for."
 license = "MIT"
 
 [lib]

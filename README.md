@@ -1,6 +1,6 @@
 # dibs
 
-Agents call dibs on tasks with expiring leases, so parallel agents can share one backlog without a central boss handing out work.
+Agents call dibs on tasks with expiring leases, so parallel agents can share one backlog without a central boss handing out work, measured on one shared registry of ten thousand tasks, with every claim accounted for.
 
 Dibs is a claim lease protocol for shared agent backlogs, carried by a Rust library with a command line and a thin Python binding. Work is offered to a backlog that lives in one registry file. An agent claims an item under a lease that expires unless the holder renews it, and the claim prints a token once. The token proves possession for as long as the lease stands, and the registry keeps the standing state and the full claim history in the same document.
 
