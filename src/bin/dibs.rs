@@ -10,8 +10,12 @@
 //! line: the same usage texts, the same parser error messages at
 //! exit 2, unambiguous prefix abbreviations of long options, the
 //! equals form, and parser extras reported by the top level
-//! parser.
+//! parser. Arguments are read from the operating system
+//! unconverted: the registry path is carried as a path, and an
+//! argument that is not Unicode text in any other position is
+//! refused as a parser error, never a panic.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -290,7 +294,12 @@ fn py_digit_value(c: char) -> Option<u32> {
 /// prints the number the caller typed rather than a parser
 /// failure.
 fn python_int(text: &str) -> Option<Value> {
-    let trimmed = text.trim_matches(|c: char| c.is_whitespace());
+    // The trim set is the Python one: the Unicode whitespace
+    // set plus the separator controls U+001C to U+001F, which
+    // the Python conversion strips and char::is_whitespace
+    // omits.
+    let trimmed =
+        text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c));
     let (negative, body) = if let Some(rest) = trimmed.strip_prefix('-') {
         (true, rest)
     } else if let Some(rest) = trimmed.strip_prefix('+') {
@@ -566,26 +575,35 @@ fn epoch_argument(value: &Value) -> i128 {
 }
 
 fn run() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
     match dispatch(&argv) {
         Ok(code) => code,
         Err(error) => report_error(&error),
     }
 }
 
-fn dispatch(argv: &[String]) -> Result<ExitCode, Error> {
+fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
     // Parse the top level: the registry option and the subcommand
     // word, with the remaining tokens handed to the subcommand.
     // The first token that is not an option is the subcommand,
     // and a double dash before it is taken as the subcommand word
-    // itself, as the Python parser took it.
-    let mut registry_path: Option<String> = None;
+    // itself, as the Python parser took it. The registry value is
+    // the one argument carried unconverted, because a path may
+    // hold bytes that are not Unicode; every other argument is
+    // text, and one that is not Unicode is a parser error.
+    let mut registry_path: Option<PathBuf> = None;
     let mut index = 0;
     let mut command: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut extras: Vec<String> = Vec::new();
     while index < argv.len() {
-        let token = &argv[index];
+        let Some(token) = argv[index].to_str() else {
+            return Ok(parser_fail(
+                MAIN_USAGE,
+                "dibs",
+                "an argument is not valid Unicode text",
+            ));
+        };
         if token == "-h" || token == "--help" {
             println!("{MAIN_HELP}");
             return Ok(ExitCode::from(0));
@@ -593,7 +611,7 @@ fn dispatch(argv: &[String]) -> Result<ExitCode, Error> {
         if token.starts_with("--") && token.len() > 2 {
             let (name, inline_value) = match token.find('=') {
                 Some(pos) => (&token[..pos], Some(token[pos + 1..].to_string())),
-                None => (&token[..], None),
+                None => (token, None),
             };
             match resolve_long(name, &["--help", "--registry"]) {
                 Ok(Some("--help")) => {
@@ -602,10 +620,12 @@ fn dispatch(argv: &[String]) -> Result<ExitCode, Error> {
                 }
                 Ok(Some("--registry")) => {
                     if let Some(value) = inline_value {
-                        registry_path = Some(value);
+                        registry_path = Some(PathBuf::from(value));
                         index += 1;
-                    } else if index + 1 < argv.len() && !is_option_like(&argv[index + 1]) {
-                        registry_path = Some(argv[index + 1].clone());
+                    } else if index + 1 < argv.len()
+                        && !argv[index + 1].to_str().is_some_and(is_option_like)
+                    {
+                        registry_path = Some(PathBuf::from(&argv[index + 1]));
                         index += 2;
                     } else {
                         return Ok(parser_fail(
@@ -618,7 +638,7 @@ fn dispatch(argv: &[String]) -> Result<ExitCode, Error> {
                 }
                 Ok(Some(_)) => unreachable!(),
                 Ok(None) => {
-                    extras.push(token.clone());
+                    extras.push(token.to_string());
                     index += 1;
                     continue;
                 }
@@ -628,12 +648,24 @@ fn dispatch(argv: &[String]) -> Result<ExitCode, Error> {
             }
         }
         if token != "--" && is_option_like(token) {
-            extras.push(token.clone());
+            extras.push(token.to_string());
             index += 1;
             continue;
         }
-        command = Some(token.clone());
-        rest = argv[index + 1..].to_vec();
+        command = Some(token.to_string());
+        rest = Vec::new();
+        for argument in &argv[index + 1..] {
+            match argument.to_str() {
+                Some(text) => rest.push(text.to_string()),
+                None => {
+                    return Ok(parser_fail(
+                        sub_usage(token),
+                        &format!("dibs {token}"),
+                        "an argument is not valid Unicode text",
+                    ));
+                }
+            }
+        }
         break;
     }
     let Some(command) = command else {
@@ -685,7 +717,7 @@ fn dispatch(argv: &[String]) -> Result<ExitCode, Error> {
             &format!("unrecognized arguments: {}", extras.join(" ")),
         ));
     }
-    let registry = Registry::new(PathBuf::from(registry_path.unwrap()));
+    let registry = Registry::new(registry_path.unwrap());
     let now = Instant::now_utc();
     let item = args.positionals.first().cloned();
     match command.as_str() {
