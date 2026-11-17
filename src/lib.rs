@@ -1101,7 +1101,12 @@ fn duplicate_key_of(error_text: &str) -> Option<String> {
     let marker = "dibs-duplicate-key\x1f";
     let start = error_text.find(marker)? + marker.len();
     let rest = &error_text[start..];
-    let end = rest.find(" at line ").unwrap_or(rest.len());
+    // The position suffix serde_json appends stands last in the
+    // text, so the cut takes the last occurrence of the separator.
+    // A key that itself carries the separator is recovered whole,
+    // where cutting at the first occurrence named only the part
+    // of the key standing before it.
+    let end = rest.rfind(" at line ").unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
 
