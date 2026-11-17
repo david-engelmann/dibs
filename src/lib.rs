@@ -1799,9 +1799,8 @@ fn render_document(document: &Document) -> String {
     // item's offered event means the sum over-reserves by about
     // one event per item, a transient overallocation that costs
     // no reallocation copies on the growth path.
-    let mut out = String::with_capacity(
-        64 + document.items.len() * 392 + document.history.len() * 202,
-    );
+    let mut out =
+        String::with_capacity(64 + document.items.len() * 392 + document.history.len() * 202);
     out.push_str("{\n");
     write_indent(&mut out, 1);
     escape_json_string("format", &mut out);
