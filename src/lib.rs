@@ -2079,7 +2079,11 @@ impl Registry {
         let raw = match std::fs::read(&self.path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(empty_document()),
-            Err(err) => return Err(corrupt(format!("the registry file cannot be read, {err}"))),
+            Err(err) => {
+                return Err(Error::Failure(format!(
+                    "the registry file cannot be read, {err}"
+                )))
+            }
         };
         let text = decode_document_bytes(&raw)
             .map_err(|detail| corrupt(format!("the document does not parse, {detail}")))?;
@@ -2500,8 +2504,9 @@ impl Registry {
         }
     }
 
-    /// Return the open items in offer order, evaluated at the
-    /// instant.
+    /// Return the items standing on the board in offer order,
+    /// the open items and the live claimed items, evaluated at
+    /// the instant.
     pub fn board(&self, now: &Instant) -> Result<Vec<BoardRow>> {
         validate_now(now)?;
         self.read(|document| {

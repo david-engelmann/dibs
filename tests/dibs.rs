@@ -739,6 +739,26 @@ fn a_naive_instant_is_refused() {
 }
 
 #[test]
+fn an_os_failure_reading_the_registry_is_a_failure_not_corruption() {
+    // The registry path stands as a directory, so reading it
+    // fails in the operating system rather than in the document.
+    // The error names the failure for what it is, where the read
+    // as first built reported the same case as corruption.
+    let dir = temp_dir("unreadable-registry");
+    let path = dir.join("registry.json");
+    std::fs::create_dir_all(&path).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Failure(_)), "{error:?}");
+    assert!(
+        error.message().contains("the registry file cannot be read"),
+        "{}",
+        error.message()
+    );
+    assert_eq!(error.exit_code(), 1);
+}
+
+#[test]
 fn missing_registry_reads_empty_and_the_first_mutation_creates_it() {
     let dir = temp_dir("missing-registry");
     let path = dir.join("deep").join("nested").join("registry.json");
