@@ -2145,6 +2145,21 @@ impl Registry {
         validate_document(&value)
     }
 
+    /// The directory the registry file stands in, with a
+    /// path carrying no directory part naming the current
+    /// directory. The mutation path creates it and the publish
+    /// path syncs it, and both take it from here so the rule
+    /// stands stated once.
+    fn parent_dir(&self) -> Option<PathBuf> {
+        self.path.parent().map(|parent| {
+            if parent.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            }
+        })
+    }
+
     fn publish(&self, document: &Document) -> Result<()> {
         let text = render_document(document) + "\n";
         let name = self
@@ -2168,13 +2183,8 @@ impl Registry {
                 "the registry could not be published, {err}"
             )));
         }
-        if let Some(parent) = self.path.parent() {
-            let dir = if parent.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent
-            };
-            if let Ok(handle) = File::open(dir) {
+        if let Some(dir) = self.parent_dir() {
+            if let Ok(handle) = File::open(&dir) {
                 let _ = handle.sync_all();
             }
         }
@@ -2182,14 +2192,7 @@ impl Registry {
     }
 
     fn mutate<T>(&self, action: impl FnOnce(&mut Document) -> Result<T>) -> Result<T> {
-        let parent = self.path.parent().map(|parent| {
-            if parent.as_os_str().is_empty() {
-                PathBuf::from(".")
-            } else {
-                parent.to_path_buf()
-            }
-        });
-        if let Some(parent) = parent {
+        if let Some(parent) = self.parent_dir() {
             std::fs::create_dir_all(&parent).map_err(|err| {
                 Error::Failure(format!("the registry directory cannot be created, {err}"))
             })?;
@@ -2606,6 +2609,24 @@ pub fn check_possession(item: &Item, holder: &str, token: &str, epoch: &Value) -
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn parent_dir_names_the_current_directory_for_a_bare_name() {
+        let registry = Registry::new(PathBuf::from("registry.json"));
+        assert_eq!(registry.parent_dir(), Some(PathBuf::from(".")));
+    }
+
+    #[test]
+    fn parent_dir_returns_a_nested_parent_unchanged() {
+        let registry = Registry::new(PathBuf::from("a/b/registry.json"));
+        assert_eq!(registry.parent_dir(), Some(PathBuf::from("a/b")));
+    }
+
+    #[test]
+    fn parent_dir_returns_the_root_for_a_root_level_file() {
+        let registry = Registry::new(PathBuf::from("/registry.json"));
+        assert_eq!(registry.parent_dir(), Some(PathBuf::from("/")));
+    }
 
     /// The publish temporary name carries the process id and a
     /// drawn suffix, so no outside test can know the name a
