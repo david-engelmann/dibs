@@ -2245,13 +2245,9 @@ impl Registry {
         Ok(*now < expires)
     }
 
-    fn standing_lease<'a>(
-        document: &'a Document,
-        item_id: &str,
-        now: &Instant,
-    ) -> Result<&'a Item> {
-        let item = match document.items.iter().find(|item| item.id == item_id) {
-            Some(item) => item,
+    fn standing_lease_index(document: &Document, item_id: &str, now: &Instant) -> Result<usize> {
+        let index = match document.items.iter().position(|item| item.id == item_id) {
+            Some(index) => index,
             None => {
                 return Err(Error::NotFound(format!(
                     "item {} does not stand in the backlog",
@@ -2259,6 +2255,7 @@ impl Registry {
                 )))
             }
         };
+        let item = &document.items[index];
         if item.status == "completed" {
             return Err(Error::Refusal(format!(
                 "item {} is completed and accepts no lease",
@@ -2277,7 +2274,7 @@ impl Registry {
                 py_repr(item_id)
             )));
         }
-        Ok(item)
+        Ok(index)
     }
 
     /// Add an item to the backlog and record the offered event.
@@ -2414,18 +2411,14 @@ impl Registry {
         let ttl = validate_ttl_i64(ttl)?;
         validate_now(now)?;
         self.mutate(|document| {
-            let item = Self::standing_lease(document, item_id, now)?;
+            let index = Self::standing_lease_index(document, item_id, now)?;
+            let item = &document.items[index];
             check_possession(item, holder, token, &Value::Int(epoch))?;
             let standing =
                 parse_stored_instant(&Value::Str(item.expires_at.clone().unwrap_or_default()))?;
             let expires = expiry_after(&standing, ttl)?;
             let rendered = format_instant(&expires);
             let standing_epoch = item.epoch;
-            let index = document
-                .items
-                .iter()
-                .position(|item| item.id == item_id)
-                .unwrap();
             document.items[index].expires_at = Some(rendered);
             Self::append_event(
                 document,
@@ -2460,14 +2453,10 @@ impl Registry {
         validate_name_str(holder, "holder")?;
         validate_now(now)?;
         self.mutate(|document| {
-            let item = Self::standing_lease(document, item_id, now)?;
+            let index = Self::standing_lease_index(document, item_id, now)?;
+            let item = &document.items[index];
             check_possession(item, holder, token, &Value::Int(epoch))?;
             let standing_epoch = item.epoch;
-            let index = document
-                .items
-                .iter()
-                .position(|item| item.id == item_id)
-                .unwrap();
             Self::end_lease(&mut document.items[index], "open");
             Self::append_event(
                 document,
@@ -2496,14 +2485,10 @@ impl Registry {
         validate_name_str(holder, "holder")?;
         validate_now(now)?;
         self.mutate(|document| {
-            let item = Self::standing_lease(document, item_id, now)?;
+            let index = Self::standing_lease_index(document, item_id, now)?;
+            let item = &document.items[index];
             check_possession(item, holder, token, &Value::Int(epoch))?;
             let standing_epoch = item.epoch;
-            let index = document
-                .items
-                .iter()
-                .position(|item| item.id == item_id)
-                .unwrap();
             Self::end_lease(&mut document.items[index], "completed");
             Self::append_event(
                 document,
