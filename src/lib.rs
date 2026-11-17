@@ -775,6 +775,23 @@ fn week_date_days(year: i64, week: i64, weekday: i64) -> Option<i64> {
     Some(week_one_monday + (week - 1) * 7 + (weekday - 1))
 }
 
+/// The day count a calendar date names, or None when the
+/// year stands outside 1 to 9999, the month outside 1 to
+/// 12, or the day outside the leap aware length of the
+/// month. Both date families in parse_date close on this
+/// one rule, so a grammar repair cannot correct one
+/// spelling family and leave the other.
+fn calendar_days(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
 fn parse_date(cursor: &mut Cursor) -> Option<i64> {
     // Extended form, YYYY-MM-DD and the week forms, or the basic
     // forms YYYYMMDD and YYYYWWW and YYYYWWWD. The year is
@@ -796,14 +813,7 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
         let month = cursor.digits(2)?;
         cursor.expect('-')?;
         let day = cursor.digits(2)?;
-        if !(1..=9999).contains(&year)
-            || !(1..=12).contains(&month)
-            || day < 1
-            || day > days_in_month(year, month)
-        {
-            return None;
-        }
-        Some(days_from_civil(year, month, day))
+        calendar_days(year, month, day)
     } else {
         let year = cursor.digits(4)?;
         if cursor.peek() == Some('W') {
@@ -818,14 +828,7 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
         }
         let month = cursor.digits(2)?;
         let day = cursor.digits(2)?;
-        if !(1..=9999).contains(&year)
-            || !(1..=12).contains(&month)
-            || day < 1
-            || day > days_in_month(year, month)
-        {
-            return None;
-        }
-        Some(days_from_civil(year, month, day))
+        calendar_days(year, month, day)
     }
 }
 
