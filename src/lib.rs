@@ -775,6 +775,23 @@ fn week_date_days(year: i64, week: i64, weekday: i64) -> Option<i64> {
     Some(week_one_monday + (week - 1) * 7 + (weekday - 1))
 }
 
+/// The day count a calendar date names, or None when the
+/// year stands outside 1 to 9999, the month outside 1 to
+/// 12, or the day outside the leap aware length of the
+/// month. Both date families in parse_date close on this
+/// one rule, so a grammar repair cannot correct one
+/// spelling family and leave the other.
+fn calendar_days(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
 fn parse_date(cursor: &mut Cursor) -> Option<i64> {
     // Extended form, YYYY-MM-DD and the week forms, or the basic
     // forms YYYYMMDD and YYYYWWW and YYYYWWWD. The year is
@@ -796,14 +813,7 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
         let month = cursor.digits(2)?;
         cursor.expect('-')?;
         let day = cursor.digits(2)?;
-        if !(1..=9999).contains(&year)
-            || !(1..=12).contains(&month)
-            || day < 1
-            || day > days_in_month(year, month)
-        {
-            return None;
-        }
-        Some(days_from_civil(year, month, day))
+        calendar_days(year, month, day)
     } else {
         let year = cursor.digits(4)?;
         if cursor.peek() == Some('W') {
@@ -818,14 +828,7 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
         }
         let month = cursor.digits(2)?;
         let day = cursor.digits(2)?;
-        if !(1..=9999).contains(&year)
-            || !(1..=12).contains(&month)
-            || day < 1
-            || day > days_in_month(year, month)
-        {
-            return None;
-        }
-        Some(days_from_civil(year, month, day))
+        calendar_days(year, month, day)
     }
 }
 
@@ -1726,21 +1729,15 @@ fn render_opt_string(value: &Option<String>, out: &mut String) {
 /// that writes its value.
 type FieldRenderer<'a> = (&'a str, &'a dyn Fn(&mut String));
 
-fn render_item(item: &Item, level: usize, out: &mut String) {
+/// Render one object from its field table, the opening
+/// brace, one line per field at the next indent with the
+/// key escaped and a comma after every field but the last,
+/// and the closing brace at the level. render_item and
+/// render_event share this one rendering, so the
+/// mechanics stand in one place and a repair cannot land
+/// in one shape and miss the other.
+fn render_fields(fields: &[FieldRenderer], level: usize, out: &mut String) {
     out.push_str("{\n");
-    let fields: [FieldRenderer; 7] = [
-        ("id", &|out| escape_json_string(&item.id, out)),
-        ("note", &|out| escape_json_string(&item.note, out)),
-        ("status", &|out| escape_json_string(&item.status, out)),
-        ("holder", &|out| render_opt_string(&item.holder, out)),
-        ("token_hash", &|out| {
-            render_opt_string(&item.token_hash, out)
-        }),
-        ("epoch", &|out| out.push_str(&item.epoch.to_string())),
-        ("expires_at", &|out| {
-            render_opt_string(&item.expires_at, out)
-        }),
-    ];
     let count = fields.len();
     for (index, (key, render)) in fields.iter().enumerate() {
         write_indent(out, level + 1);
@@ -1756,8 +1753,24 @@ fn render_item(item: &Item, level: usize, out: &mut String) {
     out.push('}');
 }
 
+fn render_item(item: &Item, level: usize, out: &mut String) {
+    let fields: [FieldRenderer; 7] = [
+        ("id", &|out| escape_json_string(&item.id, out)),
+        ("note", &|out| escape_json_string(&item.note, out)),
+        ("status", &|out| escape_json_string(&item.status, out)),
+        ("holder", &|out| render_opt_string(&item.holder, out)),
+        ("token_hash", &|out| {
+            render_opt_string(&item.token_hash, out)
+        }),
+        ("epoch", &|out| out.push_str(&item.epoch.to_string())),
+        ("expires_at", &|out| {
+            render_opt_string(&item.expires_at, out)
+        }),
+    ];
+    render_fields(&fields, level, out);
+}
+
 fn render_event(event: &Event, level: usize, out: &mut String) {
-    out.push_str("{\n");
     let fields: [FieldRenderer; 7] = [
         ("seq", &|out| out.push_str(&event.seq.to_string())),
         ("kind", &|out| escape_json_string(&event.kind, out)),
@@ -1769,19 +1782,7 @@ fn render_event(event: &Event, level: usize, out: &mut String) {
             render_opt_string(&event.previous_holder, out)
         }),
     ];
-    let count = fields.len();
-    for (index, (key, render)) in fields.iter().enumerate() {
-        write_indent(out, level + 1);
-        escape_json_string(key, out);
-        out.push_str(": ");
-        render(out);
-        if index + 1 < count {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    write_indent(out, level);
-    out.push('}');
+    render_fields(&fields, level, out);
 }
 
 /// Render a document exactly as the Python implementation's two
