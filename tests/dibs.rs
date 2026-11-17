@@ -739,6 +739,26 @@ fn a_naive_instant_is_refused() {
 }
 
 #[test]
+fn an_os_failure_reading_the_registry_is_a_failure_not_corruption() {
+    // The registry path stands as a directory, so reading it
+    // fails in the operating system rather than in the document.
+    // The error names the failure for what it is, where the read
+    // as first built reported the same case as corruption.
+    let dir = temp_dir("unreadable-registry");
+    let path = dir.join("registry.json");
+    std::fs::create_dir_all(&path).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Failure(_)), "{error:?}");
+    assert!(
+        error.message().contains("the registry file cannot be read"),
+        "{}",
+        error.message()
+    );
+    assert_eq!(error.exit_code(), 1);
+}
+
+#[test]
 fn missing_registry_reads_empty_and_the_first_mutation_creates_it() {
     let dir = temp_dir("missing-registry");
     let path = dir.join("deep").join("nested").join("registry.json");
@@ -1913,6 +1933,108 @@ fn cli_integer_arguments_take_the_python_grammar() {
         refused.stderr.contains("invalid time to live -42"),
         "{}",
         refused.stderr
+    );
+}
+
+#[test]
+fn cli_integer_arguments_refuse_the_separator_controls() {
+    // The separator controls U+001C to U+001F stand in the
+    // wider whitespace set str.strip takes, and a reader could
+    // expect the integer grammar to trim them. The Python
+    // integer conversion does not: probed against the runtime,
+    // an integer wrapped in them is refused there, and the
+    // command line refuses it the same way, at exit 2.
+    let dir = temp_dir("cli-separator-int");
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    run_cli(&["--registry", path, "offer", "task-one"], 0);
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "\u{1c}60\u{1f}",
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_non_unicode_arguments_are_parser_errors_not_panics() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = temp_dir("cli-non-unicode");
+    let path = dir.join("registry.json");
+    // An item name holding bytes that are not Unicode is
+    // refused at exit 2 with a parser error, where the parser
+    // as first built panicked collecting the arguments.
+    let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(&path)
+        .arg("offer")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("not valid Unicode text"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    // The registry path is the one argument carried
+    // unconverted, so a path holding the same bytes works.
+    let odd_dir = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
+    std::fs::create_dir_all(&odd_dir).unwrap();
+    let odd_path = odd_dir.join("registry.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(&odd_path)
+        .arg("offer")
+        .arg("task-one")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "offered task-one\n"
+    );
+    // The equals form carries the path unconverted too.
+    let mut equals = std::ffi::OsString::from("--registry=");
+    equals.push(odd_path.as_os_str());
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg(&equals)
+        .arg("offer")
+        .arg("task-two")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "offered task-two\n"
     );
 }
 
