@@ -1883,7 +1883,7 @@ fn token_matches(presented: &str, stored_hash: &str) -> bool {
 /// Decode registry bytes to text the way the Python json module
 /// decoded them, detecting a byte order mark and transcoding
 /// UTF-16 and UTF-32, and refusing what does not decode.
-fn decode_document_bytes(bytes: &[u8]) -> std::result::Result<String, String> {
+fn decode_document_bytes(bytes: Vec<u8>) -> std::result::Result<String, String> {
     if bytes.starts_with(&[0xff, 0xfe, 0x00, 0x00]) {
         decode_utf32(&bytes[4..], true)
     } else if bytes.starts_with(&[0x00, 0x00, 0xfe, 0xff]) {
@@ -1893,10 +1893,14 @@ fn decode_document_bytes(bytes: &[u8]) -> std::result::Result<String, String> {
     } else if bytes.starts_with(&[0xfe, 0xff]) {
         decode_utf16(&bytes[2..], false)
     } else if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        String::from_utf8(bytes[3..].to_vec())
+        // The buffer is owned, so the mark is drained off the
+        // front instead of copying the rest of the document.
+        let mut bytes = bytes;
+        bytes.drain(..3);
+        String::from_utf8(bytes)
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
     } else {
-        String::from_utf8(bytes.to_vec())
+        String::from_utf8(bytes)
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
     }
 }
@@ -2127,7 +2131,7 @@ impl Registry {
                 )))
             }
         };
-        let text = decode_document_bytes(&raw)
+        let text = decode_document_bytes(raw)
             .map_err(|detail| corrupt(format!("the document does not parse, {detail}")))?;
         let value: Value = serde_json::from_str(&text).map_err(|err| {
             let text = err.to_string();
