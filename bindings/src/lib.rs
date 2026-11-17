@@ -394,7 +394,8 @@ fn complete(
         .map_err(to_py_error)
 }
 
-/// Return the open items in offer order as plain dictionaries,
+/// Return the items standing on the board in offer order, the
+/// open items and the live claimed items, as plain dictionaries,
 /// with each lease state evaluated at the instant the now
 /// argument names, as ISO 8601 text.
 #[pyfunction]
