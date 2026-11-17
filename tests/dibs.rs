@@ -237,6 +237,58 @@ fn renew_extends_from_the_current_expiry_not_from_now() {
 }
 
 #[test]
+fn lease_operations_touch_only_the_named_item() {
+    let dir = temp_dir("named-item-only");
+    let registry = make_registry(&dir);
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    registry
+        .offer("task-two", "a synthetic task", &t0())
+        .unwrap();
+    let first = registry.claim("task-one", "agent-a", 60, &at(0)).unwrap();
+    let second = registry.claim("task-two", "agent-b", 60, &at(0)).unwrap();
+    // Renewing the second item extends its lease from its own
+    // standing expiry and leaves the first item's standing
+    // lease exactly as it stood.
+    let renewed = registry
+        .renew("task-two", "agent-b", &second.token, 1, 30, &at(10))
+        .unwrap();
+    assert_eq!(renewed, at(90));
+    let rows = registry.board(&at(11)).unwrap();
+    assert_eq!(
+        rows[0].expires_at.as_deref(),
+        Some(dibs::format_instant(&at(60)).as_str())
+    );
+    assert_eq!(
+        rows[1].expires_at.as_deref(),
+        Some(dibs::format_instant(&at(90)).as_str())
+    );
+    // Releasing the first item opens it and leaves the second
+    // item claimed under its renewed lease.
+    registry
+        .release("task-one", "agent-a", &first.token, 1, &at(12))
+        .unwrap();
+    let rows = registry.board(&at(13)).unwrap();
+    assert_eq!(rows[0].status, "open");
+    assert_eq!(rows[1].status, "claimed");
+    assert_eq!(
+        rows[1].expires_at.as_deref(),
+        Some(dibs::format_instant(&at(90)).as_str())
+    );
+    // Completing the second item takes it off the board and
+    // leaves the first item open at its standing epoch.
+    registry
+        .complete("task-two", "agent-b", &second.token, 1, &at(14))
+        .unwrap();
+    let rows = registry.board(&at(15)).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "task-one");
+    assert_eq!(rows[0].status, "open");
+    assert_eq!(rows[0].epoch, 1);
+}
+
+#[test]
 fn takeover_records_the_previous_holder_and_fences_the_old_lease() {
     let dir = temp_dir("takeover");
     let registry = make_registry(&dir);
