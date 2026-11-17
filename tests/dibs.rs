@@ -1917,16 +1917,18 @@ fn cli_integer_arguments_take_the_python_grammar() {
 }
 
 #[test]
-fn cli_integer_arguments_trim_the_separator_controls() {
-    // The Python integer conversion strips the separator
-    // controls U+001C to U+001F as whitespace, and the contract
-    // grammar claims the same set, so an integer wrapped in
-    // them carries its value instead of drawing a parser error.
+fn cli_integer_arguments_refuse_the_separator_controls() {
+    // The separator controls U+001C to U+001F stand in the
+    // wider whitespace set str.strip takes, and a reader could
+    // expect the integer grammar to trim them. The Python
+    // integer conversion does not: probed against the runtime,
+    // an integer wrapped in them is refused there, and the
+    // command line refuses it the same way, at exit 2.
     let dir = temp_dir("cli-separator-int");
     let path = dir.join("registry.json");
     let path = path.to_str().unwrap();
     run_cli(&["--registry", path, "offer", "task-one"], 0);
-    let claimed = run_cli(
+    let refused = run_cli(
         &[
             "--registry",
             path,
@@ -1937,30 +1939,12 @@ fn cli_integer_arguments_trim_the_separator_controls() {
             "--ttl",
             "\u{1c}60\u{1f}",
         ],
-        0,
+        2,
     );
-    let token = claimed
-        .stdout
-        .lines()
-        .next()
-        .unwrap()
-        .split_once(' ')
-        .unwrap()
-        .1
-        .to_string();
-    run_cli(
-        &[
-            "--registry",
-            path,
-            "release",
-            "task-one",
-            "--holder",
-            "agent-a",
-            &format!("--token={token}"),
-            "--epoch",
-            "\u{1d}1\u{1e}",
-        ],
-        0,
+    assert!(
+        refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
     );
 }
 
@@ -2012,6 +1996,25 @@ fn cli_non_unicode_arguments_are_parser_errors_not_panics() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "offered task-one\n"
+    );
+    // The equals form carries the path unconverted too.
+    let mut equals = std::ffi::OsString::from("--registry=");
+    equals.push(odd_path.as_os_str());
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg(&equals)
+        .arg("offer")
+        .arg("task-two")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "offered task-two\n"
     );
 }
 

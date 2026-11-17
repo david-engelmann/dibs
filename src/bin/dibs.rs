@@ -294,12 +294,12 @@ fn py_digit_value(c: char) -> Option<u32> {
 /// prints the number the caller typed rather than a parser
 /// failure.
 fn python_int(text: &str) -> Option<Value> {
-    // The trim set is the Python one: the Unicode whitespace
-    // set plus the separator controls U+001C to U+001F, which
-    // the Python conversion strips and char::is_whitespace
-    // omits.
-    let trimmed =
-        text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c));
+    // The trim set is the Python integer conversion's own,
+    // which is the Unicode whitespace set exactly. The wider
+    // set str.strip takes adds the separator controls U+001C
+    // to U+001F, and the conversion refuses those, as a probe
+    // against the Python runtime shows.
+    let trimmed = text.trim_matches(|c: char| c.is_whitespace());
     let (negative, body) = if let Some(rest) = trimmed.strip_prefix('-') {
         (true, rest)
     } else if let Some(rest) = trimmed.strip_prefix('+') {
@@ -582,21 +582,43 @@ fn run() -> ExitCode {
     }
 }
 
+/// The registry value of the equals form, taken unconverted.
+/// The option name is plain ASCII, so it is matched on the
+/// argument's bytes before any text conversion, and the value
+/// keeps the bytes the operating system carried, the same
+/// carry the spaced form gets. Without byte level access to
+/// arguments the equals form stays text only.
+#[cfg(unix)]
+fn registry_equals_value(token: &OsString) -> Option<OsString> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    token
+        .as_bytes()
+        .strip_prefix(b"--registry=")
+        .map(|rest| OsString::from_vec(rest.to_vec()))
+}
+
 fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
     // Parse the top level: the registry option and the subcommand
     // word, with the remaining tokens handed to the subcommand.
     // The first token that is not an option is the subcommand,
     // and a double dash before it is taken as the subcommand word
     // itself, as the Python parser took it. The registry value is
-    // the one argument carried unconverted, because a path may
-    // hold bytes that are not Unicode; every other argument is
-    // text, and one that is not Unicode is a parser error.
+    // the one argument carried unconverted in both its forms,
+    // because a path may hold bytes that are not Unicode; every
+    // other argument is text, and one that is not Unicode is a
+    // parser error.
     let mut registry_path: Option<PathBuf> = None;
     let mut index = 0;
     let mut command: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut extras: Vec<String> = Vec::new();
     while index < argv.len() {
+        #[cfg(unix)]
+        if let Some(value) = registry_equals_value(&argv[index]) {
+            registry_path = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
         let Some(token) = argv[index].to_str() else {
             return Ok(parser_fail(
                 MAIN_USAGE,
