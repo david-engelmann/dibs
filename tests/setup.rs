@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
+mod common;
 
 const MARKER: &str = "<!-- repo annex below this line -->";
 const GATE_COMMAND: &str = "cargo test";
@@ -29,10 +29,7 @@ fn read(name: &str) -> String {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dibs-setup-test-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::temp_dir("dibs-setup-test-", tag)
 }
 
 #[test]
@@ -289,13 +286,7 @@ fn agents_canonical_part_matches_pinned_digest() {
         .windows(marker.len())
         .position(|window| window == marker)
         .unwrap();
-    let mut hasher = Sha256::new();
-    hasher.update(&agents[..position]);
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let digest = common::sha256_hex(&agents[..position]);
     assert_eq!(digest, CANONICAL_ABOVE_MARKER_SHA256);
 }
 
