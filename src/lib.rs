@@ -2477,8 +2477,8 @@ impl Registry {
         })
     }
 
-    /// Mark the item done under its standing lease. Terminal in
-    /// slice 1.
+    /// Mark the item done under its standing lease. Completion is
+    /// terminal, and the item accepts no claim afterwards.
     pub fn complete(
         &self,
         item_id: &str,
