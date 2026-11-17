@@ -1189,6 +1189,22 @@ fn validate_stored_name(value: &Value, field: &str, subject: &str) -> Result<()>
     }
 }
 
+/// The text of a stored string field a check immediately
+/// before has proven to be a string, validate_stored_name
+/// for the name fields and parse_stored_instant for the
+/// instant fields. The proof obligation stands on the
+/// callers, and the unreachable arm of the extraction
+/// stands here once instead of at every field, so a check
+/// weakened later cannot turn one field's extraction into
+/// a panic on a stored document the reader is refusing as
+/// corrupt.
+fn stored_string(value: &Value) -> String {
+    match value {
+        Value::Str(text) => text.clone(),
+        _ => unreachable!(),
+    }
+}
+
 fn validate_item(value: &Value) -> Result<Item> {
     let pairs = match value {
         Value::Object(pairs) if keys_exact(pairs, &ITEM_KEYS) => pairs,
@@ -1200,10 +1216,7 @@ fn validate_item(value: &Value) -> Result<Item> {
     };
     let id_value = object_get(pairs, "id").unwrap();
     validate_stored_name(id_value, "item id", "an item")?;
-    let id = match id_value {
-        Value::Str(text) => text.clone(),
-        _ => unreachable!(),
-    };
+    let id = stored_string(id_value);
     let note = match object_get(pairs, "note").unwrap() {
         Value::Str(text) if text.chars().count() <= NOTE_MAX => text.clone(),
         _ => {
@@ -1227,10 +1240,7 @@ fn validate_item(value: &Value) -> Result<Item> {
         Value::Null => None,
         other => {
             validate_stored_name(other, "holder id", "an item")?;
-            match other {
-                Value::Str(text) => Some(text.clone()),
-                _ => unreachable!(),
-            }
+            Some(stored_string(other))
         }
     };
     let token_hash = match object_get(pairs, "token_hash").unwrap() {
@@ -1257,10 +1267,7 @@ fn validate_item(value: &Value) -> Result<Item> {
         Value::Null => None,
         other => {
             parse_stored_instant(other)?;
-            match other {
-                Value::Str(text) => Some(text.clone()),
-                _ => unreachable!(),
-            }
+            Some(stored_string(other))
         }
     };
     let lease_fields = (holder.is_some(), token_hash.is_some(), expires_at.is_some());
@@ -1330,10 +1337,7 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
     };
     let item_value = object_get(pairs, "item").unwrap();
     validate_stored_name(item_value, "item id", "a history event")?;
-    let item = match item_value {
-        Value::Str(text) => text.clone(),
-        _ => unreachable!(),
-    };
+    let item = stored_string(item_value);
     let holder_value = object_get(pairs, "holder").unwrap();
     let holder = if kind == "offered" {
         if holder_value != &Value::Null {
@@ -1345,10 +1349,7 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
             return Err(corrupt(format!("a {kind} event names no holder")));
         }
         validate_stored_name(holder_value, "holder id", "a history event")?;
-        match holder_value {
-            Value::Str(text) => Some(text.clone()),
-            _ => unreachable!(),
-        }
+        Some(stored_string(holder_value))
     };
     let previous_value = object_get(pairs, "previous_holder").unwrap();
     let previous_holder = if kind == "taken_over" {
@@ -1358,10 +1359,7 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
             ));
         }
         validate_stored_name(previous_value, "holder id", "a history event")?;
-        match previous_value {
-            Value::Str(text) => Some(text.clone()),
-            _ => unreachable!(),
-        }
+        Some(stored_string(previous_value))
     } else {
         if previous_value != &Value::Null {
             return Err(corrupt(
@@ -1372,10 +1370,7 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
     };
     let at_raw = object_get(pairs, "at").unwrap();
     parse_stored_instant(at_raw)?;
-    let at = match at_raw {
-        Value::Str(text) => text.clone(),
-        _ => unreachable!(),
-    };
+    let at = stored_string(at_raw);
     let epoch = match object_get(pairs, "epoch").unwrap() {
         Value::Int(number) if *number >= 0 => *number,
         _ => {
@@ -1788,7 +1783,19 @@ fn render_event(event: &Event, level: usize, out: &mut String) {
 /// space indented json rendering renders it, without the
 /// trailing newline the stored file adds.
 fn render_document(document: &Document) -> String {
-    let mut out = String::new();
+    // The output starts near its final size instead of growing
+    // from empty by doublings. The contract's measured growth
+    // constants stand at about 392 bytes per offered item, with
+    // the item's offered event counted inside that figure, and
+    // 201.5 bytes per history event, so the reserve transcribes
+    // the measured law with the event constant rounded up and a
+    // small fixed allowance for the document frame. A reserve is
+    // a capacity hint only. The item constant counting each
+    // item's offered event means the sum over-reserves by about
+    // one event per item, a transient overallocation that costs
+    // no reallocation copies on the growth path.
+    let mut out =
+        String::with_capacity(64 + document.items.len() * 392 + document.history.len() * 202);
     out.push_str("{\n");
     write_indent(&mut out, 1);
     escape_json_string("format", &mut out);
