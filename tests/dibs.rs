@@ -2138,7 +2138,9 @@ fn damage_duplicate_key_message_names_the_whole_key() {
     // The duplicated key here carries the separator the reader's
     // own position suffix uses, so a recovery that cuts the error
     // text at the first separator names only the part of the key
-    // standing before it. The message names the whole key.
+    // standing before it. The message names the whole key, and
+    // the assertions compare the complete message, so a recovery
+    // that kept the reader's position suffix would fail them too.
     let dir = temp_dir("damage-duplicate-named");
     let path = dir.join("registry.json");
     let text = "{\"format\": \"dibs-registry/1\", \"items\": [{\"id\": \"task-one\", \
@@ -2149,12 +2151,9 @@ fn damage_duplicate_key_message_names_the_whole_key() {
     let registry = Registry::new(path);
     let error = expect_error(registry.board(&t0()));
     assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
-    assert!(
-        error
-            .message()
-            .contains("a key stands twice in the document, note at line 5"),
-        "{}",
-        error.message()
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, a key stands twice in the document, note at line 5"
     );
     // The control: an ordinary duplicated key names that key in
     // the same message, as it did before the fix.
@@ -2166,11 +2165,8 @@ fn damage_duplicate_key_message_names_the_whole_key() {
     let registry = Registry::new(path);
     let error = expect_error(registry.board(&t0()));
     assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
-    assert!(
-        error
-            .message()
-            .contains("a key stands twice in the document, format"),
-        "{}",
-        error.message()
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, a key stands twice in the document, format"
     );
 }
