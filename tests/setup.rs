@@ -193,14 +193,19 @@ fn ci_runs_the_binding_smoke_test() {
     // binding check is a required check, so a workflow that
     // dropped the smoke command, or disabled the job or one of
     // its steps with if false, would leave that check green
-    // over a suite that never ran.
+    // over a suite that never ran. A command that stands
+    // commented out does not count as standing, and a step
+    // condition is read wherever it stands in its step.
     let mut section = String::new();
     let mut in_binding = false;
     for line in text.lines() {
+        // A job line stands at two spaces of indent and ends
+        // with a colon, allowing a trailing comment after it.
+        let head = line.split(" #").next().unwrap_or("");
         let job_line =
-            line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':');
+            head.starts_with("  ") && !head.starts_with("   ") && head.trim_end().ends_with(':');
         if job_line {
-            in_binding = line.trim() == "binding:";
+            in_binding = head.trim() == "binding:";
             continue;
         }
         if in_binding {
@@ -213,10 +218,16 @@ fn ci_runs_the_binding_smoke_test() {
         "maturin develop --manifest-path bindings/Cargo.toml",
         "python -m pytest tests/test_binding_smoke.py",
     ] {
-        assert!(section.contains(needle), "the binding job lost {needle}");
+        let stands = section.lines().any(|line| {
+            let stripped = line.trim();
+            !stripped.starts_with('#') && stripped.contains(needle)
+        });
+        assert!(stands, "the binding job lost {needle}");
     }
     let disabled = section.lines().any(|line| {
-        line.trim().strip_prefix("if:").is_some_and(|rest| {
+        let stripped = line.trim();
+        let stripped = stripped.strip_prefix("- ").unwrap_or(stripped);
+        stripped.strip_prefix("if:").is_some_and(|rest| {
             rest.trim()
                 .trim_matches(|c| c == '\'' || c == '"')
                 .to_lowercase()
