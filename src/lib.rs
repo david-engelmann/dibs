@@ -1954,6 +1954,48 @@ fn open_publish_temp(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
+/// Draw the four random bytes a publish temporary name carries.
+fn draw_publish_suffix() -> Result<[u8; 4]> {
+    let mut random = [0u8; 4];
+    getrandom::fill(&mut random)
+        .map_err(|err| Error::Failure(format!("the registry could not be published, {err}")))?;
+    Ok(random)
+}
+
+/// Create the temporary file a publish stages its document in,
+/// under a name drawn fresh beside the registry file. A name
+/// that already stands is a collision, and the draw repeats a
+/// bounded number of times before the publish fails: the name
+/// carries four random bytes, so one plant or one racing
+/// publish cannot hold the whole space, and a redraw lands
+/// clear of it. The open itself stays the exclusive create the
+/// planted symlink pin holds, so a plant is never followed or
+/// written through, only stepped around.
+fn create_publish_temp(
+    path: &Path,
+    name: &str,
+    draw: &mut impl FnMut() -> Result<[u8; 4]>,
+) -> Result<(PathBuf, File)> {
+    for _ in 0..8 {
+        let random = draw()?;
+        let hex: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let temp = path.with_file_name(format!(".{name}.tmp-{}-{hex}", std::process::id()));
+        match open_publish_temp(&temp) {
+            Ok(handle) => return Ok((temp, handle)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(Error::Failure(format!(
+                    "the registry could not be published, {err}"
+                )));
+            }
+        }
+    }
+    Err(Error::Failure(
+        "the registry could not be published, the temporary file name collided on every draw"
+            .to_string(),
+    ))
+}
+
 /// One backlog in one registry file, opened fresh on every call.
 pub struct Registry {
     path: PathBuf,
@@ -2105,17 +2147,8 @@ impl Registry {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut random = [0u8; 4];
-        getrandom::fill(&mut random)
-            .map_err(|err| Error::Failure(format!("the registry could not be published, {err}")))?;
-        let hex: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-        let temp = self
-            .path
-            .with_file_name(format!(".{name}.tmp-{}-{hex}", std::process::id()));
-        let mut created = false;
+        let (temp, mut handle) = create_publish_temp(&self.path, &name, &mut draw_publish_suffix)?;
         let staged = (|| -> std::io::Result<()> {
-            let mut handle = open_publish_temp(&temp)?;
-            created = true;
             handle.write_all(text.as_bytes())?;
             handle.sync_all()?;
             std::fs::rename(&temp, &self.path)?;
@@ -2123,11 +2156,9 @@ impl Registry {
         })();
         if let Err(err) = staged {
             // Only the temporary file this publish created is
-            // removed. A failure to create it means whatever
-            // stands at the name belongs to someone else.
-            if created {
-                let _ = std::fs::remove_file(&temp);
-            }
+            // removed. create_publish_temp returns only a file
+            // this publish created, never a plant at the name.
+            let _ = std::fs::remove_file(&temp);
             return Err(Error::Failure(format!(
                 "the registry could not be published, {err}"
             )));
@@ -2615,6 +2646,57 @@ mod tests {
         handle.write_all(b"staged bytes").unwrap();
         drop(handle);
         assert_eq!(std::fs::read(&temp).unwrap(), b"staged bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A publish whose drawn temporary name already stands
+    /// redraws instead of failing. The name a real publish
+    /// chooses cannot be known outside it, so the draw is
+    /// scripted here, at the helper the publish itself calls.
+    #[test]
+    fn publish_temp_create_redraws_on_a_collision() {
+        let dir =
+            std::env::temp_dir().join(format!("dibs-unit-test-collision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = dir.join("registry.json");
+        let planted_suffix = [0xab; 4];
+        let planted_hex: String = planted_suffix
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let planted = dir.join(format!(
+            ".registry.json.tmp-{}-{planted_hex}",
+            std::process::id()
+        ));
+        std::fs::write(&planted, "planted bytes").unwrap();
+        // Two draws land on the plant, the third lands clear,
+        // and the create succeeds at the third name with the
+        // plant untouched.
+        let mut draws = vec![planted_suffix, planted_suffix, [0xcd; 4]].into_iter();
+        let mut draw = || Ok(draws.next().unwrap());
+        let (temp, mut handle) =
+            create_publish_temp(&registry, "registry.json", &mut draw).unwrap();
+        assert_ne!(temp, planted);
+        handle.write_all(b"staged bytes").unwrap();
+        drop(handle);
+        assert_eq!(std::fs::read(&temp).unwrap(), b"staged bytes");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted bytes");
+        // A draw that never leaves the plant exhausts the bound
+        // and fails as a failure, with the plant still untouched.
+        let mut calls = 0;
+        let error = {
+            let mut stuck = || {
+                calls += 1;
+                Ok(planted_suffix)
+            };
+            create_publish_temp(&registry, "registry.json", &mut stuck)
+                .err()
+                .unwrap()
+        };
+        assert!(matches!(error, Error::Failure(_)), "{error:?}");
+        assert_eq!(calls, 8);
+        assert_eq!(std::fs::read(&planted).unwrap(), b"planted bytes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
