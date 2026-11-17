@@ -24,30 +24,15 @@ use dibs::{
     Value,
 };
 
-fn t0() -> Instant {
-    Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(0)).unwrap()
-}
-
-fn at(seconds: i64) -> Instant {
-    t0().plus_seconds(seconds)
-}
+mod common;
+use common::{at, expect_error, t0};
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dibs-test-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::temp_dir("dibs-test-", tag)
 }
 
 fn make_registry(dir: &Path) -> Registry {
     Registry::new(dir.join("registry.json"))
-}
-
-fn expect_error<T>(result: dibs::Result<T>) -> Error {
-    match result {
-        Ok(_) => panic!("the operation succeeded where a refusal was expected"),
-        Err(error) => error,
-    }
 }
 
 fn assert_invalid_name<T>(result: dibs::Result<T>) {
@@ -1561,30 +1546,7 @@ fn staged_lock_document(fillers: usize) -> String {
     for index in 0..fillers {
         ids.push(format!("item-{index:06}"));
     }
-    let mut out = String::from("{\"format\": \"dibs-registry/1\", \"items\": [");
-    for (index, id) in ids.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"id\": \"{id}\", \"note\": \"\", \"status\": \"open\", \
-             \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}"
-        ));
-    }
-    out.push_str("], \"history\": [");
-    for (index, id) in ids.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"seq\": {}, \"kind\": \"offered\", \"item\": \"{id}\", \
-             \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
-             \"previous_holder\": null}}",
-            index + 1
-        ));
-    }
-    out.push_str("]}");
-    out
+    common::offered_document(&ids)
 }
 
 #[test]
