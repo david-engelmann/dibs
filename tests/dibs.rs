@@ -557,6 +557,40 @@ fn invalid_holder_name_none() {
     assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
 }
 
+#[test]
+fn invalid_name_message_escapes_private_use_characters() {
+    // Python counts the private use ranges as not printable in
+    // every Unicode version, so its repr renders them as hex
+    // escapes, and the refusal message does the same. On the code
+    // before the fix the raw character stood in the message and
+    // no escape appeared.
+    let bmp = expect_error(validate_name(
+        &Value::Str("agent-\u{e000}".to_string()),
+        "holder",
+    ));
+    assert!(matches!(bmp, Error::InvalidName(_)), "{bmp:?}");
+    assert!(bmp.message().contains("\\ue000"), "{}", bmp.message());
+    assert!(!bmp.message().contains('\u{e000}'), "{}", bmp.message());
+    let supplementary = expect_error(validate_name(
+        &Value::Str("agent-\u{f0000}".to_string()),
+        "holder",
+    ));
+    assert!(
+        matches!(supplementary, Error::InvalidName(_)),
+        "{supplementary:?}"
+    );
+    assert!(
+        supplementary.message().contains("\\U000f0000"),
+        "{}",
+        supplementary.message()
+    );
+    assert!(
+        !supplementary.message().contains('\u{f0000}'),
+        "{}",
+        supplementary.message()
+    );
+}
+
 macro_rules! good_name {
     ($name:ident, $value:expr) => {
         #[test]
