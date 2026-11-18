@@ -1117,7 +1117,7 @@ fn damage_event_holder_name_message_names_the_event() {
 fn encodable_claimed_document() -> String {
     format!(
         "{{\"format\": \"dibs-registry/1\", \"items\": [{{\"id\": \"task-one\", \
-         \"note\": \"\", \"status\": \"claimed\", \"holder\": \"agent-a\", \
+         \"note\": \"abc\", \"status\": \"claimed\", \"holder\": \"agent-a\", \
          \"token_hash\": \"{}\", \"epoch\": 1, \"expires_at\": \"2031-05-04T12:01:00+00:00\"}}], \
          \"history\": []}}",
         dibs::token_hash("standing-token")
@@ -1201,17 +1201,38 @@ fn registry_documents_in_a_broken_encoding_refuse_as_corruption() {
     // UTF-16 document with an odd byte count, one carrying a
     // lone surrogate, a UTF-32 document carrying a count past
     // the last codepoint, and a UTF-8 mark followed by bytes
-    // that do not decode. A decoder that guessed at any of
-    // these instead of refusing would fail here.
+    // that do not decode. Each defect is staged inside a
+    // whole document, in the note's text, so a decoder that
+    // guessed at it, dropping the incomplete unit or reading
+    // past the bad one, would produce a valid document and
+    // stand caught; the strict decoder refuses at the decode
+    // itself. The document text is plain ASCII, so a
+    // character's offset in the text is its unit's offset in
+    // both encodings.
     let base = temp_dir("broken-encodings");
-    let mut odd_utf16 = vec![0xff, 0xfe];
-    odd_utf16.extend_from_slice(&[0x7b, 0x00, 0x22]);
+    let text = encodable_claimed_document();
+    let note_b = text.find("\"abc\"").unwrap() + 2;
+    let mut odd_utf16 = encode_document(&text, "utf-16le");
+    odd_utf16.push(0);
+    let mut surrogate_units: Vec<u16> = text.encode_utf16().collect();
+    surrogate_units[note_b] = 0xd800;
     let mut lone_surrogate = vec![0xff, 0xfe];
-    lone_surrogate.extend_from_slice(&[0x7b, 0x00, 0x00, 0xd8, 0x7d, 0x00]);
+    for unit in &surrogate_units {
+        lone_surrogate.extend_from_slice(&unit.to_le_bytes());
+    }
     let mut past_last_codepoint = vec![0xff, 0xfe, 0x00, 0x00];
-    past_last_codepoint.extend_from_slice(&0x0011_0000u32.to_le_bytes());
+    for (index, ch) in text.chars().enumerate() {
+        let value = if index == note_b {
+            0x0011_0000
+        } else {
+            ch as u32
+        };
+        past_last_codepoint.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut utf8_bytes = text.as_bytes().to_vec();
+    utf8_bytes[note_b] = 0xff;
     let mut bad_utf8 = vec![0xef, 0xbb, 0xbf];
-    bad_utf8.extend_from_slice(&[0x7b, 0xff]);
+    bad_utf8.extend_from_slice(&utf8_bytes);
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("odd-utf16", odd_utf16),
         ("lone-surrogate", lone_surrogate),
@@ -1983,15 +2004,27 @@ fn cli_round_trip_and_exit_codes() {
     assert_eq!(lines[1], "epoch 1");
     // The claim's third line prints the expiry the claim
     // recorded, and the board then reports that same expiry
-    // for the lease, so a claim that printed a different
-    // expiry than it recorded, or dropped the line, fails
-    // here while the token and epoch lines still pass.
+    // for the lease. The board's field is compared whole, so
+    // a claim that printed a different expiry than it
+    // recorded, an empty one, a truncated one, or no third
+    // line at all fails here, while the token and epoch
+    // lines still pass.
     let printed_expiry = lines[2].strip_prefix("expires_at ").unwrap();
     let board = run_cli(&["--registry", path, "board"], 0);
     assert!(board.stdout.contains("task-one claimed holder=agent-a"));
-    assert!(board
+    let board_line = board
         .stdout
-        .contains(&format!("expires_at={printed_expiry}")));
+        .lines()
+        .find(|line| line.starts_with("task-one claimed"))
+        .unwrap();
+    let board_expiry = board_line
+        .split("expires_at=")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    assert_eq!(board_expiry, printed_expiry);
     assert!(board.stdout.contains("epoch=1"));
     assert!(!board.stdout.contains(token));
     let renewed = run_cli(
