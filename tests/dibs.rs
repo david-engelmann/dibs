@@ -760,7 +760,7 @@ fn float_values_render_in_refusal_messages_as_python_renders_them() {
     // only pin around it still passed.
     let cases: [(f64, &str); 12] = [
         (1.5, "1.5"),
-        (3.14, "3.14"),
+        (123.456, "123.456"),
         (2.0, "2.0"),
         (0.0001, "0.0001"),
         (0.00001, "1e-05"),
