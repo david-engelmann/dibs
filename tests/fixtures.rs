@@ -1021,3 +1021,32 @@ fn stored_instants_in_the_wider_family_read_at_their_boundary() {
         assert_eq!(boundary[0].status, "open", "{spelling}");
     }
 }
+
+#[test]
+fn stored_offset_seconds_read_in_both_forms() {
+    // The offset of a stored instant carries its minutes and
+    // seconds in the colon form or the packed form, the one
+    // trailing component shape the time after a date carries,
+    // and the two spellings below name the same offset, thirty
+    // seconds, so both name the same expiry: 12:01:20 at an
+    // offset of thirty seconds is 12:00:50 in UTC. The wall
+    // seconds and the offset seconds differ on purpose, so a
+    // reader that lost the seconds of either component, or of
+    // both through one shared misreading, names a different
+    // instant and fails the boundary, where equal seconds
+    // would let the two losses cancel. The lease is live
+    // strictly before that instant and expired at it, and the
+    // board reports each stored spelling whole. A reader that
+    // refused either form would corrupt the read, so the pin
+    // discriminates the seconds arm of each branch.
+    let spellings = ["2031-05-04T12:01:20+00:00:30", "2031-05-04T12:01:20+000030"];
+    for (index, spelling) in spellings.iter().enumerate() {
+        let text = claimed_document(spelling);
+        let (_, registry) = staged_document(&format!("offset-seconds-{index}"), &text);
+        let live = registry.board(&at(49)).unwrap();
+        assert_eq!(live[0].status, "claimed", "{spelling}");
+        assert_eq!(live[0].expires_at.as_deref(), Some(*spelling));
+        let expired = registry.board(&at(50)).unwrap();
+        assert_eq!(expired[0].status, "open", "{spelling}");
+    }
+}
