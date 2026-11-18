@@ -466,16 +466,19 @@ fn codepoint_scan_with_an_unwritable_stdout_exits_2_without_a_panic() {
     // closed pipe of the finding's probe, because a pipe whose
     // reader closes early cannot be staged deterministically
     // from inside the suite, and /dev/full refuses the write
-    // the same way. On the pre-fix binary the same drive dies
-    // with a panic message at exit 101.
+    // the same way. Where /dev/full does not stand the staged
+    // failure cannot be produced and the pin does not run; on
+    // the hosted gate, which is Linux, the device stands. On
+    // the pre-fix binary the same drive dies with a panic
+    // message at exit 101.
     use std::process::Stdio;
 
     let dir = temp_dir("scan-full");
     std::fs::write(dir.join("clean.md"), "clean").unwrap();
-    let full = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .unwrap();
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return,
+    };
     let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
         .arg(&dir)
         .stdout(Stdio::from(full))
