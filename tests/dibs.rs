@@ -746,6 +746,52 @@ fn ttl_ceiling_is_the_contract_number_and_is_enforced() {
     ));
 }
 
+#[test]
+fn float_values_render_in_refusal_messages_as_python_renders_them() {
+    // The messages that interpolate a value render a float the
+    // way Python's repr renders it, and that rendering is an
+    // equivalence obligation of the port. The cases stand on
+    // the renderer's own decision boundaries: fixed notation
+    // inside the exponent range and scientific outside it, a
+    // trailing point zero on an integral fixed value, and the
+    // named arms for negative zero and nan and the infinities.
+    // A renderer that moved a boundary or dropped the point
+    // zero would change one of these texts while every class
+    // only pin around it still passed.
+    let cases: [(f64, &str); 12] = [
+        (1.5, "1.5"),
+        (123.456, "123.456"),
+        (2.0, "2.0"),
+        (0.0001, "0.0001"),
+        (0.00001, "1e-05"),
+        (1e15, "1000000000000000.0"),
+        (1e16, "1e+16"),
+        (1e100, "1e+100"),
+        (-0.0, "-0.0"),
+        (f64::INFINITY, "inf"),
+        (f64::NEG_INFINITY, "-inf"),
+        (f64::NAN, "nan"),
+    ];
+    for (value, rendered) in cases {
+        let error = expect_error(validate_ttl(&Value::Float(value)));
+        assert!(matches!(error, Error::InvalidTtl(_)), "{error:?}");
+        let expected = format!(
+            "invalid time to live {rendered}, use a positive integer \
+             number of seconds, at most 31536000"
+        );
+        assert_eq!(error.message(), expected.as_str(), "the float {value}");
+    }
+    // The name refusal interpolates the value the same way.
+    let error = expect_error(validate_name(&Value::Float(1.5), "item"));
+    assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "invalid item id 1.5, use one component of lowercase letters \
+         and digits and hyphens and underscores, starting and ending \
+         with a letter or a digit, at most 64 characters long"
+    );
+}
+
 macro_rules! huge_ttl {
     ($name:ident, $value:expr) => {
         #[test]
