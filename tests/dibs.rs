@@ -2310,3 +2310,81 @@ fn damage_duplicate_key_message_names_the_whole_key() {
         "the registry is corrupt, a key stands twice in the document, format"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_board_with_an_unwritable_stdout_exits_1_without_a_panic() {
+    // Command output goes through a checked writer (DB-A8), so
+    // a stream that refuses the write ends the command quietly
+    // at exit 1. /dev/full stands in for the closed pipe of the
+    // finding's settling probe, because a pipe whose reader
+    // closes early cannot be staged deterministically from
+    // inside the suite, and /dev/full refuses the write the
+    // same way. On the pre-fix binary the same drive dies with
+    // a panic message at exit 101.
+    use std::process::Stdio;
+
+    let dir = temp_dir("cli-board-full");
+    let registry = make_registry(&dir);
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(dir.join("registry.json"))
+        .arg("board")
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_claim_with_an_unwritable_stdout_exits_1_and_the_lease_stands() {
+    // The claim publishes under the lock before its token is
+    // printed, so a stream that refuses the print leaves the
+    // lease standing with its token never delivered. The
+    // checked writer reports that failure as a quiet exit 1,
+    // where the pre-fix binary panicked at exit 101 over the
+    // standing lease.
+    use std::process::Stdio;
+
+    let dir = temp_dir("cli-claim-full");
+    let path = dir.join("registry.json");
+    let path_text = path.to_str().unwrap();
+    run_cli(&["--registry", path_text, "offer", "task-one"], 0);
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(&path)
+        .arg("claim")
+        .arg("task-one")
+        .arg("--holder")
+        .arg("agent-a")
+        .arg("--ttl")
+        .arg("3600")
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let board = run_cli(&["--registry", path_text, "board"], 0);
+    assert!(
+        board.stdout.contains("task-one claimed holder=agent-a"),
+        "{}",
+        board.stdout
+    );
+    assert!(board.stdout.contains("epoch=1"), "{}", board.stdout);
+}

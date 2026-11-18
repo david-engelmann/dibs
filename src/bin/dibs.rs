@@ -380,8 +380,7 @@ fn parse_sub(command: &str, tokens: &[String]) -> Result<SubArgs, ParserError> {
             continue;
         }
         if !after_separator && (token == "-h" || token == "--help") {
-            print!("{}", sub_help(command));
-            println!();
+            out_line(format_args!("{}", sub_help(command)));
             std::process::exit(0);
         }
         if !after_separator && token.starts_with("--") && token.len() > 2 {
@@ -391,8 +390,7 @@ fn parse_sub(command: &str, tokens: &[String]) -> Result<SubArgs, ParserError> {
             };
             match resolve_long(name, &candidates) {
                 Ok(Some("--help")) => {
-                    print!("{}", sub_help(command));
-                    println!();
+                    out_line(format_args!("{}", sub_help(command)));
                     std::process::exit(0);
                 }
                 Ok(Some(option)) => {
@@ -533,14 +531,44 @@ fn require(command: &str, args: &SubArgs) -> Result<(), ParserError> {
     }
 }
 
+/// Write one line of command output through a locked stdout
+/// handle, and end the process quietly at exit 1 when the
+/// write fails (DB-A8).
+///
+/// The printing macros panic on a failed write, so a board
+/// piped into a reader that closes early died with a panic
+/// message at exit 101, and a claim whose token line could
+/// not be printed died the same way after its lease already
+/// stood. A failed write is an ordinary failure of the
+/// command, reported by the exit code alone.
+fn out_line(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    if writeln!(lock, "{args}").is_err() {
+        std::process::exit(1);
+    }
+}
+
+/// Write one line of error output through a locked stderr
+/// handle, with the same failure shape as out_line.
+fn err_line(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let stderr = std::io::stderr();
+    let mut lock = stderr.lock();
+    if writeln!(lock, "{args}").is_err() {
+        std::process::exit(1);
+    }
+}
+
 fn parser_fail(usage: &str, prog: &str, message: &str) -> ExitCode {
-    eprintln!("{usage}");
-    eprintln!("{prog}: error: {message}");
+    err_line(format_args!("{usage}"));
+    err_line(format_args!("{prog}: error: {message}"));
     ExitCode::from(2)
 }
 
 fn report_error(error: &Error) -> ExitCode {
-    eprintln!("error: {}", error.message());
+    err_line(format_args!("error: {}", error.message()));
     ExitCode::from(error.exit_code() as u8)
 }
 
@@ -627,7 +655,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             ));
         };
         if token == "-h" || token == "--help" {
-            println!("{MAIN_HELP}");
+            out_line(format_args!("{MAIN_HELP}"));
             return Ok(ExitCode::from(0));
         }
         if token.starts_with("--") && token.len() > 2 {
@@ -637,7 +665,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             };
             match resolve_long(name, &["--help", "--registry"]) {
                 Ok(Some("--help")) => {
-                    println!("{MAIN_HELP}");
+                    out_line(format_args!("{MAIN_HELP}"));
                     return Ok(ExitCode::from(0));
                 }
                 Ok(Some("--registry")) => {
@@ -747,16 +775,19 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             let item = item.unwrap();
             let note = option_text(&args, "--note").unwrap_or("");
             registry.offer(&item, note, &now)?;
-            println!("offered {item}");
+            out_line(format_args!("offered {item}"));
         }
         "claim" => {
             let item = item.unwrap();
             let holder = option_text(&args, "--holder").unwrap();
             let ttl = ttl_argument(&item, holder, option_int(&args, "--ttl").unwrap())?;
             let granted = registry.claim(&item, holder, ttl, &now)?;
-            println!("token {}", granted.token);
-            println!("epoch {}", granted.epoch);
-            println!("expires_at {}", dibs::format_instant(&granted.expires_at));
+            out_line(format_args!("token {}", granted.token));
+            out_line(format_args!("epoch {}", granted.epoch));
+            out_line(format_args!(
+                "expires_at {}",
+                dibs::format_instant(&granted.expires_at)
+            ));
         }
         "renew" => {
             let item = item.unwrap();
@@ -765,7 +796,10 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
             let ttl = ttl_argument(&item, holder, option_int(&args, "--ttl").unwrap())?;
             let expires = registry.renew(&item, holder, token, epoch, ttl, &now)?;
-            println!("expires_at {}", dibs::format_instant(&expires));
+            out_line(format_args!(
+                "expires_at {}",
+                dibs::format_instant(&expires)
+            ));
         }
         "release" => {
             let item = item.unwrap();
@@ -773,7 +807,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             let token = option_text(&args, "--token").unwrap();
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
             registry.release(&item, holder, token, epoch, &now)?;
-            println!("released {item}");
+            out_line(format_args!("released {item}"));
         }
         "complete" => {
             let item = item.unwrap();
@@ -781,20 +815,20 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             let token = option_text(&args, "--token").unwrap();
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
             registry.complete(&item, holder, token, epoch, &now)?;
-            println!("completed {item}");
+            out_line(format_args!("completed {item}"));
         }
         "board" => {
             for row in registry.board(&now)? {
                 if row.status == "claimed" {
-                    println!(
+                    out_line(format_args!(
                         "{} claimed holder={} expires_at={} epoch={}",
                         row.id,
                         row.holder.as_deref().unwrap_or_default(),
                         row.expires_at.as_deref().unwrap_or_default(),
                         row.epoch
-                    );
+                    ));
                 } else {
-                    println!("{} open epoch={}", row.id, row.epoch);
+                    out_line(format_args!("{} open epoch={}", row.id, row.epoch));
                 }
             }
         }
@@ -812,7 +846,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
                 if let Some(previous) = &event.previous_holder {
                     line.push_str(&format!(" previous_holder={previous}"));
                 }
-                println!("{line}");
+                out_line(format_args!("{line}"));
             }
         }
     }
