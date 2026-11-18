@@ -1110,6 +1110,19 @@ fn duplicate_key_of(error_text: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// The recovered duplicate key as the corruption message names it.
+/// A key carrying a character that does not print renders through
+/// py_repr, the escaped rendering the rest of the reader uses, so
+/// the refusal stays one line and names the character visibly. A
+/// key that prints whole stands raw, as the standing pins assert.
+fn duplicate_key_display(key: &str) -> String {
+    if key.chars().all(py_printable) {
+        key.to_string()
+    } else {
+        py_repr(key)
+    }
+}
+
 /// One item of the backlog, in the shape the registry stores it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
@@ -2137,7 +2150,10 @@ impl Registry {
         let value: Value = serde_json::from_str(&text).map_err(|err| {
             let text = err.to_string();
             if let Some(key) = duplicate_key_of(&text) {
-                corrupt(format!("a key stands twice in the document, {key}"))
+                corrupt(format!(
+                    "a key stands twice in the document, {}",
+                    duplicate_key_display(&key)
+                ))
             } else {
                 corrupt(format!("the document does not parse, {text}"))
             }
