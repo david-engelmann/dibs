@@ -738,7 +738,10 @@ impl Cursor {
     /// Take a fraction separator and its digits, and return the
     /// fraction of a second in microseconds, truncated past six
     /// digits, with zero digits after the separator counting as
-    /// no fraction. The fraction in the Python grammar always
+    /// no fraction where a zone designator follows it, and
+    /// refusing the reading where the separator stands at the
+    /// end of the text, the two cases the Python grammar
+    /// separates. The fraction in the Python grammar always
     /// lands on the seconds, whatever unit it follows.
     fn fraction_micros(&mut self) -> Option<i64> {
         match self.peek() {
@@ -746,17 +749,23 @@ impl Cursor {
                 self.take();
                 let mut micros: i64 = 0;
                 let mut place: i64 = 100_000;
+                let mut digits = 0;
                 while let Some(c) = self.peek() {
                     if !c.is_ascii_digit() {
                         break;
                     }
                     self.take();
+                    digits += 1;
                     if place > 0 {
                         micros += (c as i64 - '0' as i64) * place;
                         place /= 10;
                     }
                 }
-                Some(micros)
+                if digits == 0 && self.at_end() {
+                    None
+                } else {
+                    Some(micros)
+                }
             }
             _ => Some(0),
         }
