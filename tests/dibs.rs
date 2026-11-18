@@ -2320,8 +2320,11 @@ fn cli_board_with_an_unwritable_stdout_exits_1_without_a_panic() {
     // finding's settling probe, because a pipe whose reader
     // closes early cannot be staged deterministically from
     // inside the suite, and /dev/full refuses the write the
-    // same way. On the pre-fix binary the same drive dies with
-    // a panic message at exit 101.
+    // same way. Where /dev/full does not stand the staged
+    // failure cannot be produced and the pin does not run; on
+    // the hosted gate, which is Linux, the device stands. On
+    // the pre-fix binary the same drive dies with a panic
+    // message at exit 101.
     use std::process::Stdio;
 
     let dir = temp_dir("cli-board-full");
@@ -2329,10 +2332,10 @@ fn cli_board_with_an_unwritable_stdout_exits_1_without_a_panic() {
     registry
         .offer("task-one", "a synthetic task", &t0())
         .unwrap();
-    let full = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .unwrap();
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return,
+    };
     let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
         .arg("--registry")
         .arg(dir.join("registry.json"))
@@ -2354,17 +2357,18 @@ fn cli_claim_with_an_unwritable_stdout_exits_1_and_the_lease_stands() {
     // lease standing with its token never delivered. The
     // checked writer reports that failure as a quiet exit 1,
     // where the pre-fix binary panicked at exit 101 over the
-    // standing lease.
+    // standing lease. Where /dev/full does not stand the pin
+    // does not run, as its sibling above records.
     use std::process::Stdio;
 
     let dir = temp_dir("cli-claim-full");
     let path = dir.join("registry.json");
     let path_text = path.to_str().unwrap();
     run_cli(&["--registry", path_text, "offer", "task-one"], 0);
-    let full = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/full")
-        .unwrap();
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return,
+    };
     let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
         .arg("--registry")
         .arg(&path)
