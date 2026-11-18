@@ -2,9 +2,12 @@
 //! pin for pin from the Round 1 Python suite.
 //!
 //! Deterministic time comes only from injected instants. No test
-//! sleeps to make a lease expire, and the only wall clock use is
-//! the command line smoke path where no expiry boundary is
-//! crossed. Fixtures are synthetic and written for this repo.
+//! sleeps to make a lease expire. The wall clock is read only by
+//! the command line smoke path, where no expiry boundary is
+//! crossed, and by the lock identity pin, which polls for the
+//! worker's lock file and widens its window with a short sleep,
+//! a wait on a file that judges no lease. Fixtures are synthetic
+//! and written for this repo.
 //!
 //! Two reshapings from the port amendment land here. A value the
 //! Python suite handed to an operation as the wrong type, an
@@ -2106,6 +2109,81 @@ fn cli_integer_arguments_refuse_the_separator_controls() {
         "{}",
         refused.stderr
     );
+}
+
+#[test]
+fn cli_integer_arguments_cover_every_digit_family() {
+    // The integer grammar takes a decimal digit from any of the
+    // families of the converter's table, and the pins above
+    // exercise three of them. This pin exercises all of them,
+    // one renew per family, with the epoch and the time to live
+    // written in the family's own digits. The epoch must match
+    // the standing epoch exactly, so a family the table holds
+    // at the wrong offset refuses the renew and fails here, and
+    // a family the table misses fails here as a parser error.
+    // The bases stand as a second copy of the table, each the
+    // codepoint of its family's digit zero.
+    const FAMILY_BASES: [u32; 68] = [
+        0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66,
+        0x0ce6, 0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946,
+        0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0,
+        0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0,
+        0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50,
+        0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6,
+        0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0,
+    ];
+    let dir = temp_dir("cli-digit-families");
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    run_cli(&["--registry", path, "offer", "task-one"], 0);
+    let claimed = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "600",
+        ],
+        0,
+    );
+    let token = claimed
+        .stdout
+        .lines()
+        .next()
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1
+        .to_string();
+    for base in FAMILY_BASES {
+        let digit = |value: u32| char::from_u32(base + value).unwrap().to_string();
+        let epoch = digit(1);
+        let ttl = format!("{}{}", digit(3), digit(0));
+        let renewed = run_cli(
+            &[
+                "--registry",
+                path,
+                "renew",
+                "task-one",
+                "--holder",
+                "agent-a",
+                &format!("--token={token}"),
+                "--epoch",
+                &epoch,
+                "--ttl",
+                &ttl,
+            ],
+            0,
+        );
+        assert!(
+            renewed.stdout.starts_with("expires_at "),
+            "the digit family at {base:#06x} did not carry the renew: {}",
+            renewed.stderr
+        );
+    }
 }
 
 #[cfg(unix)]
