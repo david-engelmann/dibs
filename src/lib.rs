@@ -2573,12 +2573,19 @@ impl Registry {
 /// integer mismatch raises.
 pub fn check_possession(item: &Item, holder: &str, token: &str, epoch: &Value) -> Result<()> {
     if Some(holder) != item.holder.as_deref() {
-        return Err(Error::Refusal(format!(
-            "item {} is held by {}, not by {}",
-            py_repr(&item.id),
-            py_repr(item.holder.as_deref().unwrap_or_default()),
-            py_repr(holder)
-        )));
+        return Err(Error::Refusal(match &item.holder {
+            Some(standing) => format!(
+                "item {} is held by {}, not by {}",
+                py_repr(&item.id),
+                py_repr(standing),
+                py_repr(holder)
+            ),
+            None => format!(
+                "item {} is held by no one, not by {}",
+                py_repr(&item.id),
+                py_repr(holder)
+            ),
+        }));
     }
     let epoch_matches = match epoch {
         Value::Int(number) => *number == item.epoch,

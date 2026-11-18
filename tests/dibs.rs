@@ -400,6 +400,48 @@ fn epoch_mismatch_message_names_both_epochs_and_never_says_stale() {
 }
 
 #[test]
+fn possession_holder_message_names_the_holderless_case() {
+    // The possession check is public and the suite drives it
+    // directly, so it can be handed an item that holds no
+    // lease at all. Its holder refusal must name that case:
+    // the item is held by no one, and the empty string the
+    // message rendered in the holder's place before this pin
+    // is a holder no name in the protocol can be.
+    let open = Item {
+        id: "task-one".to_string(),
+        note: "a synthetic task".to_string(),
+        status: "open".to_string(),
+        holder: None,
+        token_hash: None,
+        epoch: 0,
+        expires_at: None,
+    };
+    let error = expect_error(check_possession(&open, "agent-a", "tok", &Value::Int(0)));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "item 'task-one' is held by no one, not by 'agent-a'"
+    );
+    // An item that carries a holder keeps the standing
+    // sentence whole.
+    let held = Item {
+        id: "task-one".to_string(),
+        note: "a synthetic task".to_string(),
+        status: "claimed".to_string(),
+        holder: Some("agent-a".to_string()),
+        token_hash: Some(dibs::token_hash("tok")),
+        epoch: 1,
+        expires_at: Some(dibs::format_instant(&at(60))),
+    };
+    let error = expect_error(check_possession(&held, "agent-b", "tok", &Value::Int(1)));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "item 'task-one' is held by 'agent-a', not by 'agent-b'"
+    );
+}
+
+#[test]
 fn the_registry_stores_only_the_token_hash() {
     let dir = temp_dir("hash-only");
     let registry = make_registry(&dir);
