@@ -634,7 +634,10 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
     // the one argument carried unconverted in both its forms,
     // because a path may hold bytes that are not Unicode; every
     // other argument is text, and one that is not Unicode is a
-    // parser error.
+    // parser error. The word is judged against the command set
+    // where it is taken, before the tokens after it are
+    // converted, so an unlisted word refuses as an invalid
+    // choice whatever follows it (DB-A49).
     let mut registry_path: Option<PathBuf> = None;
     let mut index = 0;
     let mut command: Option<String> = None;
@@ -702,6 +705,16 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             index += 1;
             continue;
         }
+        if !COMMANDS.contains(&token) {
+            return Ok(parser_fail(
+                MAIN_USAGE,
+                "dibs",
+                &format!(
+                    "argument command: invalid choice: {} (choose from 'offer', 'claim', 'renew', 'release', 'complete', 'board', 'history')",
+                    dibs::py_repr(token)
+                ),
+            ));
+        }
         command = Some(token.to_string());
         rest = Vec::new();
         for argument in &argv[index + 1..] {
@@ -733,16 +746,6 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             ),
         ));
     };
-    if !COMMANDS.contains(&command.as_str()) {
-        return Ok(parser_fail(
-            MAIN_USAGE,
-            "dibs",
-            &format!(
-                "argument command: invalid choice: {} (choose from 'offer', 'claim', 'renew', 'release', 'complete', 'board', 'history')",
-                dibs::py_repr(&command)
-            ),
-        ));
-    }
     let args = match parse_sub(&command, &rest) {
         Ok(args) => args,
         Err(failure) => {
