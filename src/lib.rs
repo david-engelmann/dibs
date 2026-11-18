@@ -829,11 +829,15 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
     }
 }
 
-/// Parse the time and offset after a date and its separator, or
-/// the bare end of the string, and build the instant. The
-/// separator has already been consumed by the caller.
-fn parse_time_and_offset(cursor: &mut Cursor, days: i64) -> Option<Instant> {
-    let hour = cursor.digits(2)?;
+/// Read the minute and second components that may follow an
+/// hour, the second and third components of a time and of an
+/// offset alike. Each component stands in colon form after its
+/// colon or in packed form where a digit stands, and a
+/// component that does not stand reads as zero. The time after
+/// a date and the offset after its sign carry their trailing
+/// components in this one shape, so the shape stands here once
+/// and both readers call it.
+fn minute_second_components(cursor: &mut Cursor) -> Option<(i64, i64)> {
     let mut minute = 0i64;
     let mut second = 0i64;
     if cursor.peek() == Some(':') {
@@ -849,6 +853,15 @@ fn parse_time_and_offset(cursor: &mut Cursor, days: i64) -> Option<Instant> {
             second = cursor.digits(2)?;
         }
     }
+    Some((minute, second))
+}
+
+/// Parse the time and offset after a date and its separator, or
+/// the bare end of the string, and build the instant. The
+/// separator has already been consumed by the caller.
+fn parse_time_and_offset(cursor: &mut Cursor, days: i64) -> Option<Instant> {
+    let hour = cursor.digits(2)?;
+    let (minute, second) = minute_second_components(cursor)?;
     let micros = cursor.fraction_micros()?;
     if hour > 23 || minute > 59 || second > 59 {
         return None;
@@ -870,21 +883,7 @@ fn parse_offset(cursor: &mut Cursor) -> Option<i64> {
         'Z' => Some(0),
         sign @ ('+' | '-') => {
             let hours = cursor.digits(2)?;
-            let mut minutes = 0i64;
-            let mut seconds = 0i64;
-            if cursor.peek() == Some(':') {
-                cursor.take();
-                minutes = cursor.digits(2)?;
-                if cursor.peek() == Some(':') {
-                    cursor.take();
-                    seconds = cursor.digits(2)?;
-                }
-            } else if cursor.peek().is_some_and(|c| c.is_ascii_digit()) {
-                minutes = cursor.digits(2)?;
-                if cursor.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    seconds = cursor.digits(2)?;
-                }
-            }
+            let (minutes, seconds) = minute_second_components(cursor)?;
             let micros = cursor.fraction_micros()?;
             let total_seconds = hours * 3600 + minutes * 60 + seconds;
             let total = (total_seconds as i128) * 1_000_000 + micros as i128;
