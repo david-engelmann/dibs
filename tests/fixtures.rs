@@ -873,25 +873,56 @@ fn generated_document(count: usize) -> String {
 }
 
 #[test]
-fn board_over_a_large_registry_stays_inside_a_generous_bound() {
-    // The port as first built validated a document in time
-    // quadratic in the item count, and a board over sixteen
-    // thousand items took over seventeen seconds in this
-    // profile on the build machine. Validation is linear in
-    // the count, and the same board lands far inside the bound.
-    let count = 16_000usize;
-    let text = generated_document(count);
-    let (_, registry) = staged_document("scale-board", &text);
-    let started = std::time::Instant::now();
-    let rows = registry.board(&t0()).unwrap();
-    let elapsed = started.elapsed();
-    assert_eq!(rows.len(), count);
-    assert_eq!(rows[0].id, "item-000000");
-    assert_eq!(rows[count - 1].id, "item-015999");
+fn board_over_a_large_registry_grows_with_the_document_not_its_square() {
+    // The obligation behind this pin is validation linear in
+    // the item count, where the port as first built validated
+    // in quadratic time and a board over sixteen thousand
+    // items took over seventeen seconds in this profile on
+    // the build machine. The pin as first written asserted
+    // one board inside an absolute wall clock bound, and a
+    // busy box broke that bound with no regression behind
+    // it, so the pin now judges the board's growth inside
+    // one run instead: four times the items must cost far
+    // less than the sixteen times a quadratic validation
+    // charges, each board timed as the best of three runs
+    // over its staged document so a load spike in any one
+    // run cannot fire the pin. A generous ceiling on any one
+    // board stands only as a hang guard, far past every
+    // recorded loaded figure for a board of this size.
+    let small = 4_000usize;
+    let large = 16_000usize;
+    let board_time = |count: usize| {
+        let text = generated_document(count);
+        let (_, registry) = staged_document(&format!("scale-growth-{count}"), &text);
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let rows = registry.board(&t0()).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(rows.len(), count);
+            assert!(
+                elapsed < std::time::Duration::from_secs(60),
+                "board over {count} items took {elapsed:?}"
+            );
+            best = best.min(elapsed);
+        }
+        best
+    };
+    let small_time = board_time(small);
+    let large_time = board_time(large);
+    eprintln!("scale growth: small {small_time:?}, large {large_time:?}");
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "board over {count} items took {elapsed:?}"
+        large_time < small_time * 9,
+        "board over {large} items took {large_time:?} against {small_time:?} \
+         over {small} items, a growth past the linear law"
     );
+    // The large board still reads the whole document back in
+    // offer order, as the pin before this one asserted.
+    let text = generated_document(large);
+    let (_, registry) = staged_document("scale-growth-rows", &text);
+    let rows = registry.board(&t0()).unwrap();
+    assert_eq!(rows[0].id, "item-000000");
+    assert_eq!(rows[large - 1].id, "item-015999");
 }
 
 #[test]
