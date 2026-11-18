@@ -1088,3 +1088,46 @@ fn stored_offset_seconds_read_in_both_forms() {
         assert_eq!(expired[0].status, "open", "{spelling}");
     }
 }
+
+#[test]
+fn stored_instants_with_a_trailing_fraction_separator_refuse() {
+    // A fraction separator with no digits after it counts as
+    // no fraction where a zone designator follows it, and
+    // refuses the reading where it stands at the end of the
+    // text, the two cases the Python grammar separates. The
+    // reader as first built joined them, taking the separator
+    // as no fraction in both seats of the grammar, so each
+    // spelling below read clean here and stands unparseable
+    // under the Python reader: the separator at the end of
+    // the time with a dot and with a comma, and at the end
+    // of the offset. Each refuses as corruption with the
+    // registry bytes standing unchanged. The control stands
+    // last: the same empty fraction followed by a zone
+    // designator reads at its boundary, the lease live
+    // strictly before the expiry it names and expired at it,
+    // so a repair that refused every empty fraction fails
+    // here as surely as the unrepaired reader fails above.
+    let refused = [
+        "2031-05-04T12:01:00.",
+        "2031-05-04T12:01:00,",
+        "2031-05-04T12:01:00+01:00.",
+    ];
+    for (index, spelling) in refused.iter().enumerate() {
+        let text = claimed_document(spelling);
+        let (dir, registry) = staged_document(&format!("trailing-fraction-{index}"), &text);
+        let path = dir.join("registry.json");
+        let error = expect_error(registry.board(&t0()));
+        assert!(matches!(error, Error::Corrupt(_)), "{spelling}: {error:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes());
+    }
+    let text = claimed_document("2031-05-04T12:01:00.+00:00");
+    let (_, registry) = staged_document("empty-fraction-zone", &text);
+    let live = registry.board(&at(59)).unwrap();
+    assert_eq!(live[0].status, "claimed");
+    assert_eq!(
+        live[0].expires_at.as_deref(),
+        Some("2031-05-04T12:01:00.+00:00")
+    );
+    let expired = registry.board(&at(60)).unwrap();
+    assert_eq!(expired[0].status, "open");
+}
