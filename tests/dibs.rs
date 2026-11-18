@@ -2392,3 +2392,61 @@ fn cli_claim_with_an_unwritable_stdout_exits_1_and_the_lease_stands() {
     );
     assert!(board.stdout.contains("epoch=1"), "{}", board.stdout);
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_invalid_command_word_refuses_before_the_arguments_after_it_are_converted() {
+    // The command word is judged where it is taken (DB-A49), so
+    // an unlisted word refuses as an invalid choice whatever
+    // follows it. Before the fix the tokens after the word were
+    // converted to text first, and a token that was not Unicode
+    // among them preempted the judgment, reporting the word
+    // under the history usage with the Unicode message instead,
+    // so the same invocation refused two different ways
+    // depending on the bytes of a later argument.
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = temp_dir("cli-invalid-command");
+    let path = dir.join("registry.json");
+    let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(&path)
+        .arg("bogus")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.starts_with("usage: dibs [-h] --registry REGISTRY"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("invalid choice: 'bogus'"), "{stderr}");
+    assert!(!stderr.contains("usage: dibs history"), "{stderr}");
+    assert!(!stderr.contains("not valid Unicode text"), "{stderr}");
+    // The control arm: a listed word takes the same non Unicode
+    // argument to the standing Unicode refusal under its own
+    // usage, the arm the sibling pin above holds.
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(&path)
+        .arg("offer")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.starts_with("usage: dibs offer [-h]"), "{stderr}");
+    assert!(stderr.contains("not valid Unicode text"), "{stderr}");
+}
