@@ -843,6 +843,44 @@ fn stored_week_date_spellings_read_at_their_boundary() {
     }
 }
 
+#[test]
+fn stored_week_dates_stop_at_the_weeks_in_their_year() {
+    // The week grammar refuses a week past the weeks its year
+    // carries and a weekday past 7, and holds a 53rd week in a
+    // year that carries one. 2031 opens on a Wednesday and is
+    // not a leap year, so it carries 52 weeks, and a stored
+    // expiry in its 53rd week refuses as corruption. 2020 is a
+    // leap year opening on a Wednesday, so it carries 53, and
+    // its 53rd week ends on 2021-01-03, where the lease stands
+    // live strictly before that instant and expired at it. A
+    // reader that dropped the weeks in year bound would read
+    // the first document into the following year and fail, and
+    // one that refused every 53rd week would fail the second.
+    let text = claimed_document("2031W537T12:01:00+00:00");
+    let (dir, registry) = staged_document("week-past-year", &text);
+    let path = dir.join("registry.json");
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes());
+
+    let text = claimed_document("2031W188T12:01:00+00:00");
+    let (_, registry) = staged_document("week-weekday-past", &text);
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+
+    let text = claimed_document("2020W537T12:01:00+00:00");
+    let (_, registry) = staged_document("week-fifty-three", &text);
+    let boundary = Instant::from_civil(2021, 1, 3, 12, 1, 0, 0, Some(0)).unwrap();
+    let live = registry.board(&boundary.plus_seconds(-1)).unwrap();
+    assert_eq!(live[0].status, "claimed");
+    assert_eq!(
+        live[0].expires_at.as_deref(),
+        Some("2020W537T12:01:00+00:00")
+    );
+    let expired = registry.board(&boundary).unwrap();
+    assert_eq!(expired[0].status, "open");
+}
+
 /// A generated registry of the given number of offered items,
 /// written out as text the way the scale cases stage it.
 fn generated_document(count: usize) -> String {
