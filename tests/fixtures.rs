@@ -988,3 +988,25 @@ fn stored_instants_in_the_wider_family_read_at_their_boundary() {
         assert_eq!(boundary[0].status, "open", "{spelling}");
     }
 }
+#[test]
+fn stored_offset_fraction_names_the_fraction_of_a_second() {
+    // The port amendment records one divergence in the stored
+    // instant family: a fraction on an offset whose whole part
+    // is zero is dropped by the Python parser and kept by this
+    // reader as the fraction of a second it names. The expiry
+    // below reads 12:01 at an offset of half a second, which
+    // is 12:00:59.5 in UTC, and the lease is live strictly
+    // before that instant and expired at it.
+    let spelling = "2031-05-04T12:01:00+00:00:00.5";
+    let text = claimed_document(spelling);
+    let (_, registry) = staged_document("offset-fraction", &text);
+    let live = registry
+        .board(&Instant::from_civil(2031, 5, 4, 12, 0, 59, 499_999, Some(0)).unwrap())
+        .unwrap();
+    assert_eq!(live[0].status, "claimed");
+    assert_eq!(live[0].expires_at.as_deref(), Some(spelling));
+    let expired = registry
+        .board(&Instant::from_civil(2031, 5, 4, 12, 0, 59, 500_000, Some(0)).unwrap())
+        .unwrap();
+    assert_eq!(expired[0].status, "open");
+}
