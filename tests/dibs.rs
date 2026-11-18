@@ -1111,6 +1111,127 @@ fn damage_event_holder_name_message_names_the_event() {
     );
 }
 
+/// A registry document holding one claimed item under a known
+/// token, with its expiry spelled in the canonical form, as raw
+/// text the encoding pins below re-encode.
+fn encodable_claimed_document() -> String {
+    format!(
+        "{{\"format\": \"dibs-registry/1\", \"items\": [{{\"id\": \"task-one\", \
+         \"note\": \"\", \"status\": \"claimed\", \"holder\": \"agent-a\", \
+         \"token_hash\": \"{}\", \"epoch\": 1, \"expires_at\": \"2031-05-04T12:01:00+00:00\"}}], \
+         \"history\": []}}",
+        dibs::token_hash("standing-token")
+    )
+}
+
+/// Encode a document text under one byte order mark, the way a
+/// writer of that encoding would have written it.
+fn encode_document(text: &str, mark: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    match mark {
+        "utf-8" => {
+            out.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+            out.extend_from_slice(text.as_bytes());
+        }
+        "utf-16le" => {
+            out.extend_from_slice(&[0xff, 0xfe]);
+            for unit in text.encode_utf16() {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        "utf-16be" => {
+            out.extend_from_slice(&[0xfe, 0xff]);
+            for unit in text.encode_utf16() {
+                out.extend_from_slice(&unit.to_be_bytes());
+            }
+        }
+        "utf-32le" => {
+            out.extend_from_slice(&[0xff, 0xfe, 0x00, 0x00]);
+            for ch in text.chars() {
+                out.extend_from_slice(&(ch as u32).to_le_bytes());
+            }
+        }
+        _ => {
+            out.extend_from_slice(&[0x00, 0x00, 0xfe, 0xff]);
+            for ch in text.chars() {
+                out.extend_from_slice(&(ch as u32).to_be_bytes());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn registry_documents_with_a_byte_order_mark_read_in_each_encoding() {
+    // The reader decodes the registry bytes the way the Python
+    // json module decoded them, detecting a byte order mark
+    // and transcoding UTF-16 and UTF-32, so a registry written
+    // in any of those encodings reads as the document it
+    // encodes. The dispatch carries one ordering trap: the
+    // UTF-32 little endian mark opens with the UTF-16 little
+    // endian mark, so the four byte check must run first, and
+    // a dispatch that reversed them would decode a UTF-32
+    // document as UTF-16 text full of NUL characters and
+    // refuse it as corruption, while every UTF-8 pin around
+    // this one still passed. Each encoding below must read its
+    // board at both sides of the lease's expiry boundary.
+    let text = encodable_claimed_document();
+    for mark in ["utf-8", "utf-16le", "utf-16be", "utf-32le", "utf-32be"] {
+        let dir = temp_dir(&format!("bom-{mark}"));
+        let path = dir.join("registry.json");
+        std::fs::write(&path, encode_document(&text, mark)).unwrap();
+        let registry = Registry::new(path);
+        let live = registry.board(&at(30)).unwrap();
+        assert_eq!(live.len(), 1, "{mark}");
+        assert_eq!(live[0].status, "claimed", "{mark}");
+        assert_eq!(
+            live[0].expires_at.as_deref(),
+            Some("2031-05-04T12:01:00+00:00"),
+            "{mark}"
+        );
+        let expired = registry.board(&at(60)).unwrap();
+        assert_eq!(expired[0].status, "open", "{mark}");
+    }
+}
+
+#[test]
+fn registry_documents_in_a_broken_encoding_refuse_as_corruption() {
+    // The broken forms of the same encodings refuse as
+    // corruption and leave the registry bytes standing: a
+    // UTF-16 document with an odd byte count, one carrying a
+    // lone surrogate, a UTF-32 document carrying a count past
+    // the last codepoint, and a UTF-8 mark followed by bytes
+    // that do not decode. A decoder that guessed at any of
+    // these instead of refusing would fail here.
+    let base = temp_dir("broken-encodings");
+    let mut odd_utf16 = vec![0xff, 0xfe];
+    odd_utf16.extend_from_slice(&[0x7b, 0x00, 0x22]);
+    let mut lone_surrogate = vec![0xff, 0xfe];
+    lone_surrogate.extend_from_slice(&[0x7b, 0x00, 0x00, 0xd8, 0x7d, 0x00]);
+    let mut past_last_codepoint = vec![0xff, 0xfe, 0x00, 0x00];
+    past_last_codepoint.extend_from_slice(&0x0011_0000u32.to_le_bytes());
+    let mut bad_utf8 = vec![0xef, 0xbb, 0xbf];
+    bad_utf8.extend_from_slice(&[0x7b, 0xff]);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("odd-utf16", odd_utf16),
+        ("lone-surrogate", lone_surrogate),
+        ("past-last-codepoint", past_last_codepoint),
+        ("bad-utf8", bad_utf8),
+    ];
+    for (name, bytes) in cases {
+        let directory = base.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("registry.json");
+        std::fs::write(&path, &bytes).unwrap();
+        let registry = Registry::new(path.clone());
+        assert_corrupt(registry.board(&at(1)));
+        assert_corrupt(registry.history(None));
+        assert_corrupt(registry.offer("task-two", "a synthetic task", &at(1)));
+        assert_corrupt(registry.claim("task-one", "agent-b", 60, &at(1)));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+    }
+}
+
 /// A registry holding two full lives, written by the library
 /// itself. One item stands claimed by its third holder after a
 /// release and a takeover, and one item stands completed. The
@@ -1856,11 +1977,21 @@ fn cli_round_trip_and_exit_codes() {
         0,
     );
     let lines: Vec<&str> = claimed.stdout.lines().collect();
+    assert_eq!(lines.len(), 3);
     assert!(lines[0].starts_with("token "));
     let token = lines[0].split_once(' ').unwrap().1;
     assert_eq!(lines[1], "epoch 1");
+    // The claim's third line prints the expiry the claim
+    // recorded, and the board then reports that same expiry
+    // for the lease, so a claim that printed a different
+    // expiry than it recorded, or dropped the line, fails
+    // here while the token and epoch lines still pass.
+    let printed_expiry = lines[2].strip_prefix("expires_at ").unwrap();
     let board = run_cli(&["--registry", path, "board"], 0);
     assert!(board.stdout.contains("task-one claimed holder=agent-a"));
+    assert!(board
+        .stdout
+        .contains(&format!("expires_at={printed_expiry}")));
     assert!(board.stdout.contains("epoch=1"));
     assert!(!board.stdout.contains(token));
     let renewed = run_cli(
