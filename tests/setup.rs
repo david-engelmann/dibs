@@ -456,3 +456,33 @@ fn codepoint_scan_skips_a_file_with_an_uppercase_binary_suffix() {
     assert!(result.stdout.contains("em dash U+2014 count 0"));
     assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
+
+#[cfg(unix)]
+#[test]
+fn codepoint_scan_with_an_unwritable_stdout_exits_2_without_a_panic() {
+    // The scanner prints through a checked writer (DB-A24),
+    // so a stream that refuses the write ends the scan at its
+    // error exit 2 with no panic. /dev/full stands in for the
+    // closed pipe of the finding's probe, because a pipe whose
+    // reader closes early cannot be staged deterministically
+    // from inside the suite, and /dev/full refuses the write
+    // the same way. On the pre-fix binary the same drive dies
+    // with a panic message at exit 101.
+    use std::process::Stdio;
+
+    let dir = temp_dir("scan-full");
+    std::fs::write(dir.join("clean.md"), "clean").unwrap();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .arg(&dir)
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+}
