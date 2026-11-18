@@ -886,9 +886,11 @@ fn board_over_a_large_registry_grows_with_the_document_not_its_square() {
     // less than the sixteen times a quadratic validation
     // charges, each board timed as the best of three runs
     // over its staged document so a load spike in any one
-    // run cannot fire the pin. A generous ceiling on any one
-    // board stands only as a hang guard, far past every
-    // recorded loaded figure for a board of this size.
+    // run cannot move the ratio the pin judges. A generous
+    // ceiling on any one board stands only as a hang guard,
+    // far past every recorded loaded figure for a board of
+    // this size, and a run that crosses it fails on its own
+    // however the other runs stand.
     let small = 4_000usize;
     let large = 16_000usize;
     let board_time = |count: usize| {
