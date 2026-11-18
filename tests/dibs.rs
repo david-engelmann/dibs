@@ -2310,3 +2310,35 @@ fn damage_duplicate_key_message_names_the_whole_key() {
         "the registry is corrupt, a key stands twice in the document, format"
     );
 }
+
+#[test]
+fn a_registry_whose_metadata_cannot_be_read_is_a_failure_not_an_empty_backlog() {
+    // The registry path stands under a regular file, so its
+    // metadata fails for every user, where the read path as
+    // first built took any metadata failure for absence and
+    // read the empty backlog (DB-A7). Board and history
+    // refuse with the failure an unreadable registry raises.
+    // The probe behind the finding staged the same refusal
+    // through a directory that denies search permission; this
+    // shape can fail on any box, whatever user runs the suite.
+    let dir = temp_dir("metadata-denied-registry");
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, "a regular file").unwrap();
+    let registry = Registry::new(blocker.join("registry.json"));
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Failure(_)), "{error:?}");
+    assert!(
+        error.message().contains("the registry file cannot be read"),
+        "{}",
+        error.message()
+    );
+    let error = expect_error(registry.history(None));
+    assert!(matches!(error, Error::Failure(_)), "{error:?}");
+    // The control: a registry that does not stand reads as an
+    // empty backlog and creates nothing, as DB-12 states.
+    let missing = Registry::new(dir.join("missing.json"));
+    assert_eq!(missing.board(&t0()).unwrap().len(), 0);
+    assert_eq!(missing.history(None).unwrap().len(), 0);
+    assert!(!dir.join("missing.json").exists());
+    assert!(!dir.join("missing.json.lock").exists());
+}
