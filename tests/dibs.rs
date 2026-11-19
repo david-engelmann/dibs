@@ -2768,3 +2768,67 @@ fn cli_invalid_command_word_refuses_before_the_arguments_after_it_are_converted(
     assert!(stderr.starts_with("usage: dibs offer [-h]"), "{stderr}");
     assert!(stderr.contains("not valid Unicode text"), "{stderr}");
 }
+
+#[test]
+fn registry_documents_without_a_byte_order_mark_read_in_each_encoding() {
+    // The Python json module detected the encoding of the
+    // bytes it was handed by the NUL pattern of the opening
+    // bytes as well as by a byte order mark, so a registry
+    // written in UTF-16 or UTF-32 without a mark read as the
+    // document it encodes. The reader as it stood took only
+    // the mark, and a markless document fell to the UTF-8
+    // reading, whose decode succeeds on the NUL bytes and
+    // whose parse then refuses the interleaved text, so every
+    // encoding below refused whole as corruption before the
+    // repair this pin holds. Each encoding must read its
+    // board at both sides of the lease's expiry boundary, and
+    // a markless UTF-16 document carrying a lone surrogate in
+    // its note must still refuse as corruption with its bytes
+    // standing, so a repair that decoded the detected
+    // encodings loosely stands caught beside one that never
+    // detected them, and a repair that detected only one
+    // endianness fails on the other. The mark forms stand
+    // held by the byte order mark pin above, and a repair
+    // that ran the pattern detection ahead of the mark arms
+    // would decode the UTF-32 big endian mark as a character
+    // and fail there.
+    let text = encodable_claimed_document();
+    for (mark, strip) in [
+        ("utf-16le", 2usize),
+        ("utf-16be", 2),
+        ("utf-32le", 4),
+        ("utf-32be", 4),
+    ] {
+        let dir = temp_dir(&format!("no-bom-{mark}"));
+        let path = dir.join("registry.json");
+        let marked = encode_document(&text, mark);
+        std::fs::write(&path, &marked[strip..]).unwrap();
+        let registry = Registry::new(path);
+        let live = registry.board(&at(30)).unwrap();
+        assert_eq!(live.len(), 1, "{mark}");
+        assert_eq!(live[0].status, "claimed", "{mark}");
+        assert_eq!(
+            live[0].expires_at.as_deref(),
+            Some("2031-05-04T12:01:00+00:00"),
+            "{mark}"
+        );
+        let expired = registry.board(&at(60)).unwrap();
+        assert_eq!(expired[0].status, "open", "{mark}");
+    }
+    // A markless UTF-16 document carrying a lone surrogate in
+    // its note refuses as corruption and leaves the registry
+    // bytes standing, the strict decoding the mark arms use.
+    let note_b = text.find("\"abc\"").unwrap() + 2;
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units[note_b] = 0xd800;
+    let mut bytes = Vec::new();
+    for unit in &units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let dir = temp_dir("no-bom-lone-surrogate");
+    let path = dir.join("registry.json");
+    std::fs::write(&path, &bytes).unwrap();
+    let registry = Registry::new(path.clone());
+    assert_corrupt(registry.board(&at(1)));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
