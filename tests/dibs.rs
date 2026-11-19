@@ -2768,3 +2768,156 @@ fn cli_invalid_command_word_refuses_before_the_arguments_after_it_are_converted(
     assert!(stderr.starts_with("usage: dibs offer [-h]"), "{stderr}");
     assert!(stderr.contains("not valid Unicode text"), "{stderr}");
 }
+
+#[test]
+fn cli_help_bodies_print_their_whole_texts() {
+    // The eight help bodies stand pinned as whole texts. What the
+    // parser pins already hold is the usage lines, which the parser
+    // error path shares, and one absence, the time override flag the
+    // surface carries none of. The bodies themselves, the descriptions
+    // and the option lists a caller reads on an explicit help flag,
+    // were compared nowhere, so a dropped option line or a reworded
+    // description passed every suite. Each comparison below fails on
+    // any drift inside its body. One line of the main body is pinned
+    // in its standing form deliberately: the board line is the wording
+    // DB-A33 records, its correction queued in PR 132, and when that
+    // correction lands this pin fails until the expected text is
+    // updated in the same pass, so the correction cannot land silently
+    // past the guard.
+    let main = run_cli(&["--help"], 0);
+    assert_eq!(main.stderr, "");
+    assert_eq!(
+        main.stdout,
+        concat!(
+            "usage: dibs [-h] --registry REGISTRY\n",
+            "            {offer,claim,renew,release,complete,board,history} ...\n",
+            "\n",
+            "Claim tasks from a shared backlog under leases that expire unless they are\n",
+            "renewed.\n",
+            "\n",
+            "positional arguments:\n",
+            "  {offer,claim,renew,release,complete,board,history}\n",
+            "    offer               add an item to the backlog\n",
+            "    claim               lease an item under a new claim\n",
+            "    renew               extend the standing lease from its current expiry\n",
+            "    release             end the standing lease early\n",
+            "    complete            mark the item done under its standing lease\n",
+            "    board               show the open items and their standing leases\n",
+            "    history             show the recorded claim history\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  --registry REGISTRY   the registry file holding the backlog, created by the\n",
+            "                        first mutation\n",
+        )
+    );
+    let offer = run_cli(&["offer", "--help"], 0);
+    assert_eq!(offer.stderr, "");
+    assert_eq!(
+        offer.stdout,
+        concat!(
+            "usage: dibs offer [-h] [--note NOTE] item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help   show this help message and exit\n",
+            "  --note NOTE  a short payload note for the item\n",
+        )
+    );
+    let claim = run_cli(&["claim", "--help"], 0);
+    assert_eq!(claim.stderr, "");
+    assert_eq!(
+        claim.stdout,
+        concat!(
+            "usage: dibs claim [-h] --holder HOLDER --ttl TTL item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help       show this help message and exit\n",
+            "  --holder HOLDER\n",
+            "  --ttl TTL        the lease length in seconds\n",
+        )
+    );
+    let renew = run_cli(&["renew", "--help"], 0);
+    assert_eq!(renew.stderr, "");
+    assert_eq!(
+        renew.stdout,
+        concat!(
+            "usage: dibs renew [-h] --holder HOLDER --token TOKEN --epoch EPOCH --ttl TTL\n",
+            "                  item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help       show this help message and exit\n",
+            "  --holder HOLDER\n",
+            "  --token TOKEN\n",
+            "  --epoch EPOCH\n",
+            "  --ttl TTL        the added lease length in seconds\n",
+        )
+    );
+    let release = run_cli(&["release", "--help"], 0);
+    assert_eq!(release.stderr, "");
+    assert_eq!(
+        release.stdout,
+        concat!(
+            "usage: dibs release [-h] --holder HOLDER --token TOKEN --epoch EPOCH item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help       show this help message and exit\n",
+            "  --holder HOLDER\n",
+            "  --token TOKEN\n",
+            "  --epoch EPOCH\n",
+        )
+    );
+    let complete = run_cli(&["complete", "--help"], 0);
+    assert_eq!(complete.stderr, "");
+    assert_eq!(
+        complete.stdout,
+        concat!(
+            "usage: dibs complete [-h] --holder HOLDER --token TOKEN --epoch EPOCH item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help       show this help message and exit\n",
+            "  --holder HOLDER\n",
+            "  --token TOKEN\n",
+            "  --epoch EPOCH\n",
+        )
+    );
+    let board = run_cli(&["board", "--help"], 0);
+    assert_eq!(board.stderr, "");
+    assert_eq!(
+        board.stdout,
+        concat!(
+            "usage: dibs board [-h]\n",
+            "\n",
+            "options:\n",
+            "  -h, --help  show this help message and exit\n",
+        )
+    );
+    let history = run_cli(&["history", "--help"], 0);
+    assert_eq!(history.stderr, "");
+    assert_eq!(
+        history.stdout,
+        concat!(
+            "usage: dibs history [-h] [item]\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help  show this help message and exit\n",
+        )
+    );
+}
