@@ -442,6 +442,64 @@ fn possession_holder_message_names_the_holderless_case() {
 }
 
 #[test]
+fn possession_checks_fire_in_their_order_when_several_presentations_fail() {
+    // The possession check judges the holder first and the
+    // epoch second and the token last, the order its doc
+    // comment states, and the order is observable only where
+    // two presentations fail at once, because each single
+    // failure pin passes under any order that keeps its own
+    // check. These drives fail in pairs and compare the
+    // message whole, so a check order swapped in a refactor
+    // fails here while every single failure pin around it
+    // still passed. The last arm stands as the control: with
+    // the holder and the epoch right, the token's own message
+    // fires, the same text the binding smoke pins on its
+    // surface.
+    let standing = Item {
+        id: "task-one".to_string(),
+        note: "a synthetic task".to_string(),
+        status: "claimed".to_string(),
+        holder: Some("agent-a".to_string()),
+        token_hash: Some(dibs::token_hash("standing-token")),
+        epoch: 1,
+        expires_at: Some(dibs::format_instant(&at(60))),
+    };
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-b",
+        "not-the-token",
+        &Value::Int(7),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "item 'task-one' is held by 'agent-a', not by 'agent-b'"
+    );
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-a",
+        "not-the-token",
+        &Value::Int(7),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the epoch 7 presented for item 'task-one' does not match the standing epoch 1"
+    );
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-a",
+        "not-the-token",
+        &Value::Int(1),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the token presented for item 'task-one' does not match the lease"
+    );
+}
+
+#[test]
 fn the_registry_stores_only_the_token_hash() {
     let dir = temp_dir("hash-only");
     let registry = make_registry(&dir);
@@ -790,6 +848,82 @@ fn float_values_render_in_refusal_messages_as_python_renders_them() {
          and digits and hyphens and underscores, starting and ending \
          with a letter or a digit, at most 64 characters long"
     );
+}
+
+#[test]
+fn invalid_name_message_quotes_and_escapes_as_python_repr_does() {
+    // The name refusal renders the presented value with the
+    // quoting the Python repr used, and that rendering is an
+    // equivalence obligation of the port, as the float pin
+    // above holds for numbers. These cases stand on the
+    // renderer's own decision boundaries, each probed against
+    // the Python runtime: the quote is a double quote when the
+    // text carries a single quote and no double quote and a
+    // single quote otherwise, with the chosen quote escaped
+    // where the text carries it; the backslash and the common
+    // control characters are escaped; a character Python
+    // counts as not printable renders as a hex escape, two
+    // digits at or under a byte and four in the rest of the
+    // basic plane; and a printable character past the basic
+    // plane renders as itself. A renderer that always chose
+    // one quote, or passed a control character through raw,
+    // or rendered a byte width character at four digits, or
+    // escaped a printable astral character would change one
+    // of these texts while every variant only pin around it
+    // still passed. The private use escapes stand pinned by
+    // the repair queued for DB-A5 and are not repeated here.
+    let cases: [(&str, &str); 10] = [
+        ("it's", "\"it's\""),
+        ("say \"hi\"", "'say \"hi\"'"),
+        ("both ' and \"", "'both \\' and \"'"),
+        ("back\\slash", "'back\\\\slash'"),
+        ("a\tb", "'a\\tb'"),
+        ("\u{1}", "'\\x01'"),
+        ("\u{85}", "'\\x85'"),
+        ("\u{a0}", "'\\xa0'"),
+        ("\u{200b}", "'\\u200b'"),
+        ("agent-\u{1f600}", "'agent-\u{1f600}'"),
+    ];
+    for (value, rendered) in cases {
+        let error = expect_error(validate_name(&Value::Str(value.to_string()), "item"));
+        assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
+        let expected = format!(
+            "invalid item id {rendered}, use one component of lowercase letters \
+             and digits and hyphens and underscores, starting and ending \
+             with a letter or a digit, at most 64 characters long"
+        );
+        assert_eq!(error.message(), expected.as_str(), "the value {value:?}");
+    }
+}
+
+#[test]
+fn format_name_refusal_renders_compound_values_as_python_repr_does() {
+    // The strict reader's format refusal renders the standing
+    // format value whole, and a hand damaged document can put
+    // a list or an object in that field, where the renderer
+    // joins the elements the way the Python repr joined them.
+    // The damage battery pins the refusal's class for a wrong
+    // string and leaves the text unasserted, so a renderer
+    // that joined a compound value in any other shape would
+    // pass it while changing the words a caller reads.
+    let cases: [(&str, &str); 2] = [
+        ("[\"dibs-registry/1\"]", "['dibs-registry/1']"),
+        ("{\"a\": 1}", "{'a': 1}"),
+    ];
+    for (index, (stored, rendered)) in cases.iter().enumerate() {
+        let dir = temp_dir(&format!("format-render-{index}"));
+        let path = dir.join("registry.json");
+        let text = format!("{{\"format\": {stored}, \"items\": [], \"history\": []}}");
+        std::fs::write(&path, text).unwrap();
+        let registry = Registry::new(path);
+        let error = expect_error(registry.board(&t0()));
+        assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+        let expected = format!(
+            "the registry is corrupt, the format name is {rendered}, \
+             not 'dibs-registry/1'"
+        );
+        assert_eq!(error.message(), expected.as_str());
+    }
 }
 
 macro_rules! huge_ttl {
