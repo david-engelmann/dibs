@@ -2272,6 +2272,160 @@ fn cli_integer_arguments_refuse_the_separator_controls() {
     );
 }
 
+#[test]
+fn cli_integer_arguments_refuse_digit_strings_past_the_conversion_limit() {
+    // The Python integer conversion the command line mirrors
+    // refuses a digit string past its limit of 4300 digits,
+    // counted as the conversion counts them, leading zeros
+    // included and underscores excluded, and the parser
+    // reports the argument as an invalid int value at exit 2.
+    // The converter as first built kept a digit string of any
+    // length whole, so a time to live past the limit refused
+    // as an invalid time to live, the library's sentence for a
+    // value the conversion never produced, and an epoch past
+    // the limit was presented as the widest 128 bit count and
+    // refused as a possession refusal at exit 1, a malformed
+    // invocation reading as a lease refusal. The pins below
+    // fail on that converter for those reasons, and the
+    // control at the limit itself fails on a converter that
+    // refuses one digit early.
+    let dir = temp_dir("cli-digit-limit");
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    run_cli(&["--registry", path, "offer", "task-one"], 0);
+    let claimed = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "600",
+        ],
+        0,
+    );
+    let token = claimed
+        .stdout
+        .lines()
+        .next()
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1
+        .to_string();
+    let past = "1".repeat(4301);
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            &past,
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !refused.stderr.contains("invalid time to live"),
+        "{}",
+        refused.stderr
+    );
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "release",
+            "task-one",
+            "--holder",
+            "agent-a",
+            &format!("--token={token}"),
+            "--epoch",
+            &past,
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !refused
+            .stderr
+            .contains("170141183460469231731687303715884105727"),
+        "{}",
+        refused.stderr
+    );
+    // The limit counts the digits as written, not the value
+    // they name, so an epoch of zeros past the limit refuses
+    // the same way, where the value zero itself converts.
+    let zeros = "0".repeat(4301);
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "release",
+            "task-one",
+            "--holder",
+            "agent-a",
+            &format!("--token={token}"),
+            "--epoch",
+            &zeros,
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+    // The control at the limit itself: a time to live of
+    // exactly 4300 digits still converts whole and refuses as
+    // an invalid time to live naming the number, so the
+    // boundary stands at the conversion's limit and not below
+    // it.
+    let at_limit = "1".repeat(4300);
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-two",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            &at_limit,
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid time to live"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+    // Nothing above touched the standing lease.
+    let board = run_cli(&["--registry", path, "board"], 0);
+    assert!(
+        board.stdout.contains("task-one claimed holder=agent-a"),
+        "{}",
+        board.stdout
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_non_unicode_arguments_are_parser_errors_not_panics() {
