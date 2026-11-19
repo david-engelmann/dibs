@@ -288,11 +288,15 @@ fn py_digit_value(c: char) -> Option<u32> {
 /// Python's int conversion for the numeric arguments: optional
 /// surrounding whitespace from the Unicode whitespace set, an
 /// optional sign, decimal digits from any family of the table
-/// above with single underscores between them. The value is
-/// kept whole, at 128 bit width when it fits and as its
-/// canonical digit text when it does not, so a later validation
-/// prints the number the caller typed rather than a parser
-/// failure.
+/// above with single underscores between them. A digit string
+/// past the conversion's own limit of 4300 digits is refused
+/// here, as the conversion refuses it, so the argument draws
+/// the parser's invalid int value error rather than a
+/// validation over a number the conversion never produced.
+/// The value is kept whole, at 128 bit width when it fits and
+/// as its canonical digit text when it does not, so a later
+/// validation prints the number the caller typed rather than a
+/// parser failure.
 fn python_int(text: &str) -> Option<Value> {
     // The trim set is the Python integer conversion's own,
     // which is the Unicode whitespace set exactly. The wider
@@ -331,6 +335,15 @@ fn python_int(text: &str) -> Option<Value> {
         }
     }
     if previous_underscore || !seen_digit {
+        return None;
+    }
+    // The conversion refuses a digit string past its limit of
+    // 4300 digits, counted over the digit characters as they
+    // stand collected here, leading zeros included and
+    // underscores excluded, so a longer string is no value at
+    // all and the argument draws the parser's invalid int
+    // value error.
+    if digits.len() > 4300 {
         return None;
     }
     let canonical_digits = {
