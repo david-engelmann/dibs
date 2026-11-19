@@ -1895,7 +1895,9 @@ fn token_matches(presented: &str, stored_hash: &str) -> bool {
 
 /// Decode registry bytes to text the way the Python json module
 /// decoded them, detecting a byte order mark and transcoding
-/// UTF-16 and UTF-32, and refusing what does not decode.
+/// UTF-16 and UTF-32, detecting the same encodings by the NUL
+/// pattern of the opening bytes where no mark stands, and
+/// refusing what does not decode.
 fn decode_document_bytes(bytes: &[u8]) -> std::result::Result<String, String> {
     if bytes.starts_with(&[0xff, 0xfe, 0x00, 0x00]) {
         decode_utf32(&bytes[4..], true)
@@ -1908,9 +1910,48 @@ fn decode_document_bytes(bytes: &[u8]) -> std::result::Result<String, String> {
     } else if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
         String::from_utf8(bytes[3..].to_vec())
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
+    } else if let Some(decoded) = decode_detected_encoding(bytes) {
+        decoded
     } else {
         String::from_utf8(bytes.to_vec())
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
+    }
+}
+
+/// Decode registry bytes that carry no byte order mark under
+/// the encoding the NUL pattern of their first four bytes
+/// names, the rest of the detection the Python json module
+/// performs. A document in UTF-16 or UTF-32 without a mark
+/// still decodes there, because the zero bytes of its opening
+/// units name the encoding and the endianness: 00 00 names
+/// UTF-32 big endian, 00 XX names UTF-16 big endian, XX 00 00
+/// 00 names UTF-32 little endian, and XX 00 with a nonzero
+/// third or fourth byte names UTF-16 little endian. The
+/// decoding is the strict decoding the mark arms call, so a
+/// document the pattern names but the encoding cannot carry
+/// refuses with the same sentences. Bytes whose opening names
+/// no encoding return None and fall through to the UTF-8
+/// reading, and an input shorter than four bytes names
+/// nothing here, as it names nothing under the Python
+/// detection.
+fn decode_detected_encoding(bytes: &[u8]) -> Option<std::result::Result<String, String>> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    if bytes[0] == 0 {
+        if bytes[1] == 0 {
+            Some(decode_utf32(bytes, false))
+        } else {
+            Some(decode_utf16(bytes, false))
+        }
+    } else if bytes[1] == 0 {
+        if bytes[2] == 0 && bytes[3] == 0 {
+            Some(decode_utf32(bytes, true))
+        } else {
+            Some(decode_utf16(bytes, true))
+        }
+    } else {
+        None
     }
 }
 
