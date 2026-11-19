@@ -1131,3 +1131,50 @@ fn stored_instants_with_a_trailing_fraction_separator_refuse() {
     let expired = registry.board(&at(60)).unwrap();
     assert_eq!(expired[0].status, "open");
 }
+
+#[test]
+fn stored_time_fractions_read_at_their_microsecond_boundary() {
+    // The stored instant grammar takes a fraction written
+    // with a dot or a comma at any seat of the time, and the
+    // fraction always lands on the seconds, truncated past
+    // six digits, as the port amendment in CONTRACT.md
+    // states. Every other fraction the suites stage names no
+    // value: the wider family pin's comma fraction carries
+    // zeros, the pin above stages empty fractions, and the
+    // one fraction whose value a pin judges stands on the
+    // offset, in the pin queued with DB-A47. The cases below
+    // stage the time fraction at its value, each expected
+    // boundary probed against Python 3.12.3: a half on the
+    // seconds under both separators, a half on the minute and
+    // on the hour, each landing on the seconds, a seven digit
+    // fraction truncated at the sixth digit, and a fraction
+    // of one microsecond at the last place. A reader that
+    // dropped the digits reads every expiry early by its
+    // fraction and fails the live side; one that read the
+    // hour fraction as a fraction of the hour stands thirty
+    // minutes late at that case; one that rounded the seventh
+    // digit stands one microsecond late at the truncation
+    // case; and one that scaled the last place at a coarser
+    // unit fails the microsecond case, while every whole
+    // second pin around this one still passes.
+    let cases: [(&str, (i64, i64, i64, i64)); 6] = [
+        ("2031-05-04T12:01:00.5+00:00", (12, 1, 0, 500_000)),
+        ("2031-05-04T12:01:00,5+00:00", (12, 1, 0, 500_000)),
+        ("2031-05-04T12:01.5+00:00", (12, 1, 0, 500_000)),
+        ("2031-05-04T12.5+00:00", (12, 0, 0, 500_000)),
+        ("2031-05-04T12:01:00.1234569+00:00", (12, 1, 0, 123_456)),
+        ("2031-05-04T12:01:00.000001+00:00", (12, 1, 0, 1)),
+    ];
+    for (index, (spelling, (hour, minute, second, micros))) in cases.iter().enumerate() {
+        let text = claimed_document(spelling);
+        let (_, registry) = staged_document(&format!("time-fraction-{index}"), &text);
+        let boundary =
+            Instant::from_civil(2031, 5, 4, *hour, *minute, *second, *micros, Some(0)).unwrap();
+        let just_before = Instant::from_epoch_micros(boundary.epoch_micros().unwrap() - 1).unwrap();
+        let live = registry.board(&just_before).unwrap();
+        assert_eq!(live[0].status, "claimed", "{spelling}");
+        assert_eq!(live[0].expires_at.as_deref(), Some(*spelling));
+        let expired = registry.board(&boundary).unwrap();
+        assert_eq!(expired[0].status, "open", "{spelling}");
+    }
+}
