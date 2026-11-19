@@ -2768,3 +2768,158 @@ fn cli_invalid_command_word_refuses_before_the_arguments_after_it_are_converted(
     assert!(stderr.starts_with("usage: dibs offer [-h]"), "{stderr}");
     assert!(stderr.contains("not valid Unicode text"), "{stderr}");
 }
+
+#[test]
+fn string_values_render_in_refusal_messages_as_python_renders_them() {
+    // The messages that interpolate a value render a string
+    // the way Python's repr renders it, and that rendering is
+    // an equivalence obligation of the port (DB-A56). The
+    // float arms stand pinned by the sibling float pin, and
+    // the private use escapes by the pin queued with DB-A5's
+    // repair, but the renderer's quote and escape arms stood
+    // unpinned before this pin. The cases stand on those
+    // arms: the quote selection itself (a double quote when
+    // the text carries a single quote and no double quote, a
+    // single quote otherwise, the chosen quote escaped where
+    // the text carries it), the backslash escape, the short
+    // escape for a tab, and the hex escape widths, two
+    // digits at or under a byte and four in the rest of the
+    // basic plane, for the characters the printable table
+    // refuses, closing with a printable character past the
+    // basic plane rendering as itself. Every expected text
+    // was probed against the Python runtime the contract
+    // names, 3.12.3, never written from habit. A renderer
+    // that always chose one quote fails the first three
+    // cases, one that passed a control character through
+    // raw fails the escape cases (and would break the one
+    // line shape the refusal keeps), one that rendered a
+    // byte width character at four digits fails the two
+    // digit cases, and one that escaped a printable astral
+    // character fails the last case, while every variant
+    // only pin around them still passed.
+    let cases: [(&str, &str); 10] = [
+        ("task'one", "\"task'one\""),
+        ("task\"one", "'task\"one'"),
+        ("task'\"one", "'task\\'\"one'"),
+        ("task\\one", "'task\\\\one'"),
+        ("task\tone", "'task\\tone'"),
+        ("task\u{1}one", "'task\\x01one'"),
+        ("task\u{85}one", "'task\\x85one'"),
+        ("task\u{a0}one", "'task\\xa0one'"),
+        ("task\u{200b}one", "'task\\u200bone'"),
+        ("task\u{20000}one", "'task\u{20000}one'"),
+    ];
+    for (name, rendered) in cases {
+        let error = expect_error(validate_name(&Value::Str(name.to_string()), "item"));
+        assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
+        let expected = format!(
+            "invalid item id {rendered}, use one component of lowercase letters \
+             and digits and hyphens and underscores, starting and ending \
+             with a letter or a digit, at most 64 characters long"
+        );
+        assert_eq!(error.message(), expected.as_str(), "the name {name:?}");
+    }
+}
+
+#[test]
+fn compound_format_values_render_whole_in_the_format_refusal() {
+    // The strict reader's format refusal interpolates the
+    // standing format value whole (DB-A56), and a damaged
+    // document can carry a compound value in that field,
+    // which the renderer's array and object arms join
+    // element by element. The expected texts were probed
+    // against Python 3.12.3: a list renders its elements
+    // repr by repr joined with ", ", and an object renders
+    // each key's repr, ": ", and the value's repr the same
+    // way. A renderer that joined a compound value in any
+    // other shape, or rendered a member in any other form,
+    // fails these comparisons while every variant only pin
+    // around them still passed.
+    let base = temp_dir("format-compound");
+    let (directory, text) = mutated(&base, "list-case", |doc| {
+        doc["format"] = serde_json::json!(["dibs-registry/1", 2]);
+    });
+    let path = directory.join("registry.json");
+    std::fs::write(&path, &text).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&at(1)));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, the format name is ['dibs-registry/1', 2], \
+         not 'dibs-registry/1'"
+    );
+    let (directory, text) = mutated(&base, "object-case", |doc| {
+        doc["format"] = serde_json::json!({"name": "dibs-registry/1", "version": 2});
+    });
+    let path = directory.join("registry.json");
+    std::fs::write(&path, &text).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&at(1)));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, the format name is \
+         {'name': 'dibs-registry/1', 'version': 2}, not 'dibs-registry/1'"
+    );
+}
+
+#[test]
+fn possession_check_judges_holder_then_epoch_then_token() {
+    // The possession check judges holder first and epoch
+    // second and token last, as its doc comment states, and
+    // the order is observable only where two presentations
+    // fail at once (DB-A57). Every standing pin isolates
+    // one failure, so a refactor that swapped two of the
+    // three checks would pass the whole suite while
+    // changing which refusal a doubly wrong presentation
+    // draws. These three arms present two failures at a
+    // time on the standing claimed item shape the suite
+    // hand builds, comparing the message whole, and a swap
+    // of any two checks fails exactly one arm. The last
+    // arm stands as the control, the same text the binding
+    // smoke pins on its surface.
+    let standing = Item {
+        id: "task-one".to_string(),
+        note: "a synthetic task".to_string(),
+        status: "claimed".to_string(),
+        holder: Some("agent-a".to_string()),
+        token_hash: Some(dibs::token_hash("tok")),
+        epoch: 1,
+        expires_at: Some(dibs::format_instant(&at(60))),
+    };
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-b",
+        "tok-wrong",
+        &Value::Int(7),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "item 'task-one' is held by 'agent-a', not by 'agent-b'"
+    );
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-a",
+        "tok-wrong",
+        &Value::Int(7),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the epoch 7 presented for item 'task-one' does not match \
+         the standing epoch 1"
+    );
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-a",
+        "tok-wrong",
+        &Value::Int(1),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the token presented for item 'task-one' does not match the lease"
+    );
+}
