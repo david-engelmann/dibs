@@ -1157,15 +1157,15 @@ fn stored_time_fractions_read_at_their_microsecond_boundary() {
     // case; and one that scaled the last place at a coarser
     // unit fails the microsecond case, while every whole
     // second pin around this one still passes.
-    let cases: [(&str, (i64, i64, i64, i64)); 6] = [
-        ("2031-05-04T12:01:00.5+00:00", (12, 1, 0, 500_000)),
-        ("2031-05-04T12:01:00,5+00:00", (12, 1, 0, 500_000)),
-        ("2031-05-04T12:01.5+00:00", (12, 1, 0, 500_000)),
-        ("2031-05-04T12.5+00:00", (12, 0, 0, 500_000)),
-        ("2031-05-04T12:01:00.1234569+00:00", (12, 1, 0, 123_456)),
-        ("2031-05-04T12:01:00.000001+00:00", (12, 1, 0, 1)),
+    let cases: [(&str, i64, i64, i64, i64); 6] = [
+        ("2031-05-04T12:01:00.5+00:00", 12, 1, 0, 500_000),
+        ("2031-05-04T12:01:00,5+00:00", 12, 1, 0, 500_000),
+        ("2031-05-04T12:01.5+00:00", 12, 1, 0, 500_000),
+        ("2031-05-04T12.5+00:00", 12, 0, 0, 500_000),
+        ("2031-05-04T12:01:00.1234569+00:00", 12, 1, 0, 123_456),
+        ("2031-05-04T12:01:00.000001+00:00", 12, 1, 0, 1),
     ];
-    for (index, (spelling, (hour, minute, second, micros))) in cases.iter().enumerate() {
+    for (index, (spelling, hour, minute, second, micros)) in cases.iter().enumerate() {
         let text = claimed_document(spelling);
         let (_, registry) = staged_document(&format!("time-fraction-{index}"), &text);
         let boundary =
