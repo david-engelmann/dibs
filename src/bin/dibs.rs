@@ -39,7 +39,7 @@ positional arguments:
     renew               extend the standing lease from its current expiry
     release             end the standing lease early
     complete            mark the item done under its standing lease
-    board               show the open items and their standing leases
+    board               show the open and claimed items
     history             show the recorded claim history
 
 options:
