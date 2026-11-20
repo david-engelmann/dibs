@@ -2592,6 +2592,36 @@ fn cli_completed_item_leaves_the_board_but_keeps_its_history() {
 }
 
 #[test]
+fn cli_history_names_the_previous_holder_on_a_takeover() {
+    // The history line carries the previous holder on a
+    // taken_over event alone, and the library pins assert the
+    // event's field rather than this surface's rendering of
+    // it. The takeover is staged through the library at
+    // injected instants, because history evaluates no lease
+    // state and the command line read of it crosses no wall
+    // clock boundary.
+    let dir = temp_dir("cli-takeover-line");
+    let registry = make_registry(&dir);
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    registry.claim("task-one", "agent-a", 60, &at(0)).unwrap();
+    registry.claim("task-one", "agent-b", 60, &at(61)).unwrap();
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    let history = run_cli(&["--registry", path, "history"], 0);
+    let lines: Vec<&str> = history.stdout.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines[2],
+        "3 taken_over item=task-one holder=agent-b \
+         at=2031-05-04T12:01:01+00:00 epoch=2 previous_holder=agent-a"
+    );
+    assert!(!lines[0].contains("previous_holder"), "{}", lines[0]);
+    assert!(!lines[1].contains("previous_holder"), "{}", lines[1]);
+}
+
+#[test]
 fn damage_duplicate_key_message_names_the_whole_key() {
     // The duplicated key here carries the separator the reader's
     // own position suffix uses, so a recovery that cuts the error
