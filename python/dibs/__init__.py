@@ -1,10 +1,11 @@
 """dibs, expiring claim leases for shared agent backlogs with a Rust core.
 
 This package is the thin Python face of the dibs library. Each
-function calls the library and returns plain dictionaries of the
-facts the command line reports, and a refusal raises a subclass
-of DibsError carrying the same message text the command line
-prints. InvalidNameError covers an item or holder id in the
+function calls the library. Claim and renew return one dictionary
+of the facts the command line reports, board and history return
+lists of dictionaries, and offer and release and complete return
+nothing. A refusal raises a subclass of DibsError carrying the
+same message text the command line prints. InvalidNameError covers an item or holder id in the
 wrong shape, InvalidTtlError a time to live outside the bound,
 InvalidRequestError a request in the wrong shape, NotFoundError
 an item missing from the backlog, RefusalError a lease that
