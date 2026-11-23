@@ -260,3 +260,20 @@ def test_wide_integer_digits_come_from_the_value_not_its_methods(tmp_path):
     board = rows_by_id(dibs.board(registry, T0))
     assert "task-two" not in board
     assert board["task-one"]["status"] == "open"
+
+
+def test_a_foreign_format_document_raises_corrupt_error(tmp_path):
+    registry = tmp_path / "registry.json"
+    registry.write_text(
+        '{"format": "dibs-registry/2", "items": [], "history": []}',
+        encoding="utf-8",
+    )
+    with pytest.raises(dibs.CorruptError) as corrupt:
+        dibs.board(str(registry), T0)
+    assert str(corrupt.value).startswith("the registry is corrupt")
+
+
+def test_a_registry_path_that_is_a_directory_raises_failure_error(tmp_path):
+    with pytest.raises(dibs.FailureError) as failure:
+        dibs.board(str(tmp_path), T0)
+    assert str(failure.value).startswith("the registry file cannot be read")
