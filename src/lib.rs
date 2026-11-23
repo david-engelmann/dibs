@@ -738,7 +738,10 @@ impl Cursor {
     /// Take a fraction separator and its digits, and return the
     /// fraction of a second in microseconds, truncated past six
     /// digits, with zero digits after the separator counting as
-    /// no fraction. The fraction in the Python grammar always
+    /// no fraction where a zone designator follows it, and
+    /// refusing the reading where the separator stands at the
+    /// end of the text, the two cases the Python grammar
+    /// separates. The fraction in the Python grammar always
     /// lands on the seconds, whatever unit it follows.
     fn fraction_micros(&mut self) -> Option<i64> {
         match self.peek() {
@@ -746,17 +749,23 @@ impl Cursor {
                 self.take();
                 let mut micros: i64 = 0;
                 let mut place: i64 = 100_000;
+                let mut digits = 0;
                 while let Some(c) = self.peek() {
                     if !c.is_ascii_digit() {
                         break;
                     }
                     self.take();
+                    digits += 1;
                     if place > 0 {
                         micros += (c as i64 - '0' as i64) * place;
                         place /= 10;
                     }
                 }
-                Some(micros)
+                if digits == 0 && self.at_end() {
+                    None
+                } else {
+                    Some(micros)
+                }
             }
             _ => Some(0),
         }
@@ -829,11 +838,15 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
     }
 }
 
-/// Parse the time and offset after a date and its separator, or
-/// the bare end of the string, and build the instant. The
-/// separator has already been consumed by the caller.
-fn parse_time_and_offset(cursor: &mut Cursor, days: i64) -> Option<Instant> {
-    let hour = cursor.digits(2)?;
+/// Read the minute and second components that may follow an
+/// hour, the second and third components of a time and of an
+/// offset alike. Each component stands in colon form after its
+/// colon or in packed form where a digit stands, and a
+/// component that does not stand reads as zero. The time after
+/// a date and the offset after its sign carry their trailing
+/// components in this one shape, so the shape stands here once
+/// and both readers call it.
+fn minute_second_components(cursor: &mut Cursor) -> Option<(i64, i64)> {
     let mut minute = 0i64;
     let mut second = 0i64;
     if cursor.peek() == Some(':') {
@@ -849,6 +862,15 @@ fn parse_time_and_offset(cursor: &mut Cursor, days: i64) -> Option<Instant> {
             second = cursor.digits(2)?;
         }
     }
+    Some((minute, second))
+}
+
+/// Parse the time and offset after a date and its separator, or
+/// the bare end of the string, and build the instant. The
+/// separator has already been consumed by the caller.
+fn parse_time_and_offset(cursor: &mut Cursor, days: i64) -> Option<Instant> {
+    let hour = cursor.digits(2)?;
+    let (minute, second) = minute_second_components(cursor)?;
     let micros = cursor.fraction_micros()?;
     if hour > 23 || minute > 59 || second > 59 {
         return None;
@@ -870,21 +892,7 @@ fn parse_offset(cursor: &mut Cursor) -> Option<i64> {
         'Z' => Some(0),
         sign @ ('+' | '-') => {
             let hours = cursor.digits(2)?;
-            let mut minutes = 0i64;
-            let mut seconds = 0i64;
-            if cursor.peek() == Some(':') {
-                cursor.take();
-                minutes = cursor.digits(2)?;
-                if cursor.peek() == Some(':') {
-                    cursor.take();
-                    seconds = cursor.digits(2)?;
-                }
-            } else if cursor.peek().is_some_and(|c| c.is_ascii_digit()) {
-                minutes = cursor.digits(2)?;
-                if cursor.peek().is_some_and(|c| c.is_ascii_digit()) {
-                    seconds = cursor.digits(2)?;
-                }
-            }
+            let (minutes, seconds) = minute_second_components(cursor)?;
             let micros = cursor.fraction_micros()?;
             let total_seconds = hours * 3600 + minutes * 60 + seconds;
             let total = (total_seconds as i128) * 1_000_000 + micros as i128;
@@ -1101,7 +1109,12 @@ fn duplicate_key_of(error_text: &str) -> Option<String> {
     let marker = "dibs-duplicate-key\x1f";
     let start = error_text.find(marker)? + marker.len();
     let rest = &error_text[start..];
-    let end = rest.find(" at line ").unwrap_or(rest.len());
+    // The position suffix serde_json appends stands last in the
+    // text, so the cut takes the last occurrence of the separator.
+    // A key that itself carries the separator is recovered whole,
+    // where cutting at the first occurrence named only the part
+    // of the key standing before it.
+    let end = rest.rfind(" at line ").unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
 
@@ -1783,7 +1796,19 @@ fn render_event(event: &Event, level: usize, out: &mut String) {
 /// space indented json rendering renders it, without the
 /// trailing newline the stored file adds.
 fn render_document(document: &Document) -> String {
-    let mut out = String::new();
+    // The output starts near its final size instead of growing
+    // from empty by doublings. The contract's measured growth
+    // constants stand at about 392 bytes per offered item, with
+    // the item's offered event counted inside that figure, and
+    // 201.5 bytes per history event, so the reserve transcribes
+    // the measured law with the event constant rounded up and a
+    // small fixed allowance for the document frame. A reserve is
+    // a capacity hint only. The item constant counting each
+    // item's offered event means the sum over-reserves by about
+    // one event per item, a transient overallocation that costs
+    // no reallocation copies on the growth path.
+    let mut out =
+        String::with_capacity(64 + document.items.len() * 392 + document.history.len() * 202);
     out.push_str("{\n");
     write_indent(&mut out, 1);
     escape_json_string("format", &mut out);
@@ -1877,8 +1902,10 @@ fn token_matches(presented: &str, stored_hash: &str) -> bool {
 
 /// Decode registry bytes to text the way the Python json module
 /// decoded them, detecting a byte order mark and transcoding
-/// UTF-16 and UTF-32, and refusing what does not decode.
-fn decode_document_bytes(bytes: &[u8]) -> std::result::Result<String, String> {
+/// UTF-16 and UTF-32, detecting the same encodings by the NUL
+/// pattern of the opening bytes where no mark stands, and
+/// refusing what does not decode.
+fn decode_document_bytes(bytes: Vec<u8>) -> std::result::Result<String, String> {
     if bytes.starts_with(&[0xff, 0xfe, 0x00, 0x00]) {
         decode_utf32(&bytes[4..], true)
     } else if bytes.starts_with(&[0x00, 0x00, 0xfe, 0xff]) {
@@ -1888,11 +1915,54 @@ fn decode_document_bytes(bytes: &[u8]) -> std::result::Result<String, String> {
     } else if bytes.starts_with(&[0xfe, 0xff]) {
         decode_utf16(&bytes[2..], false)
     } else if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        String::from_utf8(bytes[3..].to_vec())
+        // The buffer is owned, so the mark is drained off the
+        // front instead of copying the rest of the document.
+        let mut bytes = bytes;
+        bytes.drain(..3);
+        String::from_utf8(bytes)
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
+    } else if let Some(decoded) = decode_detected_encoding(&bytes) {
+        decoded
     } else {
-        String::from_utf8(bytes.to_vec())
+        String::from_utf8(bytes)
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
+    }
+}
+
+/// Decode registry bytes that carry no byte order mark under
+/// the encoding the NUL pattern of their first four bytes
+/// names, the rest of the detection the Python json module
+/// performs. A document in UTF-16 or UTF-32 without a mark
+/// still decodes there, because the zero bytes of its opening
+/// units name the encoding and the endianness: 00 00 names
+/// UTF-32 big endian, 00 XX names UTF-16 big endian, XX 00 00
+/// 00 names UTF-32 little endian, and XX 00 with a nonzero
+/// third or fourth byte names UTF-16 little endian. The
+/// decoding is the strict decoding the mark arms call, so a
+/// document the pattern names but the encoding cannot carry
+/// refuses with the same sentences. Bytes whose opening names
+/// no encoding return None and fall through to the UTF-8
+/// reading, and an input shorter than four bytes names
+/// nothing here, as it names nothing under the Python
+/// detection.
+fn decode_detected_encoding(bytes: &[u8]) -> Option<std::result::Result<String, String>> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    if bytes[0] == 0 {
+        if bytes[1] == 0 {
+            Some(decode_utf32(bytes, false))
+        } else {
+            Some(decode_utf16(bytes, false))
+        }
+    } else if bytes[1] == 0 {
+        if bytes[2] == 0 && bytes[3] == 0 {
+            Some(decode_utf32(bytes, true))
+        } else {
+            Some(decode_utf16(bytes, true))
+        }
+    } else {
+        None
     }
 }
 
@@ -2122,7 +2192,7 @@ impl Registry {
                 )))
             }
         };
-        let text = decode_document_bytes(&raw)
+        let text = decode_document_bytes(raw)
             .map_err(|detail| corrupt(format!("the document does not parse, {detail}")))?;
         let value: Value = serde_json::from_str(&text).map_err(|err| {
             let text = err.to_string();
@@ -2235,13 +2305,9 @@ impl Registry {
         Ok(*now < expires)
     }
 
-    fn standing_lease<'a>(
-        document: &'a Document,
-        item_id: &str,
-        now: &Instant,
-    ) -> Result<&'a Item> {
-        let item = match document.items.iter().find(|item| item.id == item_id) {
-            Some(item) => item,
+    fn standing_lease_index(document: &Document, item_id: &str, now: &Instant) -> Result<usize> {
+        let index = match document.items.iter().position(|item| item.id == item_id) {
+            Some(index) => index,
             None => {
                 return Err(Error::NotFound(format!(
                     "item {} does not stand in the backlog",
@@ -2249,6 +2315,7 @@ impl Registry {
                 )))
             }
         };
+        let item = &document.items[index];
         if item.status == "completed" {
             return Err(Error::Refusal(format!(
                 "item {} is completed and accepts no lease",
@@ -2267,7 +2334,7 @@ impl Registry {
                 py_repr(item_id)
             )));
         }
-        Ok(item)
+        Ok(index)
     }
 
     /// Add an item to the backlog and record the offered event.
@@ -2404,18 +2471,14 @@ impl Registry {
         let ttl = validate_ttl_i64(ttl)?;
         validate_now(now)?;
         self.mutate(|document| {
-            let item = Self::standing_lease(document, item_id, now)?;
+            let index = Self::standing_lease_index(document, item_id, now)?;
+            let item = &document.items[index];
             check_possession(item, holder, token, &Value::Int(epoch))?;
             let standing =
                 parse_stored_instant(&Value::Str(item.expires_at.clone().unwrap_or_default()))?;
             let expires = expiry_after(&standing, ttl)?;
             let rendered = format_instant(&expires);
             let standing_epoch = item.epoch;
-            let index = document
-                .items
-                .iter()
-                .position(|item| item.id == item_id)
-                .unwrap();
             document.items[index].expires_at = Some(rendered);
             Self::append_event(
                 document,
@@ -2450,14 +2513,10 @@ impl Registry {
         validate_name_str(holder, "holder")?;
         validate_now(now)?;
         self.mutate(|document| {
-            let item = Self::standing_lease(document, item_id, now)?;
+            let index = Self::standing_lease_index(document, item_id, now)?;
+            let item = &document.items[index];
             check_possession(item, holder, token, &Value::Int(epoch))?;
             let standing_epoch = item.epoch;
-            let index = document
-                .items
-                .iter()
-                .position(|item| item.id == item_id)
-                .unwrap();
             Self::end_lease(&mut document.items[index], "open");
             Self::append_event(
                 document,
@@ -2486,14 +2545,10 @@ impl Registry {
         validate_name_str(holder, "holder")?;
         validate_now(now)?;
         self.mutate(|document| {
-            let item = Self::standing_lease(document, item_id, now)?;
+            let index = Self::standing_lease_index(document, item_id, now)?;
+            let item = &document.items[index];
             check_possession(item, holder, token, &Value::Int(epoch))?;
             let standing_epoch = item.epoch;
-            let index = document
-                .items
-                .iter()
-                .position(|item| item.id == item_id)
-                .unwrap();
             Self::end_lease(&mut document.items[index], "completed");
             Self::append_event(
                 document,
@@ -2578,12 +2633,19 @@ impl Registry {
 /// integer mismatch raises.
 pub fn check_possession(item: &Item, holder: &str, token: &str, epoch: &Value) -> Result<()> {
     if Some(holder) != item.holder.as_deref() {
-        return Err(Error::Refusal(format!(
-            "item {} is held by {}, not by {}",
-            py_repr(&item.id),
-            py_repr(item.holder.as_deref().unwrap_or_default()),
-            py_repr(holder)
-        )));
+        return Err(Error::Refusal(match &item.holder {
+            Some(standing) => format!(
+                "item {} is held by {}, not by {}",
+                py_repr(&item.id),
+                py_repr(standing),
+                py_repr(holder)
+            ),
+            None => format!(
+                "item {} is held by no one, not by {}",
+                py_repr(&item.id),
+                py_repr(holder)
+            ),
+        }));
     }
     let epoch_matches = match epoch {
         Value::Int(number) => *number == item.epoch,
