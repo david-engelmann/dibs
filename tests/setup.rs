@@ -480,3 +480,36 @@ fn codepoint_scan_takes_a_non_unicode_root_without_panicking() {
     assert!(result.stderr.contains("scan error"), "{}", result.stderr);
     assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
 }
+
+#[cfg(unix)]
+#[test]
+fn codepoint_scan_with_an_unwritable_stdout_exits_2_without_a_panic() {
+    // The scanner prints through a checked writer (DB-A24),
+    // so a stream that refuses the write ends the scan at its
+    // error exit 2 with no panic. /dev/full stands in for the
+    // closed pipe of the finding's probe, because a pipe whose
+    // reader closes early cannot be staged deterministically
+    // from inside the suite, and /dev/full refuses the write
+    // the same way. Where /dev/full does not stand the staged
+    // failure cannot be produced and the pin does not run; on
+    // the hosted gate, which is Linux, the device stands. On
+    // the pre-fix binary the same drive dies with a panic
+    // message at exit 101.
+    use std::process::Stdio;
+
+    let dir = temp_dir("scan-full");
+    std::fs::write(dir.join("clean.md"), "clean").unwrap();
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .arg(&dir)
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+}
