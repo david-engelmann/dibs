@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
+mod common;
 
 const MARKER: &str = "<!-- repo annex below this line -->";
 const GATE_COMMAND: &str = "cargo test";
@@ -29,10 +29,7 @@ fn read(name: &str) -> String {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dibs-setup-test-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::temp_dir("dibs-setup-test-", tag)
 }
 
 #[test]
@@ -185,30 +182,89 @@ fn ci_runs_the_local_gate_commands() {
 }
 
 #[test]
+fn ci_runs_the_binding_smoke_test() {
+    let text = read(".github/workflows/ci.yml");
+    // Read the binding job alone, from its job line to the next
+    // job line or the end of the file. The job builds the
+    // binding and runs the smoke suite against it, and the
+    // binding check is a required check, so a workflow that
+    // dropped the smoke command, or disabled the job or one of
+    // its steps with if false, would leave that check green
+    // over a suite that never ran. A command that stands
+    // commented out does not count as standing, and a step
+    // condition is read wherever it stands in its step.
+    let mut section = String::new();
+    let mut in_binding = false;
+    for line in text.lines() {
+        // A job line stands at two spaces of indent and ends
+        // with a colon, allowing a trailing comment after it.
+        let head = line.split(" #").next().unwrap_or("");
+        let job_line =
+            head.starts_with("  ") && !head.starts_with("   ") && head.trim_end().ends_with(':');
+        if job_line {
+            in_binding = head.trim() == "binding:";
+            continue;
+        }
+        if in_binding {
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    assert!(!section.is_empty(), "the workflow carries no binding job");
+    for needle in [
+        "maturin develop --manifest-path bindings/Cargo.toml",
+        "python -m pytest tests/test_binding_smoke.py",
+    ] {
+        let stands = section.lines().any(|line| {
+            let stripped = line.trim();
+            !stripped.starts_with('#') && stripped.contains(needle)
+        });
+        assert!(stands, "the binding job lost {needle}");
+    }
+    let disabled = section.lines().any(|line| {
+        let stripped = line.trim();
+        let stripped = stripped.strip_prefix("- ").unwrap_or(stripped);
+        stripped.strip_prefix("if:").is_some_and(|rest| {
+            rest.trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_lowercase()
+                == "false"
+        })
+    });
+    assert!(!disabled, "the binding job is disabled with if: false");
+}
+
+#[test]
 fn ci_carries_the_fleet_credential_hygiene() {
     let text = read(".github/workflows/ci.yml");
     // The workflow asks for no more than it uses. Its token
     // is limited to reading the repository, the checkout
-    // leaves no credential behind for later steps, and the
-    // toolchain action is pinned to a full commit SHA rather
+    // leaves no credential behind for later steps, and every
+    // toolchain step is pinned to a full commit SHA rather
     // than a moving branch name.
     assert!(text.contains("permissions:"));
     assert!(text.contains("contents: read"));
     assert!(text.contains("persist-credentials: false"));
     assert!(!text.contains("rust-toolchain@master"));
-    let toolchain_line = text
+    let toolchain_lines: Vec<&str> = text
         .lines()
-        .find(|line| line.contains("dtolnay/rust-toolchain@"))
-        .expect("the workflow carries no toolchain step");
-    let pin = toolchain_line
-        .split("dtolnay/rust-toolchain@")
-        .nth(1)
-        .unwrap()
-        .trim();
-    assert_eq!(pin.len(), 40, "{}", toolchain_line);
-    assert!(pin
-        .bytes()
-        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        .filter(|line| line.contains("dtolnay/rust-toolchain@"))
+        .collect();
+    assert!(
+        !toolchain_lines.is_empty(),
+        "the workflow carries no toolchain step"
+    );
+    for toolchain_line in toolchain_lines {
+        let pin = toolchain_line
+            .split("dtolnay/rust-toolchain@")
+            .nth(1)
+            .unwrap()
+            .trim();
+        assert_eq!(pin.len(), 40, "{}", toolchain_line);
+        assert!(pin
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
 }
 
 #[test]
@@ -289,13 +345,7 @@ fn agents_canonical_part_matches_pinned_digest() {
         .windows(marker.len())
         .position(|window| window == marker)
         .unwrap();
-    let mut hasher = Sha256::new();
-    hasher.update(&agents[..position]);
-    let digest: String = hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let digest = common::sha256_hex(&agents[..position]);
     assert_eq!(digest, CANONICAL_ABOVE_MARKER_SHA256);
 }
 
@@ -402,4 +452,31 @@ fn codepoint_scan_skips_a_file_with_an_uppercase_binary_suffix() {
     assert_eq!(result.status, 0);
     assert!(result.stdout.contains("em dash U+2014 count 0"));
     assert!(result.stdout.contains("en dash U+2013 count 0"));
+}
+
+#[cfg(unix)]
+#[test]
+fn codepoint_scan_takes_a_non_unicode_root_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+
+    // The scanner read its root through std::env::args as
+    // first built, which panics on an argument that is not
+    // valid Unicode, where the root is a path and stands
+    // carried unconverted, the shape the command line's
+    // registry path takes. A root naming a real directory
+    // scans clean, a root that does not stand refuses with
+    // the scan error line, and neither case panics.
+    let dir = temp_dir("non-unicode-root");
+    let odd_dir = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
+    std::fs::create_dir_all(&odd_dir).unwrap();
+    std::fs::write(odd_dir.join("clean.md"), "clean").unwrap();
+    let result = scan_tree(&odd_dir);
+    assert_eq!(result.status, 0, "{}", result.stderr);
+    assert!(result.stdout.contains("em dash U+2014 count 0"));
+    assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
+    let missing = dir.join(std::ffi::OsString::from_vec(vec![0xfe]));
+    let result = scan_tree(&missing);
+    assert_eq!(result.status, 2, "{}", result.stderr);
+    assert!(result.stderr.contains("scan error"), "{}", result.stderr);
+    assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
 }
