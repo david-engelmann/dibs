@@ -193,7 +193,8 @@ pub fn py_repr(text: &str) -> String {
 /// the ranges that can reach an error message. Letters, digits,
 /// marks, punctuation, symbols, and the plain space are printable.
 /// Control and format and separator characters other than the
-/// plain space are not.
+/// plain space are not, and neither are the private use ranges,
+/// which Python counts as not printable in every Unicode version.
 fn py_printable(c: char) -> bool {
     let n = c as u32;
     if n < 0x20 || n == 0x7f {
@@ -208,6 +209,7 @@ fn py_printable(c: char) -> bool {
         | 0x205f | 0x2060..=0x206f | 0x3000 | 0xfeff | 0xfff9..=0xfffb
         | 0x0600..=0x0605 | 0x061c | 0x06dd | 0x0890..=0x0891 | 0x08e2
         | 0x180f | 0x1944..=0x1945 | 0x1b4d | 0x1b7d
+        | 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd
     )
 }
 
@@ -784,6 +786,23 @@ fn week_date_days(year: i64, week: i64, weekday: i64) -> Option<i64> {
     Some(week_one_monday + (week - 1) * 7 + (weekday - 1))
 }
 
+/// The day count a calendar date names, or None when the
+/// year stands outside 1 to 9999, the month outside 1 to
+/// 12, or the day outside the leap aware length of the
+/// month. Both date families in parse_date close on this
+/// one rule, so a grammar repair cannot correct one
+/// spelling family and leave the other.
+fn calendar_days(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
 fn parse_date(cursor: &mut Cursor) -> Option<i64> {
     // Extended form, YYYY-MM-DD and the week forms, or the basic
     // forms YYYYMMDD and YYYYWWW and YYYYWWWD. The year is
@@ -805,14 +824,7 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
         let month = cursor.digits(2)?;
         cursor.expect('-')?;
         let day = cursor.digits(2)?;
-        if !(1..=9999).contains(&year)
-            || !(1..=12).contains(&month)
-            || day < 1
-            || day > days_in_month(year, month)
-        {
-            return None;
-        }
-        Some(days_from_civil(year, month, day))
+        calendar_days(year, month, day)
     } else {
         let year = cursor.digits(4)?;
         if cursor.peek() == Some('W') {
@@ -827,14 +839,7 @@ fn parse_date(cursor: &mut Cursor) -> Option<i64> {
         }
         let month = cursor.digits(2)?;
         let day = cursor.digits(2)?;
-        if !(1..=9999).contains(&year)
-            || !(1..=12).contains(&month)
-            || day < 1
-            || day > days_in_month(year, month)
-        {
-            return None;
-        }
-        Some(days_from_civil(year, month, day))
+        calendar_days(year, month, day)
     }
 }
 
@@ -1118,6 +1123,19 @@ fn duplicate_key_of(error_text: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// The recovered duplicate key as the corruption message names it.
+/// A key carrying a character that does not print renders through
+/// py_repr, the escaped rendering the rest of the reader uses, so
+/// the refusal stays one line and names the character visibly. A
+/// key that prints whole stands raw, as the standing pins assert.
+fn duplicate_key_display(key: &str) -> String {
+    if key.chars().all(py_printable) {
+        key.to_string()
+    } else {
+        py_repr(key)
+    }
+}
+
 /// One item of the backlog, in the shape the registry stores it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
@@ -1202,6 +1220,22 @@ fn validate_stored_name(value: &Value, field: &str, subject: &str) -> Result<()>
     }
 }
 
+/// The text of a stored string field a check immediately
+/// before has proven to be a string, validate_stored_name
+/// for the name fields and parse_stored_instant for the
+/// instant fields. The proof obligation stands on the
+/// callers, and the unreachable arm of the extraction
+/// stands here once instead of at every field, so a check
+/// weakened later cannot turn one field's extraction into
+/// a panic on a stored document the reader is refusing as
+/// corrupt.
+fn stored_string(value: &Value) -> String {
+    match value {
+        Value::Str(text) => text.clone(),
+        _ => unreachable!(),
+    }
+}
+
 fn validate_item(value: &Value) -> Result<Item> {
     let pairs = match value {
         Value::Object(pairs) if keys_exact(pairs, &ITEM_KEYS) => pairs,
@@ -1213,10 +1247,7 @@ fn validate_item(value: &Value) -> Result<Item> {
     };
     let id_value = object_get(pairs, "id").unwrap();
     validate_stored_name(id_value, "item id", "an item")?;
-    let id = match id_value {
-        Value::Str(text) => text.clone(),
-        _ => unreachable!(),
-    };
+    let id = stored_string(id_value);
     let note = match object_get(pairs, "note").unwrap() {
         Value::Str(text) if text.chars().count() <= NOTE_MAX => text.clone(),
         _ => {
@@ -1240,10 +1271,7 @@ fn validate_item(value: &Value) -> Result<Item> {
         Value::Null => None,
         other => {
             validate_stored_name(other, "holder id", "an item")?;
-            match other {
-                Value::Str(text) => Some(text.clone()),
-                _ => unreachable!(),
-            }
+            Some(stored_string(other))
         }
     };
     let token_hash = match object_get(pairs, "token_hash").unwrap() {
@@ -1270,10 +1298,7 @@ fn validate_item(value: &Value) -> Result<Item> {
         Value::Null => None,
         other => {
             parse_stored_instant(other)?;
-            match other {
-                Value::Str(text) => Some(text.clone()),
-                _ => unreachable!(),
-            }
+            Some(stored_string(other))
         }
     };
     let lease_fields = (holder.is_some(), token_hash.is_some(), expires_at.is_some());
@@ -1343,10 +1368,7 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
     };
     let item_value = object_get(pairs, "item").unwrap();
     validate_stored_name(item_value, "item id", "a history event")?;
-    let item = match item_value {
-        Value::Str(text) => text.clone(),
-        _ => unreachable!(),
-    };
+    let item = stored_string(item_value);
     let holder_value = object_get(pairs, "holder").unwrap();
     let holder = if kind == "offered" {
         if holder_value != &Value::Null {
@@ -1358,10 +1380,7 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
             return Err(corrupt(format!("a {kind} event names no holder")));
         }
         validate_stored_name(holder_value, "holder id", "a history event")?;
-        match holder_value {
-            Value::Str(text) => Some(text.clone()),
-            _ => unreachable!(),
-        }
+        Some(stored_string(holder_value))
     };
     let previous_value = object_get(pairs, "previous_holder").unwrap();
     let previous_holder = if kind == "taken_over" {
@@ -1371,10 +1390,7 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
             ));
         }
         validate_stored_name(previous_value, "holder id", "a history event")?;
-        match previous_value {
-            Value::Str(text) => Some(text.clone()),
-            _ => unreachable!(),
-        }
+        Some(stored_string(previous_value))
     } else {
         if previous_value != &Value::Null {
             return Err(corrupt(
@@ -1385,10 +1401,7 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
     };
     let at_raw = object_get(pairs, "at").unwrap();
     parse_stored_instant(at_raw)?;
-    let at = match at_raw {
-        Value::Str(text) => text.clone(),
-        _ => unreachable!(),
-    };
+    let at = stored_string(at_raw);
     let epoch = match object_get(pairs, "epoch").unwrap() {
         Value::Int(number) if *number >= 0 => *number,
         _ => {
@@ -1739,8 +1752,31 @@ fn render_opt_string(value: &Option<String>, out: &mut String) {
 /// that writes its value.
 type FieldRenderer<'a> = (&'a str, &'a dyn Fn(&mut String));
 
-fn render_item(item: &Item, level: usize, out: &mut String) {
+/// Render one object from its field table, the opening
+/// brace, one line per field at the next indent with the
+/// key escaped and a comma after every field but the last,
+/// and the closing brace at the level. render_item and
+/// render_event share this one rendering, so the
+/// mechanics stand in one place and a repair cannot land
+/// in one shape and miss the other.
+fn render_fields(fields: &[FieldRenderer], level: usize, out: &mut String) {
     out.push_str("{\n");
+    let count = fields.len();
+    for (index, (key, render)) in fields.iter().enumerate() {
+        write_indent(out, level + 1);
+        escape_json_string(key, out);
+        out.push_str(": ");
+        render(out);
+        if index + 1 < count {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    write_indent(out, level);
+    out.push('}');
+}
+
+fn render_item(item: &Item, level: usize, out: &mut String) {
     let fields: [FieldRenderer; 7] = [
         ("id", &|out| escape_json_string(&item.id, out)),
         ("note", &|out| escape_json_string(&item.note, out)),
@@ -1754,23 +1790,10 @@ fn render_item(item: &Item, level: usize, out: &mut String) {
             render_opt_string(&item.expires_at, out)
         }),
     ];
-    let count = fields.len();
-    for (index, (key, render)) in fields.iter().enumerate() {
-        write_indent(out, level + 1);
-        escape_json_string(key, out);
-        out.push_str(": ");
-        render(out);
-        if index + 1 < count {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    write_indent(out, level);
-    out.push('}');
+    render_fields(&fields, level, out);
 }
 
 fn render_event(event: &Event, level: usize, out: &mut String) {
-    out.push_str("{\n");
     let fields: [FieldRenderer; 7] = [
         ("seq", &|out| out.push_str(&event.seq.to_string())),
         ("kind", &|out| escape_json_string(&event.kind, out)),
@@ -1782,26 +1805,26 @@ fn render_event(event: &Event, level: usize, out: &mut String) {
             render_opt_string(&event.previous_holder, out)
         }),
     ];
-    let count = fields.len();
-    for (index, (key, render)) in fields.iter().enumerate() {
-        write_indent(out, level + 1);
-        escape_json_string(key, out);
-        out.push_str(": ");
-        render(out);
-        if index + 1 < count {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    write_indent(out, level);
-    out.push('}');
+    render_fields(&fields, level, out);
 }
 
 /// Render a document exactly as the Python implementation's two
 /// space indented json rendering renders it, without the
 /// trailing newline the stored file adds.
 fn render_document(document: &Document) -> String {
-    let mut out = String::new();
+    // The output starts near its final size instead of growing
+    // from empty by doublings. The contract's measured growth
+    // constants stand at about 392 bytes per offered item, with
+    // the item's offered event counted inside that figure, and
+    // 201.5 bytes per history event, so the reserve transcribes
+    // the measured law with the event constant rounded up and a
+    // small fixed allowance for the document frame. A reserve is
+    // a capacity hint only. The item constant counting each
+    // item's offered event means the sum over-reserves by about
+    // one event per item, a transient overallocation that costs
+    // no reallocation copies on the growth path.
+    let mut out =
+        String::with_capacity(64 + document.items.len() * 392 + document.history.len() * 202);
     out.push_str("{\n");
     write_indent(&mut out, 1);
     escape_json_string("format", &mut out);
@@ -1898,7 +1921,7 @@ fn token_matches(presented: &str, stored_hash: &str) -> bool {
 /// UTF-16 and UTF-32, detecting the same encodings by the NUL
 /// pattern of the opening bytes where no mark stands, and
 /// refusing what does not decode.
-fn decode_document_bytes(bytes: &[u8]) -> std::result::Result<String, String> {
+fn decode_document_bytes(bytes: Vec<u8>) -> std::result::Result<String, String> {
     if bytes.starts_with(&[0xff, 0xfe, 0x00, 0x00]) {
         decode_utf32(&bytes[4..], true)
     } else if bytes.starts_with(&[0x00, 0x00, 0xfe, 0xff]) {
@@ -1908,12 +1931,16 @@ fn decode_document_bytes(bytes: &[u8]) -> std::result::Result<String, String> {
     } else if bytes.starts_with(&[0xfe, 0xff]) {
         decode_utf16(&bytes[2..], false)
     } else if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-        String::from_utf8(bytes[3..].to_vec())
+        // The buffer is owned, so the mark is drained off the
+        // front instead of copying the rest of the document.
+        let mut bytes = bytes;
+        bytes.drain(..3);
+        String::from_utf8(bytes)
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
-    } else if let Some(decoded) = decode_detected_encoding(bytes) {
+    } else if let Some(decoded) = decode_detected_encoding(&bytes) {
         decoded
     } else {
-        String::from_utf8(bytes.to_vec())
+        String::from_utf8(bytes)
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
     }
 }
@@ -2181,17 +2208,35 @@ impl Registry {
                 )))
             }
         };
-        let text = decode_document_bytes(&raw)
+        let text = decode_document_bytes(raw)
             .map_err(|detail| corrupt(format!("the document does not parse, {detail}")))?;
         let value: Value = serde_json::from_str(&text).map_err(|err| {
             let text = err.to_string();
             if let Some(key) = duplicate_key_of(&text) {
-                corrupt(format!("a key stands twice in the document, {key}"))
+                corrupt(format!(
+                    "a key stands twice in the document, {}",
+                    duplicate_key_display(&key)
+                ))
             } else {
                 corrupt(format!("the document does not parse, {text}"))
             }
         })?;
         validate_document(&value)
+    }
+
+    /// The directory the registry file stands in, with a
+    /// path carrying no directory part naming the current
+    /// directory. The mutation path creates it and the publish
+    /// path syncs it, and both take it from here so the rule
+    /// stands stated once.
+    fn parent_dir(&self) -> Option<PathBuf> {
+        self.path.parent().map(|parent| {
+            if parent.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            }
+        })
     }
 
     fn publish(&self, document: &Document) -> Result<()> {
@@ -2217,13 +2262,8 @@ impl Registry {
                 "the registry could not be published, {err}"
             )));
         }
-        if let Some(parent) = self.path.parent() {
-            let dir = if parent.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent
-            };
-            if let Ok(handle) = File::open(dir) {
+        if let Some(dir) = self.parent_dir() {
+            if let Ok(handle) = File::open(&dir) {
                 let _ = handle.sync_all();
             }
         }
@@ -2231,14 +2271,7 @@ impl Registry {
     }
 
     fn mutate<T>(&self, action: impl FnOnce(&mut Document) -> Result<T>) -> Result<T> {
-        let parent = self.path.parent().map(|parent| {
-            if parent.as_os_str().is_empty() {
-                PathBuf::from(".")
-            } else {
-                parent.to_path_buf()
-            }
-        });
-        if let Some(parent) = parent {
+        if let Some(parent) = self.parent_dir() {
             std::fs::create_dir_all(&parent).map_err(|err| {
                 Error::Failure(format!("the registry directory cannot be created, {err}"))
             })?;
@@ -2255,8 +2288,24 @@ impl Registry {
     }
 
     fn read<T>(&self, action: impl FnOnce(&Document) -> Result<T>) -> Result<T> {
-        if !self.path.exists() {
-            return action(&empty_document());
+        // A missing registry reads as the empty document and
+        // the read creates nothing, so absence is established
+        // from the metadata before any lock is taken (DB-12).
+        // A metadata failure of any other kind is not absence.
+        // The registry may stand and be unreadable, and reading
+        // it as empty would report a backlog that is not there
+        // (DB-A7), so it refuses with the failure the document
+        // read itself raises for an unreadable registry.
+        match std::fs::metadata(&self.path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return action(&empty_document());
+            }
+            Err(err) => {
+                return Err(Error::Failure(format!(
+                    "the registry file cannot be read, {err}"
+                )));
+            }
         }
         let _guard = self.locked(false)?;
         let document = self.read_document()?;
@@ -2520,8 +2569,8 @@ impl Registry {
         })
     }
 
-    /// Mark the item done under its standing lease. Terminal in
-    /// slice 1.
+    /// Mark the item done under its standing lease. Completion is
+    /// terminal, and the item accepts no claim afterwards.
     pub fn complete(
         &self,
         item_id: &str,
@@ -2662,6 +2711,24 @@ pub fn check_possession(item: &Item, holder: &str, token: &str, epoch: &Value) -
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn parent_dir_names_the_current_directory_for_a_bare_name() {
+        let registry = Registry::new(PathBuf::from("registry.json"));
+        assert_eq!(registry.parent_dir(), Some(PathBuf::from(".")));
+    }
+
+    #[test]
+    fn parent_dir_returns_a_nested_parent_unchanged() {
+        let registry = Registry::new(PathBuf::from("a/b/registry.json"));
+        assert_eq!(registry.parent_dir(), Some(PathBuf::from("a/b")));
+    }
+
+    #[test]
+    fn parent_dir_returns_the_root_for_a_root_level_file() {
+        let registry = Registry::new(PathBuf::from("/registry.json"));
+        assert_eq!(registry.parent_dir(), Some(PathBuf::from("/")));
+    }
 
     /// The publish temporary name carries the process id and a
     /// drawn suffix, so no outside test can know the name a

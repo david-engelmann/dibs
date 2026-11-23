@@ -15,21 +15,12 @@
 use std::path::PathBuf;
 
 use dibs::{Error, Instant, Registry};
-use sha2::{Digest, Sha256};
 
-fn t0() -> Instant {
-    Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(0)).unwrap()
-}
-
-fn at(seconds: i64) -> Instant {
-    t0().plus_seconds(seconds)
-}
+mod common;
+use common::{at, expect_error, sha256_hex, t0};
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dibs-fixture-test-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::temp_dir("dibs-fixture-test-", tag)
 }
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -48,20 +39,6 @@ fn staged_fixture(tag: &str, name: &str) -> (PathBuf, Registry) {
     std::fs::copy(fixture_path(name), &path).unwrap();
     let registry = Registry::new(path);
     (dir, registry)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn expect_error<T>(result: dibs::Result<T>) -> Error {
-    match result {
-        Ok(_) => panic!("the operation succeeded where a refusal was expected"),
-        Err(error) => error,
-    }
 }
 
 /// Stage one hand written document in a scratch directory and
@@ -338,10 +315,17 @@ fn fixture_hashes_match_the_manifest_inventory() {
             "90acad5aaee8df5aa46b554a2f874b645eed9a46703af39c2b02848d3f470c6f",
         ),
     ];
+    let manifest = std::fs::read_to_string(fixture_path("MANIFEST.md")).unwrap();
     for (name, bytes, hash) in inventory {
         let raw = std::fs::read(fixture_path(name)).unwrap();
         assert_eq!(raw.len(), bytes, "{name}");
         assert_eq!(sha256_hex(&raw), hash, "{name}");
+        assert!(
+            manifest.contains(&format!(
+                "`{name}` stands at {bytes} bytes with SHA-256 `{hash}`"
+            )),
+            "MANIFEST.md does not record {name} at {bytes} bytes with SHA-256 {hash}"
+        );
     }
 }
 
@@ -884,30 +868,8 @@ fn stored_week_dates_stop_at_the_weeks_in_their_year() {
 /// A generated registry of the given number of offered items,
 /// written out as text the way the scale cases stage it.
 fn generated_document(count: usize) -> String {
-    let mut out = String::from("{\"format\": \"dibs-registry/1\", \"items\": [");
-    for index in 0..count {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"id\": \"item-{index:06}\", \"note\": \"\", \"status\": \"open\", \
-             \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}"
-        ));
-    }
-    out.push_str("], \"history\": [");
-    for index in 0..count {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"seq\": {}, \"kind\": \"offered\", \"item\": \"item-{index:06}\", \
-             \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
-             \"previous_holder\": null}}",
-            index + 1
-        ));
-    }
-    out.push_str("]}");
-    out
+    let ids: Vec<String> = (0..count).map(|index| format!("item-{index:06}")).collect();
+    common::offered_document(&ids)
 }
 
 #[test]
@@ -1130,4 +1092,73 @@ fn stored_instants_with_a_trailing_fraction_separator_refuse() {
     );
     let expired = registry.board(&at(60)).unwrap();
     assert_eq!(expired[0].status, "open");
+}
+#[test]
+fn stored_offset_fraction_names_the_fraction_of_a_second() {
+    // The port amendment records one divergence in the stored
+    // instant family: a fraction on an offset whose whole part
+    // is zero is dropped by the Python parser and kept by this
+    // reader as the fraction of a second it names. The expiry
+    // below reads 12:01 at an offset of half a second, which
+    // is 12:00:59.5 in UTC, and the lease is live strictly
+    // before that instant and expired at it.
+    let spelling = "2031-05-04T12:01:00+00:00:00.5";
+    let text = claimed_document(spelling);
+    let (_, registry) = staged_document("offset-fraction", &text);
+    let live = registry
+        .board(&Instant::from_civil(2031, 5, 4, 12, 0, 59, 499_999, Some(0)).unwrap())
+        .unwrap();
+    assert_eq!(live[0].status, "claimed");
+    assert_eq!(live[0].expires_at.as_deref(), Some(spelling));
+    let expired = registry
+        .board(&Instant::from_civil(2031, 5, 4, 12, 0, 59, 500_000, Some(0)).unwrap())
+        .unwrap();
+    assert_eq!(expired[0].status, "open");
+}
+
+#[test]
+fn stored_time_fractions_read_at_their_microsecond_boundary() {
+    // The stored instant grammar takes a fraction written
+    // with a dot or a comma at any seat of the time, and the
+    // fraction always lands on the seconds, truncated past
+    // six digits, as the port amendment in CONTRACT.md
+    // states. Every other fraction the suites stage names no
+    // value: the wider family pin's comma fraction carries
+    // zeros, the pin above stages empty fractions, and the
+    // one fraction whose value a pin judges stands on the
+    // offset, in the pin queued with DB-A47. The cases below
+    // stage the time fraction at its value, each expected
+    // boundary probed against Python 3.12.3: a half on the
+    // seconds under both separators, a half on the minute and
+    // on the hour, each landing on the seconds, a seven digit
+    // fraction truncated at the sixth digit, and a fraction
+    // of one microsecond at the last place. A reader that
+    // dropped the digits reads every expiry early by its
+    // fraction and fails the live side; one that read the
+    // hour fraction as a fraction of the hour stands thirty
+    // minutes late at that case; one that rounded the seventh
+    // digit stands one microsecond late at the truncation
+    // case; and one that scaled the last place at a coarser
+    // unit fails the microsecond case, while every whole
+    // second pin around this one still passes.
+    let cases: [(&str, i64, i64, i64, i64); 6] = [
+        ("2031-05-04T12:01:00.5+00:00", 12, 1, 0, 500_000),
+        ("2031-05-04T12:01:00,5+00:00", 12, 1, 0, 500_000),
+        ("2031-05-04T12:01.5+00:00", 12, 1, 0, 500_000),
+        ("2031-05-04T12.5+00:00", 12, 0, 0, 500_000),
+        ("2031-05-04T12:01:00.1234569+00:00", 12, 1, 0, 123_456),
+        ("2031-05-04T12:01:00.000001+00:00", 12, 1, 0, 1),
+    ];
+    for (index, (spelling, hour, minute, second, micros)) in cases.iter().enumerate() {
+        let text = claimed_document(spelling);
+        let (_, registry) = staged_document(&format!("time-fraction-{index}"), &text);
+        let boundary =
+            Instant::from_civil(2031, 5, 4, *hour, *minute, *second, *micros, Some(0)).unwrap();
+        let just_before = Instant::from_epoch_micros(boundary.epoch_micros().unwrap() - 1).unwrap();
+        let live = registry.board(&just_before).unwrap();
+        assert_eq!(live[0].status, "claimed", "{spelling}");
+        assert_eq!(live[0].expires_at.as_deref(), Some(*spelling));
+        let expired = registry.board(&boundary).unwrap();
+        assert_eq!(expired[0].status, "open", "{spelling}");
+    }
 }

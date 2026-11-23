@@ -108,7 +108,10 @@ fn scan(root: &Path) -> Result<(usize, usize), ScanError> {
         let file_em = text.matches(EM_DASH).count();
         let file_en = text.matches(EN_DASH).count();
         if file_em > 0 || file_en > 0 {
-            println!("{}: em dash {file_em}, en dash {file_en}", path.display());
+            out_line(format_args!(
+                "{}: em dash {file_em}, en dash {file_en}",
+                path.display()
+            ));
         }
         em_count += file_em;
         en_count += file_en;
@@ -116,15 +119,45 @@ fn scan(root: &Path) -> Result<(usize, usize), ScanError> {
     Ok((em_count, en_count))
 }
 
+/// Write one line of scan output through a locked stdout
+/// handle, and end the process at the scan error exit when
+/// the write fails (DB-A24).
+///
+/// The printing macros panic on a failed write, so a scan
+/// piped into a reader that closes early died with a panic
+/// message at exit 101. A failed write is a failure of the
+/// scan, reported by its error exit code alone, the same
+/// checked writer shape the command line takes for DB-A8
+/// with the exit this binary reserves for its errors.
+fn out_line(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    if writeln!(lock, "{args}").is_err() {
+        std::process::exit(2);
+    }
+}
+
+/// Write the scan error line through a locked stderr
+/// handle, with the same failure shape as out_line.
+fn err_line(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let stderr = std::io::stderr();
+    let mut lock = stderr.lock();
+    if writeln!(lock, "{args}").is_err() {
+        std::process::exit(2);
+    }
+}
+
 fn main() -> ExitCode {
-    let root = std::env::args()
+    let root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     match scan(&root) {
         Ok((em_count, en_count)) => {
-            println!("em dash U+2014 count {em_count}");
-            println!("en dash U+2013 count {en_count}");
+            out_line(format_args!("em dash U+2014 count {em_count}"));
+            out_line(format_args!("en dash U+2013 count {en_count}"));
             if em_count > 0 || en_count > 0 {
                 ExitCode::from(1)
             } else {
@@ -132,7 +165,7 @@ fn main() -> ExitCode {
             }
         }
         Err(ScanError(message)) => {
-            eprintln!("scan error, {message}");
+            err_line(format_args!("scan error, {message}"));
             ExitCode::from(2)
         }
     }

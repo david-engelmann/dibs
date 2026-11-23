@@ -2,9 +2,12 @@
 //! pin for pin from the Round 1 Python suite.
 //!
 //! Deterministic time comes only from injected instants. No test
-//! sleeps to make a lease expire, and the only wall clock use is
-//! the command line smoke path where no expiry boundary is
-//! crossed. Fixtures are synthetic and written for this repo.
+//! sleeps to make a lease expire. The wall clock is read only by
+//! the command line smoke path, where no expiry boundary is
+//! crossed, and by the lock identity pin, which polls for the
+//! worker's lock file and widens its window with a short sleep,
+//! a wait on a file that judges no lease. Fixtures are synthetic
+//! and written for this repo.
 //!
 //! Two reshapings from the port amendment land here. A value the
 //! Python suite handed to an operation as the wrong type, an
@@ -24,30 +27,15 @@ use dibs::{
     Value,
 };
 
-fn t0() -> Instant {
-    Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(0)).unwrap()
-}
-
-fn at(seconds: i64) -> Instant {
-    t0().plus_seconds(seconds)
-}
+mod common;
+use common::{at, expect_error, t0};
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dibs-test-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::temp_dir("dibs-test-", tag)
 }
 
 fn make_registry(dir: &Path) -> Registry {
     Registry::new(dir.join("registry.json"))
-}
-
-fn expect_error<T>(result: dibs::Result<T>) -> Error {
-    match result {
-        Ok(_) => panic!("the operation succeeded where a refusal was expected"),
-        Err(error) => error,
-    }
 }
 
 fn assert_invalid_name<T>(result: dibs::Result<T>) {
@@ -651,6 +639,40 @@ fn invalid_holder_name_none() {
     assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
 }
 
+#[test]
+fn invalid_name_message_escapes_private_use_characters() {
+    // Python counts the private use ranges as not printable in
+    // every Unicode version, so its repr renders them as hex
+    // escapes, and the refusal message does the same. On the code
+    // before the fix the raw character stood in the message and
+    // no escape appeared.
+    let bmp = expect_error(validate_name(
+        &Value::Str("agent-\u{e000}".to_string()),
+        "holder",
+    ));
+    assert!(matches!(bmp, Error::InvalidName(_)), "{bmp:?}");
+    assert!(bmp.message().contains("\\ue000"), "{}", bmp.message());
+    assert!(!bmp.message().contains('\u{e000}'), "{}", bmp.message());
+    let supplementary = expect_error(validate_name(
+        &Value::Str("agent-\u{f0000}".to_string()),
+        "holder",
+    ));
+    assert!(
+        matches!(supplementary, Error::InvalidName(_)),
+        "{supplementary:?}"
+    );
+    assert!(
+        supplementary.message().contains("\\U000f0000"),
+        "{}",
+        supplementary.message()
+    );
+    assert!(
+        !supplementary.message().contains('\u{f0000}'),
+        "{}",
+        supplementary.message()
+    );
+}
+
 macro_rules! good_name {
     ($name:ident, $value:expr) => {
         #[test]
@@ -701,18 +723,13 @@ macro_rules! bad_ttl_value {
     ($name:ident, $value:expr) => {
         #[test]
         fn $name() {
-            let dir = temp_dir(stringify!($name));
-            let registry = make_registry(&dir);
-            registry
-                .offer("task-one", "a synthetic task", &t0())
-                .unwrap();
             // A time to live of this shape reaches the validator
             // the claim and the renew both call first, and it
             // refuses there with the typed error, before any
-            // state is read.
-            assert_invalid_ttl(validate_ttl(&$value));
-            let granted = registry.claim("task-one", "agent-a", 60, &t0()).unwrap();
-            let _ = granted;
+            // state is read. The validator is a pure function
+            // of the value, so the assertion stands alone:
+            // staging a registry or claiming first could not
+            // change its outcome.
             assert_invalid_ttl(validate_ttl(&$value));
         }
     };
@@ -1843,30 +1860,7 @@ fn staged_lock_document(fillers: usize) -> String {
     for index in 0..fillers {
         ids.push(format!("item-{index:06}"));
     }
-    let mut out = String::from("{\"format\": \"dibs-registry/1\", \"items\": [");
-    for (index, id) in ids.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"id\": \"{id}\", \"note\": \"\", \"status\": \"open\", \
-             \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}"
-        ));
-    }
-    out.push_str("], \"history\": [");
-    for (index, id) in ids.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"seq\": {}, \"kind\": \"offered\", \"item\": \"{id}\", \
-             \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
-             \"previous_holder\": null}}",
-            index + 1
-        ));
-    }
-    out.push_str("]}");
-    out
+    common::offered_document(&ids)
 }
 
 #[test]
@@ -2426,6 +2420,81 @@ fn cli_integer_arguments_refuse_digit_strings_past_the_conversion_limit() {
     );
 }
 
+#[test]
+fn cli_integer_arguments_cover_every_digit_family() {
+    // The integer grammar takes a decimal digit from any of the
+    // families of the converter's table, and the pins above
+    // exercise three of them. This pin exercises all of them,
+    // one renew per family, with the epoch and the time to live
+    // written in the family's own digits. The epoch must match
+    // the standing epoch exactly, so a family the table holds
+    // at the wrong offset refuses the renew and fails here, and
+    // a family the table misses fails here as a parser error.
+    // The bases stand as a second copy of the table, each the
+    // codepoint of its family's digit zero.
+    const FAMILY_BASES: [u32; 68] = [
+        0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66,
+        0x0ce6, 0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946,
+        0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0,
+        0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0,
+        0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50,
+        0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6,
+        0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0,
+    ];
+    let dir = temp_dir("cli-digit-families");
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    run_cli(&["--registry", path, "offer", "task-one"], 0);
+    let claimed = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "600",
+        ],
+        0,
+    );
+    let token = claimed
+        .stdout
+        .lines()
+        .next()
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1
+        .to_string();
+    for base in FAMILY_BASES {
+        let digit = |value: u32| char::from_u32(base + value).unwrap().to_string();
+        let epoch = digit(1);
+        let ttl = format!("{}{}", digit(3), digit(0));
+        let renewed = run_cli(
+            &[
+                "--registry",
+                path,
+                "renew",
+                "task-one",
+                "--holder",
+                "agent-a",
+                &format!("--token={token}"),
+                "--epoch",
+                &epoch,
+                "--ttl",
+                &ttl,
+            ],
+            0,
+        );
+        assert!(
+            renewed.stdout.starts_with("expires_at "),
+            "the digit family at {base:#06x} did not carry the renew: {}",
+            renewed.stderr
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_non_unicode_arguments_are_parser_errors_not_panics() {
@@ -2589,6 +2658,36 @@ fn cli_completed_item_leaves_the_board_but_keeps_its_history() {
     assert!(history
         .stdout
         .contains("3 completed item=task-one holder=agent-a"));
+}
+
+#[test]
+fn cli_history_names_the_previous_holder_on_a_takeover() {
+    // The history line carries the previous holder on a
+    // taken_over event alone, and the library pins assert the
+    // event's field rather than this surface's rendering of
+    // it. The takeover is staged through the library at
+    // injected instants, because history evaluates no lease
+    // state and the command line read of it crosses no wall
+    // clock boundary.
+    let dir = temp_dir("cli-takeover-line");
+    let registry = make_registry(&dir);
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    registry.claim("task-one", "agent-a", 60, &at(0)).unwrap();
+    registry.claim("task-one", "agent-b", 60, &at(61)).unwrap();
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    let history = run_cli(&["--registry", path, "history"], 0);
+    let lines: Vec<&str> = history.stdout.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines[2],
+        "3 taken_over item=task-one holder=agent-b \
+         at=2031-05-04T12:01:01+00:00 epoch=2 previous_holder=agent-a"
+    );
+    assert!(!lines[0].contains("previous_holder"), "{}", lines[0]);
+    assert!(!lines[1].contains("previous_holder"), "{}", lines[1]);
 }
 
 #[test]
@@ -2831,4 +2930,366 @@ fn registry_documents_without_a_byte_order_mark_read_in_each_encoding() {
     let registry = Registry::new(path.clone());
     assert_corrupt(registry.board(&at(1)));
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+#[test]
+fn damage_duplicate_key_with_a_newline_names_it_escaped() {
+    // A duplicated key carrying a newline names the key in its
+    // escaped rendering, so the refusal stays one line. The
+    // standing code printed the recovered key raw, and the
+    // message carried the newline itself.
+    let dir = temp_dir("damage-duplicate-newline");
+    let path = dir.join("registry.json");
+    let text = "{\"format\": \"dibs-registry/1\", \"items\": [{\"id\": \"task-one\", \
+         \"note\\nline\": \"a\", \"note\\nline\": \"b\", \"note\": \"\", \
+         \"status\": \"open\", \"holder\": null, \"token_hash\": null, \"epoch\": 0, \
+         \"expires_at\": null}], \"history\": []}";
+    std::fs::write(&path, text).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, a key stands twice in the document, 'note\\nline'"
+    );
+    assert!(!error.message().contains('\n'));
+}
+
+#[test]
+fn a_registry_whose_metadata_cannot_be_read_is_a_failure_not_an_empty_backlog() {
+    // The registry path stands under a regular file, so its
+    // metadata fails for every user, where the read path as
+    // first built took any metadata failure for absence and
+    // read the empty backlog (DB-A7). Board and history
+    // refuse with the failure an unreadable registry raises.
+    // The probe behind the finding staged the same refusal
+    // through a directory that denies search permission; this
+    // shape can fail on any box, whatever user runs the suite.
+    let dir = temp_dir("metadata-denied-registry");
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, "a regular file").unwrap();
+    let registry = Registry::new(blocker.join("registry.json"));
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Failure(_)), "{error:?}");
+    assert!(
+        error.message().contains("the registry file cannot be read"),
+        "{}",
+        error.message()
+    );
+    let error = expect_error(registry.history(None));
+    assert!(matches!(error, Error::Failure(_)), "{error:?}");
+    // The control: a registry that does not stand reads as an
+    // empty backlog and creates nothing, as DB-12 states.
+    let missing = Registry::new(dir.join("missing.json"));
+    assert_eq!(missing.board(&t0()).unwrap().len(), 0);
+    assert_eq!(missing.history(None).unwrap().len(), 0);
+    assert!(!dir.join("missing.json").exists());
+    assert!(!dir.join("missing.json.lock").exists());
+}
+
+#[test]
+fn string_values_render_in_refusal_messages_as_python_renders_them() {
+    // The messages that interpolate a value render a string
+    // the way Python's repr renders it, and that rendering is
+    // an equivalence obligation of the port (DB-A56). The
+    // float arms stand pinned by the sibling float pin, and
+    // the private use escapes by the pin queued with DB-A5's
+    // repair, but the renderer's quote and escape arms stood
+    // unpinned before this pin. The cases stand on those
+    // arms: the quote selection itself (a double quote when
+    // the text carries a single quote and no double quote, a
+    // single quote otherwise, the chosen quote escaped where
+    // the text carries it), the backslash escape, the short
+    // escape for a tab, and the hex escape widths, two
+    // digits at or under a byte and four in the rest of the
+    // basic plane, for the characters the printable table
+    // refuses, closing with a printable character past the
+    // basic plane rendering as itself. Every expected text
+    // was probed against the Python runtime the contract
+    // names, 3.12.3, never written from habit. A renderer
+    // that always chose one quote fails the first three
+    // cases, one that passed a control character through
+    // raw fails the escape cases (and would break the one
+    // line shape the refusal keeps), one that rendered a
+    // byte width character at four digits fails the two
+    // digit cases, and one that escaped a printable astral
+    // character fails the last case, while every variant
+    // only pin around them still passed.
+    let cases: [(&str, &str); 10] = [
+        ("task'one", "\"task'one\""),
+        ("task\"one", "'task\"one'"),
+        ("task'\"one", "'task\\'\"one'"),
+        ("task\\one", "'task\\\\one'"),
+        ("task\tone", "'task\\tone'"),
+        ("task\u{1}one", "'task\\x01one'"),
+        ("task\u{85}one", "'task\\x85one'"),
+        ("task\u{a0}one", "'task\\xa0one'"),
+        ("task\u{200b}one", "'task\\u200bone'"),
+        ("task\u{20000}one", "'task\u{20000}one'"),
+    ];
+    for (name, rendered) in cases {
+        let error = expect_error(validate_name(&Value::Str(name.to_string()), "item"));
+        assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
+        let expected = format!(
+            "invalid item id {rendered}, use one component of lowercase letters \
+             and digits and hyphens and underscores, starting and ending \
+             with a letter or a digit, at most 64 characters long"
+        );
+        assert_eq!(error.message(), expected.as_str(), "the name {name:?}");
+    }
+}
+
+#[test]
+fn compound_format_values_render_whole_in_the_format_refusal() {
+    // The strict reader's format refusal interpolates the
+    // standing format value whole (DB-A56), and a damaged
+    // document can carry a compound value in that field,
+    // which the renderer's array and object arms join
+    // element by element. The expected texts were probed
+    // against Python 3.12.3: a list renders its elements
+    // repr by repr joined with ", ", and an object renders
+    // each key's repr, ": ", and the value's repr the same
+    // way. A renderer that joined a compound value in any
+    // other shape, or rendered a member in any other form,
+    // fails these comparisons while every variant only pin
+    // around them still passed.
+    let base = temp_dir("format-compound");
+    let (directory, text) = mutated(&base, "list-case", |doc| {
+        doc["format"] = serde_json::json!(["dibs-registry/1", 2]);
+    });
+    let path = directory.join("registry.json");
+    std::fs::write(&path, &text).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&at(1)));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, the format name is ['dibs-registry/1', 2], \
+         not 'dibs-registry/1'"
+    );
+    let (directory, text) = mutated(&base, "object-case", |doc| {
+        doc["format"] = serde_json::json!({"name": "dibs-registry/1", "version": 2});
+    });
+    let path = directory.join("registry.json");
+    std::fs::write(&path, &text).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&at(1)));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, the format name is \
+         {'name': 'dibs-registry/1', 'version': 2}, not 'dibs-registry/1'"
+    );
+}
+
+#[test]
+fn possession_check_judges_holder_then_epoch_then_token() {
+    // The possession check judges holder first and epoch
+    // second and token last, as its doc comment states, and
+    // the order is observable only where two presentations
+    // fail at once (DB-A57). Every standing pin isolates
+    // one failure, so a refactor that swapped two of the
+    // three checks would pass the whole suite while
+    // changing which refusal a doubly wrong presentation
+    // draws. These three arms present two failures at a
+    // time on the standing claimed item shape the suite
+    // hand builds, comparing the message whole, and a swap
+    // of any two checks fails exactly one arm. The last
+    // arm stands as the control, the same text the binding
+    // smoke pins on its surface.
+    let standing = Item {
+        id: "task-one".to_string(),
+        note: "a synthetic task".to_string(),
+        status: "claimed".to_string(),
+        holder: Some("agent-a".to_string()),
+        token_hash: Some(dibs::token_hash("tok")),
+        epoch: 1,
+        expires_at: Some(dibs::format_instant(&at(60))),
+    };
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-b",
+        "tok-wrong",
+        &Value::Int(7),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "item 'task-one' is held by 'agent-a', not by 'agent-b'"
+    );
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-a",
+        "tok-wrong",
+        &Value::Int(7),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the epoch 7 presented for item 'task-one' does not match \
+         the standing epoch 1"
+    );
+    let error = expect_error(check_possession(
+        &standing,
+        "agent-a",
+        "tok-wrong",
+        &Value::Int(1),
+    ));
+    assert!(matches!(error, Error::Refusal(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the token presented for item 'task-one' does not match the lease"
+    );
+}
+
+#[test]
+fn cli_help_bodies_print_their_whole_texts() {
+    // The eight help bodies stand pinned as whole texts. What the
+    // parser pins already hold is the usage lines, which the parser
+    // error path shares, and one absence, the time override flag the
+    // surface carries none of. The bodies themselves, the descriptions
+    // and the option lists a caller reads on an explicit help flag,
+    // were compared nowhere, so a dropped option line or a reworded
+    // description passed every suite. Each comparison below fails on
+    // any drift inside its body. One line of the main body is pinned
+    // in its standing form deliberately: the board line is the wording
+    // DB-A33 records, its correction queued in PR 132, and when that
+    // correction lands this pin fails until the expected text is
+    // updated in the same pass, so the correction cannot land silently
+    // past the guard.
+    let main = run_cli(&["--help"], 0);
+    assert_eq!(main.stderr, "");
+    assert_eq!(
+        main.stdout,
+        concat!(
+            "usage: dibs [-h] --registry REGISTRY\n",
+            "            {offer,claim,renew,release,complete,board,history} ...\n",
+            "\n",
+            "Claim tasks from a shared backlog under leases that expire unless they are\n",
+            "renewed.\n",
+            "\n",
+            "positional arguments:\n",
+            "  {offer,claim,renew,release,complete,board,history}\n",
+            "    offer               add an item to the backlog\n",
+            "    claim               lease an item under a new claim\n",
+            "    renew               extend the standing lease from its current expiry\n",
+            "    release             end the standing lease early\n",
+            "    complete            mark the item done under its standing lease\n",
+            "    board               show the open and claimed items\n",
+            "    history             show the recorded claim history\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  --registry REGISTRY   the registry file holding the backlog, created by the\n",
+            "                        first mutation\n",
+        )
+    );
+    let offer = run_cli(&["offer", "--help"], 0);
+    assert_eq!(offer.stderr, "");
+    assert_eq!(
+        offer.stdout,
+        concat!(
+            "usage: dibs offer [-h] [--note NOTE] item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help   show this help message and exit\n",
+            "  --note NOTE  a short payload note for the item\n",
+        )
+    );
+    let claim = run_cli(&["claim", "--help"], 0);
+    assert_eq!(claim.stderr, "");
+    assert_eq!(
+        claim.stdout,
+        concat!(
+            "usage: dibs claim [-h] --holder HOLDER --ttl TTL item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help       show this help message and exit\n",
+            "  --holder HOLDER\n",
+            "  --ttl TTL        the lease length in seconds\n",
+        )
+    );
+    let renew = run_cli(&["renew", "--help"], 0);
+    assert_eq!(renew.stderr, "");
+    assert_eq!(
+        renew.stdout,
+        concat!(
+            "usage: dibs renew [-h] --holder HOLDER --token TOKEN --epoch EPOCH --ttl TTL\n",
+            "                  item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help       show this help message and exit\n",
+            "  --holder HOLDER\n",
+            "  --token TOKEN\n",
+            "  --epoch EPOCH\n",
+            "  --ttl TTL        the added lease length in seconds\n",
+        )
+    );
+    let release = run_cli(&["release", "--help"], 0);
+    assert_eq!(release.stderr, "");
+    assert_eq!(
+        release.stdout,
+        concat!(
+            "usage: dibs release [-h] --holder HOLDER --token TOKEN --epoch EPOCH item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help       show this help message and exit\n",
+            "  --holder HOLDER\n",
+            "  --token TOKEN\n",
+            "  --epoch EPOCH\n",
+        )
+    );
+    let complete = run_cli(&["complete", "--help"], 0);
+    assert_eq!(complete.stderr, "");
+    assert_eq!(
+        complete.stdout,
+        concat!(
+            "usage: dibs complete [-h] --holder HOLDER --token TOKEN --epoch EPOCH item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help       show this help message and exit\n",
+            "  --holder HOLDER\n",
+            "  --token TOKEN\n",
+            "  --epoch EPOCH\n",
+        )
+    );
+    let board = run_cli(&["board", "--help"], 0);
+    assert_eq!(board.stderr, "");
+    assert_eq!(
+        board.stdout,
+        concat!(
+            "usage: dibs board [-h]\n",
+            "\n",
+            "options:\n",
+            "  -h, --help  show this help message and exit\n",
+        )
+    );
+    let history = run_cli(&["history", "--help"], 0);
+    assert_eq!(history.stderr, "");
+    assert_eq!(
+        history.stdout,
+        concat!(
+            "usage: dibs history [-h] [item]\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help  show this help message and exit\n",
+        )
+    );
 }
