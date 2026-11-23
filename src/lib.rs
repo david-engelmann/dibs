@@ -193,7 +193,8 @@ pub fn py_repr(text: &str) -> String {
 /// the ranges that can reach an error message. Letters, digits,
 /// marks, punctuation, symbols, and the plain space are printable.
 /// Control and format and separator characters other than the
-/// plain space are not.
+/// plain space are not, and neither are the private use ranges,
+/// which Python counts as not printable in every Unicode version.
 fn py_printable(c: char) -> bool {
     let n = c as u32;
     if n < 0x20 || n == 0x7f {
@@ -208,6 +209,7 @@ fn py_printable(c: char) -> bool {
         | 0x205f | 0x2060..=0x206f | 0x3000 | 0xfeff | 0xfff9..=0xfffb
         | 0x0600..=0x0605 | 0x061c | 0x06dd | 0x0890..=0x0891 | 0x08e2
         | 0x180f | 0x1944..=0x1945 | 0x1b4d | 0x1b7d
+        | 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd
     )
 }
 
