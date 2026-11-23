@@ -315,10 +315,17 @@ fn fixture_hashes_match_the_manifest_inventory() {
             "90acad5aaee8df5aa46b554a2f874b645eed9a46703af39c2b02848d3f470c6f",
         ),
     ];
+    let manifest = std::fs::read_to_string(fixture_path("MANIFEST.md")).unwrap();
     for (name, bytes, hash) in inventory {
         let raw = std::fs::read(fixture_path(name)).unwrap();
         assert_eq!(raw.len(), bytes, "{name}");
         assert_eq!(sha256_hex(&raw), hash, "{name}");
+        assert!(
+            manifest.contains(&format!(
+                "`{name}` stands at {bytes} bytes with SHA-256 `{hash}`"
+            )),
+            "MANIFEST.md does not record {name} at {bytes} bytes with SHA-256 {hash}"
+        );
     }
 }
 
