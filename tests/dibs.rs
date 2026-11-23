@@ -686,18 +686,13 @@ macro_rules! bad_ttl_value {
     ($name:ident, $value:expr) => {
         #[test]
         fn $name() {
-            let dir = temp_dir(stringify!($name));
-            let registry = make_registry(&dir);
-            registry
-                .offer("task-one", "a synthetic task", &t0())
-                .unwrap();
             // A time to live of this shape reaches the validator
             // the claim and the renew both call first, and it
             // refuses there with the typed error, before any
-            // state is read.
-            assert_invalid_ttl(validate_ttl(&$value));
-            let granted = registry.claim("task-one", "agent-a", 60, &t0()).unwrap();
-            let _ = granted;
+            // state is read. The validator is a pure function
+            // of the value, so the assertion stands alone:
+            // staging a registry or claiming first could not
+            // change its outcome.
             assert_invalid_ttl(validate_ttl(&$value));
         }
     };
