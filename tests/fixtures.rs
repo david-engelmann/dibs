@@ -15,21 +15,12 @@
 use std::path::PathBuf;
 
 use dibs::{Error, Instant, Registry};
-use sha2::{Digest, Sha256};
 
-fn t0() -> Instant {
-    Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(0)).unwrap()
-}
-
-fn at(seconds: i64) -> Instant {
-    t0().plus_seconds(seconds)
-}
+mod common;
+use common::{at, expect_error, sha256_hex, t0};
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dibs-fixture-test-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::temp_dir("dibs-fixture-test-", tag)
 }
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -48,20 +39,6 @@ fn staged_fixture(tag: &str, name: &str) -> (PathBuf, Registry) {
     std::fs::copy(fixture_path(name), &path).unwrap();
     let registry = Registry::new(path);
     (dir, registry)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn expect_error<T>(result: dibs::Result<T>) -> Error {
-    match result {
-        Ok(_) => panic!("the operation succeeded where a refusal was expected"),
-        Err(error) => error,
-    }
 }
 
 /// Stage one hand written document in a scratch directory and
@@ -884,30 +861,8 @@ fn stored_week_dates_stop_at_the_weeks_in_their_year() {
 /// A generated registry of the given number of offered items,
 /// written out as text the way the scale cases stage it.
 fn generated_document(count: usize) -> String {
-    let mut out = String::from("{\"format\": \"dibs-registry/1\", \"items\": [");
-    for index in 0..count {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"id\": \"item-{index:06}\", \"note\": \"\", \"status\": \"open\", \
-             \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}"
-        ));
-    }
-    out.push_str("], \"history\": [");
-    for index in 0..count {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"seq\": {}, \"kind\": \"offered\", \"item\": \"item-{index:06}\", \
-             \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
-             \"previous_holder\": null}}",
-            index + 1
-        ));
-    }
-    out.push_str("]}");
-    out
+    let ids: Vec<String> = (0..count).map(|index| format!("item-{index:06}")).collect();
+    common::offered_document(&ids)
 }
 
 #[test]
