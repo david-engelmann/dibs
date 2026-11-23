@@ -185,6 +185,59 @@ fn ci_runs_the_local_gate_commands() {
 }
 
 #[test]
+fn ci_runs_the_binding_smoke_test() {
+    let text = read(".github/workflows/ci.yml");
+    // Read the binding job alone, from its job line to the next
+    // job line or the end of the file. The job builds the
+    // binding and runs the smoke suite against it, and the
+    // binding check is a required check, so a workflow that
+    // dropped the smoke command, or disabled the job or one of
+    // its steps with if false, would leave that check green
+    // over a suite that never ran. A command that stands
+    // commented out does not count as standing, and a step
+    // condition is read wherever it stands in its step.
+    let mut section = String::new();
+    let mut in_binding = false;
+    for line in text.lines() {
+        // A job line stands at two spaces of indent and ends
+        // with a colon, allowing a trailing comment after it.
+        let head = line.split(" #").next().unwrap_or("");
+        let job_line =
+            head.starts_with("  ") && !head.starts_with("   ") && head.trim_end().ends_with(':');
+        if job_line {
+            in_binding = head.trim() == "binding:";
+            continue;
+        }
+        if in_binding {
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    assert!(!section.is_empty(), "the workflow carries no binding job");
+    for needle in [
+        "maturin develop --manifest-path bindings/Cargo.toml",
+        "python -m pytest tests/test_binding_smoke.py",
+    ] {
+        let stands = section.lines().any(|line| {
+            let stripped = line.trim();
+            !stripped.starts_with('#') && stripped.contains(needle)
+        });
+        assert!(stands, "the binding job lost {needle}");
+    }
+    let disabled = section.lines().any(|line| {
+        let stripped = line.trim();
+        let stripped = stripped.strip_prefix("- ").unwrap_or(stripped);
+        stripped.strip_prefix("if:").is_some_and(|rest| {
+            rest.trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_lowercase()
+                == "false"
+        })
+    });
+    assert!(!disabled, "the binding job is disabled with if: false");
+}
+
+#[test]
 fn ci_carries_the_fleet_credential_hygiene() {
     let text = read(".github/workflows/ci.yml");
     // The workflow asks for no more than it uses. Its token
