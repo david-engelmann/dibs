@@ -15,21 +15,12 @@
 use std::path::PathBuf;
 
 use dibs::{Error, Instant, Registry};
-use sha2::{Digest, Sha256};
 
-fn t0() -> Instant {
-    Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(0)).unwrap()
-}
-
-fn at(seconds: i64) -> Instant {
-    t0().plus_seconds(seconds)
-}
+mod common;
+use common::{at, expect_error, sha256_hex, t0};
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dibs-fixture-test-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::temp_dir("dibs-fixture-test-", tag)
 }
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -48,20 +39,6 @@ fn staged_fixture(tag: &str, name: &str) -> (PathBuf, Registry) {
     std::fs::copy(fixture_path(name), &path).unwrap();
     let registry = Registry::new(path);
     (dir, registry)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn expect_error<T>(result: dibs::Result<T>) -> Error {
-    match result {
-        Ok(_) => panic!("the operation succeeded where a refusal was expected"),
-        Err(error) => error,
-    }
 }
 
 /// Stage one hand written document in a scratch directory and
@@ -338,10 +315,17 @@ fn fixture_hashes_match_the_manifest_inventory() {
             "90acad5aaee8df5aa46b554a2f874b645eed9a46703af39c2b02848d3f470c6f",
         ),
     ];
+    let manifest = std::fs::read_to_string(fixture_path("MANIFEST.md")).unwrap();
     for (name, bytes, hash) in inventory {
         let raw = std::fs::read(fixture_path(name)).unwrap();
         assert_eq!(raw.len(), bytes, "{name}");
         assert_eq!(sha256_hex(&raw), hash, "{name}");
+        assert!(
+            manifest.contains(&format!(
+                "`{name}` stands at {bytes} bytes with SHA-256 `{hash}`"
+            )),
+            "MANIFEST.md does not record {name} at {bytes} bytes with SHA-256 {hash}"
+        );
     }
 }
 
@@ -843,55 +827,104 @@ fn stored_week_date_spellings_read_at_their_boundary() {
     }
 }
 
+#[test]
+fn stored_week_dates_stop_at_the_weeks_in_their_year() {
+    // The week grammar refuses a week past the weeks its year
+    // carries and a weekday past 7, and holds a 53rd week in a
+    // year that carries one. 2031 opens on a Wednesday and is
+    // not a leap year, so it carries 52 weeks, and a stored
+    // expiry in its 53rd week refuses as corruption. 2020 is a
+    // leap year opening on a Wednesday, so it carries 53, and
+    // its 53rd week ends on 2021-01-03, where the lease stands
+    // live strictly before that instant and expired at it. A
+    // reader that dropped the weeks in year bound would read
+    // the first document into the following year and fail, and
+    // one that refused every 53rd week would fail the second.
+    let text = claimed_document("2031W537T12:01:00+00:00");
+    let (dir, registry) = staged_document("week-past-year", &text);
+    let path = dir.join("registry.json");
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes());
+
+    let text = claimed_document("2031W188T12:01:00+00:00");
+    let (_, registry) = staged_document("week-weekday-past", &text);
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+
+    let text = claimed_document("2020W537T12:01:00+00:00");
+    let (_, registry) = staged_document("week-fifty-three", &text);
+    let boundary = Instant::from_civil(2021, 1, 3, 12, 1, 0, 0, Some(0)).unwrap();
+    let live = registry.board(&boundary.plus_seconds(-1)).unwrap();
+    assert_eq!(live[0].status, "claimed");
+    assert_eq!(
+        live[0].expires_at.as_deref(),
+        Some("2020W537T12:01:00+00:00")
+    );
+    let expired = registry.board(&boundary).unwrap();
+    assert_eq!(expired[0].status, "open");
+}
+
 /// A generated registry of the given number of offered items,
 /// written out as text the way the scale cases stage it.
 fn generated_document(count: usize) -> String {
-    let mut out = String::from("{\"format\": \"dibs-registry/1\", \"items\": [");
-    for index in 0..count {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"id\": \"item-{index:06}\", \"note\": \"\", \"status\": \"open\", \
-             \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}"
-        ));
-    }
-    out.push_str("], \"history\": [");
-    for index in 0..count {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"seq\": {}, \"kind\": \"offered\", \"item\": \"item-{index:06}\", \
-             \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
-             \"previous_holder\": null}}",
-            index + 1
-        ));
-    }
-    out.push_str("]}");
-    out
+    let ids: Vec<String> = (0..count).map(|index| format!("item-{index:06}")).collect();
+    common::offered_document(&ids)
 }
 
 #[test]
-fn board_over_a_large_registry_stays_inside_a_generous_bound() {
-    // The port as first built validated a document in time
-    // quadratic in the item count, and a board over sixteen
-    // thousand items took over seventeen seconds in this
-    // profile on the build machine. Validation is linear in
-    // the count, and the same board lands far inside the bound.
-    let count = 16_000usize;
-    let text = generated_document(count);
-    let (_, registry) = staged_document("scale-board", &text);
-    let started = std::time::Instant::now();
-    let rows = registry.board(&t0()).unwrap();
-    let elapsed = started.elapsed();
-    assert_eq!(rows.len(), count);
-    assert_eq!(rows[0].id, "item-000000");
-    assert_eq!(rows[count - 1].id, "item-015999");
+fn board_over_a_large_registry_grows_with_the_document_not_its_square() {
+    // The obligation behind this pin is validation linear in
+    // the item count, where the port as first built validated
+    // in quadratic time and a board over sixteen thousand
+    // items took over seventeen seconds in this profile on
+    // the build machine. The pin as first written asserted
+    // one board inside an absolute wall clock bound, and a
+    // busy box broke that bound with no regression behind
+    // it, so the pin now judges the board's growth inside
+    // one run instead: four times the items must cost far
+    // less than the sixteen times a quadratic validation
+    // charges, each board timed as the best of three runs
+    // over its staged document so a load spike in any one
+    // run cannot move the ratio the pin judges. A generous
+    // ceiling on any one board stands only as a hang guard,
+    // far past every recorded loaded figure for a board of
+    // this size, and a run that crosses it fails on its own
+    // however the other runs stand.
+    let small = 4_000usize;
+    let large = 16_000usize;
+    let board_time = |count: usize| {
+        let text = generated_document(count);
+        let (_, registry) = staged_document(&format!("scale-growth-{count}"), &text);
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let rows = registry.board(&t0()).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(rows.len(), count);
+            assert!(
+                elapsed < std::time::Duration::from_secs(60),
+                "board over {count} items took {elapsed:?}"
+            );
+            best = best.min(elapsed);
+        }
+        best
+    };
+    let small_time = board_time(small);
+    let large_time = board_time(large);
+    eprintln!("scale growth: small {small_time:?}, large {large_time:?}");
     assert!(
-        elapsed < std::time::Duration::from_secs(10),
-        "board over {count} items took {elapsed:?}"
+        large_time < small_time * 9,
+        "board over {large} items took {large_time:?} against {small_time:?} \
+         over {small} items, a growth past the linear law"
     );
+    // The large board still reads the whole document back in
+    // offer order, as the pin before this one asserted.
+    let text = generated_document(large);
+    let (_, registry) = staged_document("scale-growth-rows", &text);
+    let rows = registry.board(&t0()).unwrap();
+    assert_eq!(rows[0].id, "item-000000");
+    assert_eq!(rows[large - 1].id, "item-015999");
 }
 
 #[test]
@@ -987,4 +1020,76 @@ fn stored_instants_in_the_wider_family_read_at_their_boundary() {
         let boundary = registry.board(&at(60)).unwrap();
         assert_eq!(boundary[0].status, "open", "{spelling}");
     }
+}
+
+#[test]
+fn stored_offset_seconds_read_in_both_forms() {
+    // The offset of a stored instant carries its minutes and
+    // seconds in the colon form or the packed form, the one
+    // trailing component shape the time after a date carries,
+    // and the two spellings below name the same offset, thirty
+    // seconds, so both name the same expiry: 12:01:20 at an
+    // offset of thirty seconds is 12:00:50 in UTC. The wall
+    // seconds and the offset seconds differ on purpose, so a
+    // reader that lost the seconds of either component, or of
+    // both through one shared misreading, names a different
+    // instant and fails the boundary, where equal seconds
+    // would let the two losses cancel. The lease is live
+    // strictly before that instant and expired at it, and the
+    // board reports each stored spelling whole. A reader that
+    // refused either form would corrupt the read, so the pin
+    // discriminates the seconds arm of each branch.
+    let spellings = ["2031-05-04T12:01:20+00:00:30", "2031-05-04T12:01:20+000030"];
+    for (index, spelling) in spellings.iter().enumerate() {
+        let text = claimed_document(spelling);
+        let (_, registry) = staged_document(&format!("offset-seconds-{index}"), &text);
+        let live = registry.board(&at(49)).unwrap();
+        assert_eq!(live[0].status, "claimed", "{spelling}");
+        assert_eq!(live[0].expires_at.as_deref(), Some(*spelling));
+        let expired = registry.board(&at(50)).unwrap();
+        assert_eq!(expired[0].status, "open", "{spelling}");
+    }
+}
+
+#[test]
+fn stored_instants_with_a_trailing_fraction_separator_refuse() {
+    // A fraction separator with no digits after it counts as
+    // no fraction where a zone designator follows it, and
+    // refuses the reading where it stands at the end of the
+    // text, the two cases the Python grammar separates. The
+    // reader as first built joined them, taking the separator
+    // as no fraction in both seats of the grammar, so each
+    // spelling below read clean here and stands unparseable
+    // under the Python reader: the separator at the end of
+    // the time with a dot and with a comma, and at the end
+    // of the offset. Each refuses as corruption with the
+    // registry bytes standing unchanged. The control stands
+    // last: the same empty fraction followed by a zone
+    // designator reads at its boundary, the lease live
+    // strictly before the expiry it names and expired at it,
+    // so a repair that refused every empty fraction fails
+    // here as surely as the unrepaired reader fails above.
+    let refused = [
+        "2031-05-04T12:01:00.",
+        "2031-05-04T12:01:00,",
+        "2031-05-04T12:01:00+01:00.",
+    ];
+    for (index, spelling) in refused.iter().enumerate() {
+        let text = claimed_document(spelling);
+        let (dir, registry) = staged_document(&format!("trailing-fraction-{index}"), &text);
+        let path = dir.join("registry.json");
+        let error = expect_error(registry.board(&t0()));
+        assert!(matches!(error, Error::Corrupt(_)), "{spelling}: {error:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes());
+    }
+    let text = claimed_document("2031-05-04T12:01:00.+00:00");
+    let (_, registry) = staged_document("empty-fraction-zone", &text);
+    let live = registry.board(&at(59)).unwrap();
+    assert_eq!(live[0].status, "claimed");
+    assert_eq!(
+        live[0].expires_at.as_deref(),
+        Some("2031-05-04T12:01:00.+00:00")
+    );
+    let expired = registry.board(&at(60)).unwrap();
+    assert_eq!(expired[0].status, "open");
 }

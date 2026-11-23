@@ -2,9 +2,12 @@
 //! pin for pin from the Round 1 Python suite.
 //!
 //! Deterministic time comes only from injected instants. No test
-//! sleeps to make a lease expire, and the only wall clock use is
-//! the command line smoke path where no expiry boundary is
-//! crossed. Fixtures are synthetic and written for this repo.
+//! sleeps to make a lease expire. The wall clock is read only by
+//! the command line smoke path, where no expiry boundary is
+//! crossed, and by the lock identity pin, which polls for the
+//! worker's lock file and widens its window with a short sleep,
+//! a wait on a file that judges no lease. Fixtures are synthetic
+//! and written for this repo.
 //!
 //! Two reshapings from the port amendment land here. A value the
 //! Python suite handed to an operation as the wrong type, an
@@ -24,30 +27,15 @@ use dibs::{
     Value,
 };
 
-fn t0() -> Instant {
-    Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, Some(0)).unwrap()
-}
-
-fn at(seconds: i64) -> Instant {
-    t0().plus_seconds(seconds)
-}
+mod common;
+use common::{at, expect_error, t0};
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dibs-test-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    common::temp_dir("dibs-test-", tag)
 }
 
 fn make_registry(dir: &Path) -> Registry {
     Registry::new(dir.join("registry.json"))
-}
-
-fn expect_error<T>(result: dibs::Result<T>) -> Error {
-    match result {
-        Ok(_) => panic!("the operation succeeded where a refusal was expected"),
-        Err(error) => error,
-    }
 }
 
 fn assert_invalid_name<T>(result: dibs::Result<T>) {
@@ -651,6 +639,40 @@ fn invalid_holder_name_none() {
     assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
 }
 
+#[test]
+fn invalid_name_message_escapes_private_use_characters() {
+    // Python counts the private use ranges as not printable in
+    // every Unicode version, so its repr renders them as hex
+    // escapes, and the refusal message does the same. On the code
+    // before the fix the raw character stood in the message and
+    // no escape appeared.
+    let bmp = expect_error(validate_name(
+        &Value::Str("agent-\u{e000}".to_string()),
+        "holder",
+    ));
+    assert!(matches!(bmp, Error::InvalidName(_)), "{bmp:?}");
+    assert!(bmp.message().contains("\\ue000"), "{}", bmp.message());
+    assert!(!bmp.message().contains('\u{e000}'), "{}", bmp.message());
+    let supplementary = expect_error(validate_name(
+        &Value::Str("agent-\u{f0000}".to_string()),
+        "holder",
+    ));
+    assert!(
+        matches!(supplementary, Error::InvalidName(_)),
+        "{supplementary:?}"
+    );
+    assert!(
+        supplementary.message().contains("\\U000f0000"),
+        "{}",
+        supplementary.message()
+    );
+    assert!(
+        !supplementary.message().contains('\u{f0000}'),
+        "{}",
+        supplementary.message()
+    );
+}
+
 macro_rules! good_name {
     ($name:ident, $value:expr) => {
         #[test]
@@ -701,18 +723,13 @@ macro_rules! bad_ttl_value {
     ($name:ident, $value:expr) => {
         #[test]
         fn $name() {
-            let dir = temp_dir(stringify!($name));
-            let registry = make_registry(&dir);
-            registry
-                .offer("task-one", "a synthetic task", &t0())
-                .unwrap();
             // A time to live of this shape reaches the validator
             // the claim and the renew both call first, and it
             // refuses there with the typed error, before any
-            // state is read.
-            assert_invalid_ttl(validate_ttl(&$value));
-            let granted = registry.claim("task-one", "agent-a", 60, &t0()).unwrap();
-            let _ = granted;
+            // state is read. The validator is a pure function
+            // of the value, so the assertion stands alone:
+            // staging a registry or claiming first could not
+            // change its outcome.
             assert_invalid_ttl(validate_ttl(&$value));
         }
     };
@@ -744,6 +761,52 @@ fn ttl_ceiling_is_the_contract_number_and_is_enforced() {
         dibs::TTL_MAX + 1,
         &at(1),
     ));
+}
+
+#[test]
+fn float_values_render_in_refusal_messages_as_python_renders_them() {
+    // The messages that interpolate a value render a float the
+    // way Python's repr renders it, and that rendering is an
+    // equivalence obligation of the port. The cases stand on
+    // the renderer's own decision boundaries: fixed notation
+    // inside the exponent range and scientific outside it, a
+    // trailing point zero on an integral fixed value, and the
+    // named arms for negative zero and nan and the infinities.
+    // A renderer that moved a boundary or dropped the point
+    // zero would change one of these texts while every class
+    // only pin around it still passed.
+    let cases: [(f64, &str); 12] = [
+        (1.5, "1.5"),
+        (123.456, "123.456"),
+        (2.0, "2.0"),
+        (0.0001, "0.0001"),
+        (0.00001, "1e-05"),
+        (1e15, "1000000000000000.0"),
+        (1e16, "1e+16"),
+        (1e100, "1e+100"),
+        (-0.0, "-0.0"),
+        (f64::INFINITY, "inf"),
+        (f64::NEG_INFINITY, "-inf"),
+        (f64::NAN, "nan"),
+    ];
+    for (value, rendered) in cases {
+        let error = expect_error(validate_ttl(&Value::Float(value)));
+        assert!(matches!(error, Error::InvalidTtl(_)), "{error:?}");
+        let expected = format!(
+            "invalid time to live {rendered}, use a positive integer \
+             number of seconds, at most 31536000"
+        );
+        assert_eq!(error.message(), expected.as_str(), "the float {value}");
+    }
+    // The name refusal interpolates the value the same way.
+    let error = expect_error(validate_name(&Value::Float(1.5), "item"));
+    assert!(matches!(error, Error::InvalidName(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "invalid item id 1.5, use one component of lowercase letters \
+         and digits and hyphens and underscores, starting and ending \
+         with a letter or a digit, at most 64 characters long"
+    );
 }
 
 macro_rules! huge_ttl {
@@ -1063,6 +1126,148 @@ fn damage_event_holder_name_message_names_the_event() {
         "{}",
         error.message()
     );
+}
+
+/// A registry document holding one claimed item under a known
+/// token, with its expiry spelled in the canonical form, as raw
+/// text the encoding pins below re-encode.
+fn encodable_claimed_document() -> String {
+    format!(
+        "{{\"format\": \"dibs-registry/1\", \"items\": [{{\"id\": \"task-one\", \
+         \"note\": \"abc\", \"status\": \"claimed\", \"holder\": \"agent-a\", \
+         \"token_hash\": \"{}\", \"epoch\": 1, \"expires_at\": \"2031-05-04T12:01:00+00:00\"}}], \
+         \"history\": []}}",
+        dibs::token_hash("standing-token")
+    )
+}
+
+/// Encode a document text under one byte order mark, the way a
+/// writer of that encoding would have written it.
+fn encode_document(text: &str, mark: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    match mark {
+        "utf-8" => {
+            out.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+            out.extend_from_slice(text.as_bytes());
+        }
+        "utf-16le" => {
+            out.extend_from_slice(&[0xff, 0xfe]);
+            for unit in text.encode_utf16() {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        "utf-16be" => {
+            out.extend_from_slice(&[0xfe, 0xff]);
+            for unit in text.encode_utf16() {
+                out.extend_from_slice(&unit.to_be_bytes());
+            }
+        }
+        "utf-32le" => {
+            out.extend_from_slice(&[0xff, 0xfe, 0x00, 0x00]);
+            for ch in text.chars() {
+                out.extend_from_slice(&(ch as u32).to_le_bytes());
+            }
+        }
+        _ => {
+            out.extend_from_slice(&[0x00, 0x00, 0xfe, 0xff]);
+            for ch in text.chars() {
+                out.extend_from_slice(&(ch as u32).to_be_bytes());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn registry_documents_with_a_byte_order_mark_read_in_each_encoding() {
+    // The reader decodes the registry bytes the way the Python
+    // json module decoded them, detecting a byte order mark
+    // and transcoding UTF-16 and UTF-32, so a registry written
+    // in any of those encodings reads as the document it
+    // encodes. The dispatch carries one ordering trap: the
+    // UTF-32 little endian mark opens with the UTF-16 little
+    // endian mark, so the four byte check must run first, and
+    // a dispatch that reversed them would decode a UTF-32
+    // document as UTF-16 text full of NUL characters and
+    // refuse it as corruption, while every UTF-8 pin around
+    // this one still passed. Each encoding below must read its
+    // board at both sides of the lease's expiry boundary.
+    let text = encodable_claimed_document();
+    for mark in ["utf-8", "utf-16le", "utf-16be", "utf-32le", "utf-32be"] {
+        let dir = temp_dir(&format!("bom-{mark}"));
+        let path = dir.join("registry.json");
+        std::fs::write(&path, encode_document(&text, mark)).unwrap();
+        let registry = Registry::new(path);
+        let live = registry.board(&at(30)).unwrap();
+        assert_eq!(live.len(), 1, "{mark}");
+        assert_eq!(live[0].status, "claimed", "{mark}");
+        assert_eq!(
+            live[0].expires_at.as_deref(),
+            Some("2031-05-04T12:01:00+00:00"),
+            "{mark}"
+        );
+        let expired = registry.board(&at(60)).unwrap();
+        assert_eq!(expired[0].status, "open", "{mark}");
+    }
+}
+
+#[test]
+fn registry_documents_in_a_broken_encoding_refuse_as_corruption() {
+    // The broken forms of the same encodings refuse as
+    // corruption and leave the registry bytes standing: a
+    // UTF-16 document with an odd byte count, one carrying a
+    // lone surrogate, a UTF-32 document carrying a count past
+    // the last codepoint, and a UTF-8 mark followed by bytes
+    // that do not decode. Each defect is staged inside a
+    // whole document, in the note's text, so a decoder that
+    // guessed at it, dropping the incomplete unit or reading
+    // past the bad one, would produce a valid document and
+    // stand caught; the strict decoder refuses at the decode
+    // itself. The document text is plain ASCII, so a
+    // character's offset in the text is its unit's offset in
+    // both encodings.
+    let base = temp_dir("broken-encodings");
+    let text = encodable_claimed_document();
+    let note_b = text.find("\"abc\"").unwrap() + 2;
+    let mut odd_utf16 = encode_document(&text, "utf-16le");
+    odd_utf16.push(0);
+    let mut surrogate_units: Vec<u16> = text.encode_utf16().collect();
+    surrogate_units[note_b] = 0xd800;
+    let mut lone_surrogate = vec![0xff, 0xfe];
+    for unit in &surrogate_units {
+        lone_surrogate.extend_from_slice(&unit.to_le_bytes());
+    }
+    let mut past_last_codepoint = vec![0xff, 0xfe, 0x00, 0x00];
+    for (index, ch) in text.chars().enumerate() {
+        let value = if index == note_b {
+            0x0011_0000
+        } else {
+            ch as u32
+        };
+        past_last_codepoint.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut utf8_bytes = text.as_bytes().to_vec();
+    utf8_bytes[note_b] = 0xff;
+    let mut bad_utf8 = vec![0xef, 0xbb, 0xbf];
+    bad_utf8.extend_from_slice(&utf8_bytes);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("odd-utf16", odd_utf16),
+        ("lone-surrogate", lone_surrogate),
+        ("past-last-codepoint", past_last_codepoint),
+        ("bad-utf8", bad_utf8),
+    ];
+    for (name, bytes) in cases {
+        let directory = base.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("registry.json");
+        std::fs::write(&path, &bytes).unwrap();
+        let registry = Registry::new(path.clone());
+        assert_corrupt(registry.board(&at(1)));
+        assert_corrupt(registry.history(None));
+        assert_corrupt(registry.offer("task-two", "a synthetic task", &at(1)));
+        assert_corrupt(registry.claim("task-one", "agent-b", 60, &at(1)));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+    }
 }
 
 /// A registry holding two full lives, written by the library
@@ -1655,30 +1860,7 @@ fn staged_lock_document(fillers: usize) -> String {
     for index in 0..fillers {
         ids.push(format!("item-{index:06}"));
     }
-    let mut out = String::from("{\"format\": \"dibs-registry/1\", \"items\": [");
-    for (index, id) in ids.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"id\": \"{id}\", \"note\": \"\", \"status\": \"open\", \
-             \"holder\": null, \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}}"
-        ));
-    }
-    out.push_str("], \"history\": [");
-    for (index, id) in ids.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&format!(
-            "{{\"seq\": {}, \"kind\": \"offered\", \"item\": \"{id}\", \
-             \"holder\": null, \"at\": \"2031-05-04T12:00:00+00:00\", \"epoch\": 0, \
-             \"previous_holder\": null}}",
-            index + 1
-        ));
-    }
-    out.push_str("]}");
-    out
+    common::offered_document(&ids)
 }
 
 #[test]
@@ -1810,11 +1992,33 @@ fn cli_round_trip_and_exit_codes() {
         0,
     );
     let lines: Vec<&str> = claimed.stdout.lines().collect();
+    assert_eq!(lines.len(), 3);
     assert!(lines[0].starts_with("token "));
     let token = lines[0].split_once(' ').unwrap().1;
     assert_eq!(lines[1], "epoch 1");
+    // The claim's third line prints the expiry the claim
+    // recorded, and the board then reports that same expiry
+    // for the lease. The board's field is compared whole, so
+    // a claim that printed a different expiry than it
+    // recorded, an empty one, a truncated one, or no third
+    // line at all fails here, while the token and epoch
+    // lines still pass.
+    let printed_expiry = lines[2].strip_prefix("expires_at ").unwrap();
     let board = run_cli(&["--registry", path, "board"], 0);
     assert!(board.stdout.contains("task-one claimed holder=agent-a"));
+    let board_line = board
+        .stdout
+        .lines()
+        .find(|line| line.starts_with("task-one claimed"))
+        .unwrap();
+    let board_expiry = board_line
+        .split("expires_at=")
+        .nth(1)
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap();
+    assert_eq!(board_expiry, printed_expiry);
     assert!(board.stdout.contains("epoch=1"));
     assert!(!board.stdout.contains(token));
     let renewed = run_cli(
@@ -2062,6 +2266,235 @@ fn cli_integer_arguments_refuse_the_separator_controls() {
     );
 }
 
+#[test]
+fn cli_integer_arguments_refuse_digit_strings_past_the_conversion_limit() {
+    // The Python integer conversion the command line mirrors
+    // refuses a digit string past its limit of 4300 digits,
+    // counted as the conversion counts them, leading zeros
+    // included and underscores excluded, and the parser
+    // reports the argument as an invalid int value at exit 2.
+    // The converter as first built kept a digit string of any
+    // length whole, so a time to live past the limit refused
+    // as an invalid time to live, the library's sentence for a
+    // value the conversion never produced, and an epoch past
+    // the limit was presented as the widest 128 bit count and
+    // refused as a possession refusal at exit 1, a malformed
+    // invocation reading as a lease refusal. The pins below
+    // fail on that converter for those reasons, and the
+    // control at the limit itself fails on a converter that
+    // refuses one digit early.
+    let dir = temp_dir("cli-digit-limit");
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    run_cli(&["--registry", path, "offer", "task-one"], 0);
+    let claimed = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "600",
+        ],
+        0,
+    );
+    let token = claimed
+        .stdout
+        .lines()
+        .next()
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1
+        .to_string();
+    let past = "1".repeat(4301);
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            &past,
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !refused.stderr.contains("invalid time to live"),
+        "{}",
+        refused.stderr
+    );
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "release",
+            "task-one",
+            "--holder",
+            "agent-a",
+            &format!("--token={token}"),
+            "--epoch",
+            &past,
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !refused
+            .stderr
+            .contains("170141183460469231731687303715884105727"),
+        "{}",
+        refused.stderr
+    );
+    // The limit counts the digits as written, not the value
+    // they name, so an epoch of zeros past the limit refuses
+    // the same way, where the value zero itself converts.
+    let zeros = "0".repeat(4301);
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "release",
+            "task-one",
+            "--holder",
+            "agent-a",
+            &format!("--token={token}"),
+            "--epoch",
+            &zeros,
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+    // The control at the limit itself: a time to live of
+    // exactly 4300 digits still converts whole and refuses as
+    // an invalid time to live naming the number, so the
+    // boundary stands at the conversion's limit and not below
+    // it.
+    let at_limit = "1".repeat(4300);
+    let refused = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-two",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            &at_limit,
+        ],
+        2,
+    );
+    assert!(
+        refused.stderr.contains("invalid time to live"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !refused.stderr.contains("invalid int value"),
+        "{}",
+        refused.stderr
+    );
+    // Nothing above touched the standing lease.
+    let board = run_cli(&["--registry", path, "board"], 0);
+    assert!(
+        board.stdout.contains("task-one claimed holder=agent-a"),
+        "{}",
+        board.stdout
+    );
+}
+
+#[test]
+fn cli_integer_arguments_cover_every_digit_family() {
+    // The integer grammar takes a decimal digit from any of the
+    // families of the converter's table, and the pins above
+    // exercise three of them. This pin exercises all of them,
+    // one renew per family, with the epoch and the time to live
+    // written in the family's own digits. The epoch must match
+    // the standing epoch exactly, so a family the table holds
+    // at the wrong offset refuses the renew and fails here, and
+    // a family the table misses fails here as a parser error.
+    // The bases stand as a second copy of the table, each the
+    // codepoint of its family's digit zero.
+    const FAMILY_BASES: [u32; 68] = [
+        0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66,
+        0x0ce6, 0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946,
+        0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0,
+        0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0,
+        0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50,
+        0x11da0, 0x11f50, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6,
+        0x1e140, 0x1e2f0, 0x1e4f0, 0x1e950, 0x1fbf0,
+    ];
+    let dir = temp_dir("cli-digit-families");
+    let path = dir.join("registry.json");
+    let path = path.to_str().unwrap();
+    run_cli(&["--registry", path, "offer", "task-one"], 0);
+    let claimed = run_cli(
+        &[
+            "--registry",
+            path,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "600",
+        ],
+        0,
+    );
+    let token = claimed
+        .stdout
+        .lines()
+        .next()
+        .unwrap()
+        .split_once(' ')
+        .unwrap()
+        .1
+        .to_string();
+    for base in FAMILY_BASES {
+        let digit = |value: u32| char::from_u32(base + value).unwrap().to_string();
+        let epoch = digit(1);
+        let ttl = format!("{}{}", digit(3), digit(0));
+        let renewed = run_cli(
+            &[
+                "--registry",
+                path,
+                "renew",
+                "task-one",
+                "--holder",
+                "agent-a",
+                &format!("--token={token}"),
+                "--epoch",
+                &epoch,
+                "--ttl",
+                &ttl,
+            ],
+            0,
+        );
+        assert!(
+            renewed.stdout.starts_with("expires_at "),
+            "the digit family at {base:#06x} did not carry the renew: {}",
+            renewed.stderr
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_non_unicode_arguments_are_parser_errors_not_panics() {
@@ -2293,4 +2726,230 @@ fn damage_duplicate_key_message_names_the_whole_key() {
         error.message(),
         "the registry is corrupt, a key stands twice in the document, format"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_board_with_an_unwritable_stdout_exits_1_without_a_panic() {
+    // Command output goes through a checked writer (DB-A8), so
+    // a stream that refuses the write ends the command quietly
+    // at exit 1. /dev/full stands in for the closed pipe of the
+    // finding's settling probe, because a pipe whose reader
+    // closes early cannot be staged deterministically from
+    // inside the suite, and /dev/full refuses the write the
+    // same way. Where /dev/full does not stand the staged
+    // failure cannot be produced and the pin does not run; on
+    // the hosted gate, which is Linux, the device stands. On
+    // the pre-fix binary the same drive dies with a panic
+    // message at exit 101.
+    use std::process::Stdio;
+
+    let dir = temp_dir("cli-board-full");
+    let registry = make_registry(&dir);
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(dir.join("registry.json"))
+        .arg("board")
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_claim_with_an_unwritable_stdout_exits_1_and_the_lease_stands() {
+    // The claim publishes under the lock before its token is
+    // printed, so a stream that refuses the print leaves the
+    // lease standing with its token never delivered. The
+    // checked writer reports that failure as a quiet exit 1,
+    // where the pre-fix binary panicked at exit 101 over the
+    // standing lease. Where /dev/full does not stand the pin
+    // does not run, as its sibling above records.
+    use std::process::Stdio;
+
+    let dir = temp_dir("cli-claim-full");
+    let path = dir.join("registry.json");
+    let path_text = path.to_str().unwrap();
+    run_cli(&["--registry", path_text, "offer", "task-one"], 0);
+    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(&path)
+        .arg("claim")
+        .arg("task-one")
+        .arg("--holder")
+        .arg("agent-a")
+        .arg("--ttl")
+        .arg("3600")
+        .stdout(Stdio::from(full))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let board = run_cli(&["--registry", path_text, "board"], 0);
+    assert!(
+        board.stdout.contains("task-one claimed holder=agent-a"),
+        "{}",
+        board.stdout
+    );
+    assert!(board.stdout.contains("epoch=1"), "{}", board.stdout);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_invalid_command_word_refuses_before_the_arguments_after_it_are_converted() {
+    // The command word is judged where it is taken (DB-A49), so
+    // an unlisted word refuses as an invalid choice whatever
+    // follows it. Before the fix the tokens after the word were
+    // converted to text first, and a token that was not Unicode
+    // among them preempted the judgment, reporting the word
+    // under the history usage with the Unicode message instead,
+    // so the same invocation refused two different ways
+    // depending on the bytes of a later argument.
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = temp_dir("cli-invalid-command");
+    let path = dir.join("registry.json");
+    let bad = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(&path)
+        .arg("bogus")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.starts_with("usage: dibs [-h] --registry REGISTRY"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("invalid choice: 'bogus'"), "{stderr}");
+    assert!(!stderr.contains("usage: dibs history"), "{stderr}");
+    assert!(!stderr.contains("not valid Unicode text"), "{stderr}");
+    // The control arm: a listed word takes the same non Unicode
+    // argument to the standing Unicode refusal under its own
+    // usage, the arm the sibling pin above holds.
+    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .arg("--registry")
+        .arg(&path)
+        .arg("offer")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.starts_with("usage: dibs offer [-h]"), "{stderr}");
+    assert!(stderr.contains("not valid Unicode text"), "{stderr}");
+}
+
+#[test]
+fn registry_documents_without_a_byte_order_mark_read_in_each_encoding() {
+    // The Python json module detected the encoding of the
+    // bytes it was handed by the NUL pattern of the opening
+    // bytes as well as by a byte order mark, so a registry
+    // written in UTF-16 or UTF-32 without a mark read as the
+    // document it encodes. The reader as it stood took only
+    // the mark, and a markless document fell to the UTF-8
+    // reading, whose decode succeeds on the NUL bytes and
+    // whose parse then refuses the interleaved text, so every
+    // encoding below refused whole as corruption before the
+    // repair this pin holds. Each encoding must read its
+    // board at both sides of the lease's expiry boundary, and
+    // a markless UTF-16 document carrying a lone surrogate in
+    // its note must still refuse as corruption with its bytes
+    // standing, so a repair that decoded the detected
+    // encodings loosely stands caught beside one that never
+    // detected them, and a repair that detected only one
+    // endianness fails on the other. The mark forms stand
+    // held by the byte order mark pin above, and a repair
+    // that ran the pattern detection ahead of the mark arms
+    // would decode the UTF-32 big endian mark as a character
+    // and fail there.
+    let text = encodable_claimed_document();
+    for (mark, strip) in [
+        ("utf-16le", 2usize),
+        ("utf-16be", 2),
+        ("utf-32le", 4),
+        ("utf-32be", 4),
+    ] {
+        let dir = temp_dir(&format!("no-bom-{mark}"));
+        let path = dir.join("registry.json");
+        let marked = encode_document(&text, mark);
+        std::fs::write(&path, &marked[strip..]).unwrap();
+        let registry = Registry::new(path);
+        let live = registry.board(&at(30)).unwrap();
+        assert_eq!(live.len(), 1, "{mark}");
+        assert_eq!(live[0].status, "claimed", "{mark}");
+        assert_eq!(
+            live[0].expires_at.as_deref(),
+            Some("2031-05-04T12:01:00+00:00"),
+            "{mark}"
+        );
+        let expired = registry.board(&at(60)).unwrap();
+        assert_eq!(expired[0].status, "open", "{mark}");
+    }
+    // A markless UTF-16 document carrying a lone surrogate in
+    // its note refuses as corruption and leaves the registry
+    // bytes standing, the strict decoding the mark arms use.
+    let note_b = text.find("\"abc\"").unwrap() + 2;
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units[note_b] = 0xd800;
+    let mut bytes = Vec::new();
+    for unit in &units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let dir = temp_dir("no-bom-lone-surrogate");
+    let path = dir.join("registry.json");
+    std::fs::write(&path, &bytes).unwrap();
+    let registry = Registry::new(path.clone());
+    assert_corrupt(registry.board(&at(1)));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+#[test]
+fn damage_duplicate_key_with_a_newline_names_it_escaped() {
+    // A duplicated key carrying a newline names the key in its
+    // escaped rendering, so the refusal stays one line. The
+    // standing code printed the recovered key raw, and the
+    // message carried the newline itself.
+    let dir = temp_dir("damage-duplicate-newline");
+    let path = dir.join("registry.json");
+    let text = "{\"format\": \"dibs-registry/1\", \"items\": [{\"id\": \"task-one\", \
+         \"note\\nline\": \"a\", \"note\\nline\": \"b\", \"note\": \"\", \
+         \"status\": \"open\", \"holder\": null, \"token_hash\": null, \"epoch\": 0, \
+         \"expires_at\": null}], \"history\": []}";
+    std::fs::write(&path, text).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, a key stands twice in the document, 'note\\nline'"
+    );
+    assert!(!error.message().contains('\n'));
 }

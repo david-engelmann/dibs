@@ -39,7 +39,7 @@ positional arguments:
     renew               extend the standing lease from its current expiry
     release             end the standing lease early
     complete            mark the item done under its standing lease
-    board               show the open items and their standing leases
+    board               show the open and claimed items
     history             show the recorded claim history
 
 options:
@@ -288,11 +288,15 @@ fn py_digit_value(c: char) -> Option<u32> {
 /// Python's int conversion for the numeric arguments: optional
 /// surrounding whitespace from the Unicode whitespace set, an
 /// optional sign, decimal digits from any family of the table
-/// above with single underscores between them. The value is
-/// kept whole, at 128 bit width when it fits and as its
-/// canonical digit text when it does not, so a later validation
-/// prints the number the caller typed rather than a parser
-/// failure.
+/// above with single underscores between them. A digit string
+/// past the conversion's own limit of 4300 digits is refused
+/// here, as the conversion refuses it, so the argument draws
+/// the parser's invalid int value error rather than a
+/// validation over a number the conversion never produced.
+/// The value is kept whole, at 128 bit width when it fits and
+/// as its canonical digit text when it does not, so a later
+/// validation prints the number the caller typed rather than a
+/// parser failure.
 fn python_int(text: &str) -> Option<Value> {
     // The trim set is the Python integer conversion's own,
     // which is the Unicode whitespace set exactly. The wider
@@ -331,6 +335,15 @@ fn python_int(text: &str) -> Option<Value> {
         }
     }
     if previous_underscore || !seen_digit {
+        return None;
+    }
+    // The conversion refuses a digit string past its limit of
+    // 4300 digits, counted over the digit characters as they
+    // stand collected here, leading zeros included and
+    // underscores excluded, so a longer string is no value at
+    // all and the argument draws the parser's invalid int
+    // value error.
+    if digits.len() > 4300 {
         return None;
     }
     let canonical_digits = {
@@ -380,8 +393,7 @@ fn parse_sub(command: &str, tokens: &[String]) -> Result<SubArgs, ParserError> {
             continue;
         }
         if !after_separator && (token == "-h" || token == "--help") {
-            print!("{}", sub_help(command));
-            println!();
+            out_line(format_args!("{}", sub_help(command)));
             std::process::exit(0);
         }
         if !after_separator && token.starts_with("--") && token.len() > 2 {
@@ -391,8 +403,7 @@ fn parse_sub(command: &str, tokens: &[String]) -> Result<SubArgs, ParserError> {
             };
             match resolve_long(name, &candidates) {
                 Ok(Some("--help")) => {
-                    print!("{}", sub_help(command));
-                    println!();
+                    out_line(format_args!("{}", sub_help(command)));
                     std::process::exit(0);
                 }
                 Ok(Some(option)) => {
@@ -533,14 +544,44 @@ fn require(command: &str, args: &SubArgs) -> Result<(), ParserError> {
     }
 }
 
+/// Write one line of command output through a locked stdout
+/// handle, and end the process quietly at exit 1 when the
+/// write fails (DB-A8).
+///
+/// The printing macros panic on a failed write, so a board
+/// piped into a reader that closes early died with a panic
+/// message at exit 101, and a claim whose token line could
+/// not be printed died the same way after its lease already
+/// stood. A failed write is an ordinary failure of the
+/// command, reported by the exit code alone.
+fn out_line(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    if writeln!(lock, "{args}").is_err() {
+        std::process::exit(1);
+    }
+}
+
+/// Write one line of error output through a locked stderr
+/// handle, with the same failure shape as out_line.
+fn err_line(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let stderr = std::io::stderr();
+    let mut lock = stderr.lock();
+    if writeln!(lock, "{args}").is_err() {
+        std::process::exit(1);
+    }
+}
+
 fn parser_fail(usage: &str, prog: &str, message: &str) -> ExitCode {
-    eprintln!("{usage}");
-    eprintln!("{prog}: error: {message}");
+    err_line(format_args!("{usage}"));
+    err_line(format_args!("{prog}: error: {message}"));
     ExitCode::from(2)
 }
 
 fn report_error(error: &Error) -> ExitCode {
-    eprintln!("error: {}", error.message());
+    err_line(format_args!("error: {}", error.message()));
     ExitCode::from(error.exit_code() as u8)
 }
 
@@ -606,7 +647,10 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
     // the one argument carried unconverted in both its forms,
     // because a path may hold bytes that are not Unicode; every
     // other argument is text, and one that is not Unicode is a
-    // parser error.
+    // parser error. The word is judged against the command set
+    // where it is taken, before the tokens after it are
+    // converted, so an unlisted word refuses as an invalid
+    // choice whatever follows it (DB-A49).
     let mut registry_path: Option<PathBuf> = None;
     let mut index = 0;
     let mut command: Option<String> = None;
@@ -627,7 +671,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             ));
         };
         if token == "-h" || token == "--help" {
-            println!("{MAIN_HELP}");
+            out_line(format_args!("{MAIN_HELP}"));
             return Ok(ExitCode::from(0));
         }
         if token.starts_with("--") && token.len() > 2 {
@@ -637,7 +681,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             };
             match resolve_long(name, &["--help", "--registry"]) {
                 Ok(Some("--help")) => {
-                    println!("{MAIN_HELP}");
+                    out_line(format_args!("{MAIN_HELP}"));
                     return Ok(ExitCode::from(0));
                 }
                 Ok(Some("--registry")) => {
@@ -674,6 +718,16 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             index += 1;
             continue;
         }
+        if !COMMANDS.contains(&token) {
+            return Ok(parser_fail(
+                MAIN_USAGE,
+                "dibs",
+                &format!(
+                    "argument command: invalid choice: {} (choose from 'offer', 'claim', 'renew', 'release', 'complete', 'board', 'history')",
+                    dibs::py_repr(token)
+                ),
+            ));
+        }
         command = Some(token.to_string());
         rest = Vec::new();
         for argument in &argv[index + 1..] {
@@ -705,16 +759,6 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             ),
         ));
     };
-    if !COMMANDS.contains(&command.as_str()) {
-        return Ok(parser_fail(
-            MAIN_USAGE,
-            "dibs",
-            &format!(
-                "argument command: invalid choice: {} (choose from 'offer', 'claim', 'renew', 'release', 'complete', 'board', 'history')",
-                dibs::py_repr(&command)
-            ),
-        ));
-    }
     let args = match parse_sub(&command, &rest) {
         Ok(args) => args,
         Err(failure) => {
@@ -747,16 +791,19 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             let item = item.unwrap();
             let note = option_text(&args, "--note").unwrap_or("");
             registry.offer(&item, note, &now)?;
-            println!("offered {item}");
+            out_line(format_args!("offered {item}"));
         }
         "claim" => {
             let item = item.unwrap();
             let holder = option_text(&args, "--holder").unwrap();
             let ttl = ttl_argument(&item, holder, option_int(&args, "--ttl").unwrap())?;
             let granted = registry.claim(&item, holder, ttl, &now)?;
-            println!("token {}", granted.token);
-            println!("epoch {}", granted.epoch);
-            println!("expires_at {}", dibs::format_instant(&granted.expires_at));
+            out_line(format_args!("token {}", granted.token));
+            out_line(format_args!("epoch {}", granted.epoch));
+            out_line(format_args!(
+                "expires_at {}",
+                dibs::format_instant(&granted.expires_at)
+            ));
         }
         "renew" => {
             let item = item.unwrap();
@@ -765,7 +812,10 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
             let ttl = ttl_argument(&item, holder, option_int(&args, "--ttl").unwrap())?;
             let expires = registry.renew(&item, holder, token, epoch, ttl, &now)?;
-            println!("expires_at {}", dibs::format_instant(&expires));
+            out_line(format_args!(
+                "expires_at {}",
+                dibs::format_instant(&expires)
+            ));
         }
         "release" => {
             let item = item.unwrap();
@@ -773,7 +823,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             let token = option_text(&args, "--token").unwrap();
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
             registry.release(&item, holder, token, epoch, &now)?;
-            println!("released {item}");
+            out_line(format_args!("released {item}"));
         }
         "complete" => {
             let item = item.unwrap();
@@ -781,20 +831,20 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             let token = option_text(&args, "--token").unwrap();
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
             registry.complete(&item, holder, token, epoch, &now)?;
-            println!("completed {item}");
+            out_line(format_args!("completed {item}"));
         }
         "board" => {
             for row in registry.board(&now)? {
                 if row.status == "claimed" {
-                    println!(
+                    out_line(format_args!(
                         "{} claimed holder={} expires_at={} epoch={}",
                         row.id,
                         row.holder.as_deref().unwrap_or_default(),
                         row.expires_at.as_deref().unwrap_or_default(),
                         row.epoch
-                    );
+                    ));
                 } else {
-                    println!("{} open epoch={}", row.id, row.epoch);
+                    out_line(format_args!("{} open epoch={}", row.id, row.epoch));
                 }
             }
         }
@@ -812,7 +862,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
                 if let Some(previous) = &event.previous_holder {
                     line.push_str(&format!(" previous_holder={previous}"));
                 }
-                println!("{line}");
+                out_line(format_args!("{line}"));
             }
         }
     }
