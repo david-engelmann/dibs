@@ -2901,3 +2901,25 @@ fn registry_documents_without_a_byte_order_mark_read_in_each_encoding() {
     assert_corrupt(registry.board(&at(1)));
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
+#[test]
+fn damage_duplicate_key_with_a_newline_names_it_escaped() {
+    // A duplicated key carrying a newline names the key in its
+    // escaped rendering, so the refusal stays one line. The
+    // standing code printed the recovered key raw, and the
+    // message carried the newline itself.
+    let dir = temp_dir("damage-duplicate-newline");
+    let path = dir.join("registry.json");
+    let text = "{\"format\": \"dibs-registry/1\", \"items\": [{\"id\": \"task-one\", \
+         \"note\\nline\": \"a\", \"note\\nline\": \"b\", \"note\": \"\", \
+         \"status\": \"open\", \"holder\": null, \"token_hash\": null, \"epoch\": 0, \
+         \"expires_at\": null}], \"history\": []}";
+    std::fs::write(&path, text).unwrap();
+    let registry = Registry::new(path);
+    let error = expect_error(registry.board(&t0()));
+    assert!(matches!(error, Error::Corrupt(_)), "{error:?}");
+    assert_eq!(
+        error.message(),
+        "the registry is corrupt, a key stands twice in the document, 'note\\nline'"
+    );
+    assert!(!error.message().contains('\n'));
+}
