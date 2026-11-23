@@ -1734,21 +1734,15 @@ fn render_opt_string(value: &Option<String>, out: &mut String) {
 /// that writes its value.
 type FieldRenderer<'a> = (&'a str, &'a dyn Fn(&mut String));
 
-fn render_item(item: &Item, level: usize, out: &mut String) {
+/// Render one object from its field table, the opening
+/// brace, one line per field at the next indent with the
+/// key escaped and a comma after every field but the last,
+/// and the closing brace at the level. render_item and
+/// render_event share this one rendering, so the
+/// mechanics stand in one place and a repair cannot land
+/// in one shape and miss the other.
+fn render_fields(fields: &[FieldRenderer], level: usize, out: &mut String) {
     out.push_str("{\n");
-    let fields: [FieldRenderer; 7] = [
-        ("id", &|out| escape_json_string(&item.id, out)),
-        ("note", &|out| escape_json_string(&item.note, out)),
-        ("status", &|out| escape_json_string(&item.status, out)),
-        ("holder", &|out| render_opt_string(&item.holder, out)),
-        ("token_hash", &|out| {
-            render_opt_string(&item.token_hash, out)
-        }),
-        ("epoch", &|out| out.push_str(&item.epoch.to_string())),
-        ("expires_at", &|out| {
-            render_opt_string(&item.expires_at, out)
-        }),
-    ];
     let count = fields.len();
     for (index, (key, render)) in fields.iter().enumerate() {
         write_indent(out, level + 1);
@@ -1764,8 +1758,24 @@ fn render_item(item: &Item, level: usize, out: &mut String) {
     out.push('}');
 }
 
+fn render_item(item: &Item, level: usize, out: &mut String) {
+    let fields: [FieldRenderer; 7] = [
+        ("id", &|out| escape_json_string(&item.id, out)),
+        ("note", &|out| escape_json_string(&item.note, out)),
+        ("status", &|out| escape_json_string(&item.status, out)),
+        ("holder", &|out| render_opt_string(&item.holder, out)),
+        ("token_hash", &|out| {
+            render_opt_string(&item.token_hash, out)
+        }),
+        ("epoch", &|out| out.push_str(&item.epoch.to_string())),
+        ("expires_at", &|out| {
+            render_opt_string(&item.expires_at, out)
+        }),
+    ];
+    render_fields(&fields, level, out);
+}
+
 fn render_event(event: &Event, level: usize, out: &mut String) {
-    out.push_str("{\n");
     let fields: [FieldRenderer; 7] = [
         ("seq", &|out| out.push_str(&event.seq.to_string())),
         ("kind", &|out| escape_json_string(&event.kind, out)),
@@ -1777,19 +1787,7 @@ fn render_event(event: &Event, level: usize, out: &mut String) {
             render_opt_string(&event.previous_holder, out)
         }),
     ];
-    let count = fields.len();
-    for (index, (key, render)) in fields.iter().enumerate() {
-        write_indent(out, level + 1);
-        escape_json_string(key, out);
-        out.push_str(": ");
-        render(out);
-        if index + 1 < count {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    write_indent(out, level);
-    out.push('}');
+    render_fields(&fields, level, out);
 }
 
 /// Render a document exactly as the Python implementation's two
