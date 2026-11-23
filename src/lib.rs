@@ -1801,7 +1801,19 @@ fn render_event(event: &Event, level: usize, out: &mut String) {
 /// space indented json rendering renders it, without the
 /// trailing newline the stored file adds.
 fn render_document(document: &Document) -> String {
-    let mut out = String::new();
+    // The output starts near its final size instead of growing
+    // from empty by doublings. The contract's measured growth
+    // constants stand at about 392 bytes per offered item, with
+    // the item's offered event counted inside that figure, and
+    // 201.5 bytes per history event, so the reserve transcribes
+    // the measured law with the event constant rounded up and a
+    // small fixed allowance for the document frame. A reserve is
+    // a capacity hint only. The item constant counting each
+    // item's offered event means the sum over-reserves by about
+    // one event per item, a transient overallocation that costs
+    // no reallocation copies on the growth path.
+    let mut out =
+        String::with_capacity(64 + document.items.len() * 392 + document.history.len() * 202);
     out.push_str("{\n");
     write_indent(&mut out, 1);
     escape_json_string("format", &mut out);
