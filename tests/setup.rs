@@ -456,3 +456,30 @@ fn codepoint_scan_skips_a_file_with_an_uppercase_binary_suffix() {
     assert!(result.stdout.contains("em dash U+2014 count 0"));
     assert!(result.stdout.contains("en dash U+2013 count 0"));
 }
+
+#[cfg(unix)]
+#[test]
+fn codepoint_scan_takes_a_non_unicode_root_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+
+    // The scanner read its root through std::env::args as
+    // first built, which panics on an argument that is not
+    // valid Unicode, where the root is a path and stands
+    // carried unconverted, the shape the command line's
+    // registry path takes. A root naming a real directory
+    // scans clean, a root that does not stand refuses with
+    // the scan error line, and neither case panics.
+    let dir = temp_dir("non-unicode-root");
+    let odd_dir = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
+    std::fs::create_dir_all(&odd_dir).unwrap();
+    std::fs::write(odd_dir.join("clean.md"), "clean").unwrap();
+    let result = scan_tree(&odd_dir);
+    assert_eq!(result.status, 0, "{}", result.stderr);
+    assert!(result.stdout.contains("em dash U+2014 count 0"));
+    assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
+    let missing = dir.join(std::ffi::OsString::from_vec(vec![0xfe]));
+    let result = scan_tree(&missing);
+    assert_eq!(result.status, 2, "{}", result.stderr);
+    assert!(result.stderr.contains("scan error"), "{}", result.stderr);
+    assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
+}
