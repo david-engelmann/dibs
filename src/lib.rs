@@ -2288,8 +2288,24 @@ impl Registry {
     }
 
     fn read<T>(&self, action: impl FnOnce(&Document) -> Result<T>) -> Result<T> {
-        if !self.path.exists() {
-            return action(&empty_document());
+        // A missing registry reads as the empty document and
+        // the read creates nothing, so absence is established
+        // from the metadata before any lock is taken (DB-12).
+        // A metadata failure of any other kind is not absence.
+        // The registry may stand and be unreadable, and reading
+        // it as empty would report a backlog that is not there
+        // (DB-A7), so it refuses with the failure the document
+        // read itself raises for an unreadable registry.
+        match std::fs::metadata(&self.path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return action(&empty_document());
+            }
+            Err(err) => {
+                return Err(Error::Failure(format!(
+                    "the registry file cannot be read, {err}"
+                )));
+            }
         }
         let _guard = self.locked(false)?;
         let document = self.read_document()?;
