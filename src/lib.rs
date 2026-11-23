@@ -1914,7 +1914,7 @@ fn decode_document_bytes(bytes: Vec<u8>) -> std::result::Result<String, String> 
         bytes.drain(..3);
         String::from_utf8(bytes)
             .map_err(|err| format!("the document does not decode as UTF-8, {err}"))
-    } else if let Some(decoded) = decode_detected_encoding(bytes) {
+    } else if let Some(decoded) = decode_detected_encoding(&bytes) {
         decoded
     } else {
         String::from_utf8(bytes)
