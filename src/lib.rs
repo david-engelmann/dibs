@@ -518,9 +518,7 @@ impl Instant {
     /// The instant the system clock reports now, in UTC. Only the
     /// command line uses this, and it offers no override.
     pub fn now_utc() -> Result<Instant, Error> {
-        Instant::from_clock_read(
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH),
-        )
+        Instant::from_clock_read(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
     }
 
     /// The instant a clock read names. A read that fails stands
@@ -2890,18 +2888,11 @@ mod tests {
 
     #[test]
     fn a_clock_at_or_after_the_epoch_builds_its_instant() {
-        let at_epoch = Instant::from_clock_read(Ok(std::time::Duration::ZERO))
-            .expect("the epoch read builds");
-        assert_eq!(
-            at_epoch,
-            Instant::from_epoch_micros(0).expect("the epoch count builds")
-        );
-        let after =
-            Instant::from_clock_read(Ok(std::time::Duration::from_micros(90_000_000)))
-                .expect("a later read builds");
-        assert_eq!(
-            after,
-            Instant::from_epoch_micros(90_000_000).expect("the later count builds")
-        );
+        let at_epoch =
+            Instant::from_clock_read(Ok(std::time::Duration::ZERO)).expect("the epoch read builds");
+        assert_eq!(at_epoch, Instant::from_epoch_micros(0).expect("the epoch count builds"));
+        let after = Instant::from_clock_read(Ok(std::time::Duration::from_micros(90_000_000)))
+            .expect("a later read builds");
+        assert_eq!(after, Instant::from_epoch_micros(90_000_000).expect("the later count builds"));
     }
 }
