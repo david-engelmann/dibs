@@ -529,9 +529,8 @@ impl Instant {
     fn from_clock_read(
         read: std::result::Result<std::time::Duration, std::time::SystemTimeError>,
     ) -> Result<Instant> {
-        let elapsed = read.map_err(|_| {
-            Error::Failure("the system clock stands before the epoch".to_string())
-        })?;
+        let elapsed = read
+            .map_err(|_| Error::Failure("the system clock stands before the epoch".to_string()))?;
         let total_micros = elapsed.as_secs() as i128 * 1_000_000 + elapsed.subsec_micros() as i128;
         let days = total_micros.div_euclid(DAY_MICROS);
         let rest = total_micros.rem_euclid(DAY_MICROS);
@@ -2890,9 +2889,15 @@ mod tests {
     fn a_clock_at_or_after_the_epoch_builds_its_instant() {
         let at_epoch =
             Instant::from_clock_read(Ok(std::time::Duration::ZERO)).expect("the epoch read builds");
-        assert_eq!(at_epoch, Instant::from_epoch_micros(0).expect("the epoch count builds"));
+        assert_eq!(
+            at_epoch,
+            Instant::from_epoch_micros(0).expect("the epoch count builds")
+        );
         let after = Instant::from_clock_read(Ok(std::time::Duration::from_micros(90_000_000)))
             .expect("a later read builds");
-        assert_eq!(after, Instant::from_epoch_micros(90_000_000).expect("the later count builds"));
+        assert_eq!(
+            after,
+            Instant::from_epoch_micros(90_000_000).expect("the later count builds")
+        );
     }
 }
