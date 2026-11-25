@@ -517,19 +517,29 @@ impl Instant {
 
     /// The instant the system clock reports now, in UTC. Only the
     /// command line uses this, and it offers no override.
-    pub fn now_utc() -> Instant {
-        let elapsed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+    pub fn now_utc() -> Result<Instant> {
+        Instant::from_clock_read(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+    }
+
+    /// The instant a clock read names. A read that fails stands
+    /// before the epoch, and no command may run on an instant the
+    /// clock never gave (perfection finding DB-P13): the read
+    /// answers a failure naming the case, at the failure exit,
+    /// instead of the epoch the standing form fabricated.
+    fn from_clock_read(
+        read: std::result::Result<std::time::Duration, std::time::SystemTimeError>,
+    ) -> Result<Instant> {
+        let elapsed = read
+            .map_err(|_| Error::Failure("the system clock stands before the epoch".to_string()))?;
         let total_micros = elapsed.as_secs() as i128 * 1_000_000 + elapsed.subsec_micros() as i128;
         let days = total_micros.div_euclid(DAY_MICROS);
         let rest = total_micros.rem_euclid(DAY_MICROS);
-        Instant {
+        Ok(Instant {
             days: days as i64,
             secs: (rest / 1_000_000) as i64,
             micros: (rest % 1_000_000) as i64,
             offset_micros: Some(0),
-        }
+        })
     }
 
     pub fn is_naive(&self) -> bool {
@@ -2862,5 +2872,32 @@ mod tests {
             &ITEM_STATUSES,
         );
         assert_order(vocabulary("The kind field carries one of "), &EVENT_KINDS);
+    }
+
+    #[test]
+    fn a_clock_standing_before_the_epoch_answers_the_failure() {
+        let read = (std::time::UNIX_EPOCH - std::time::Duration::from_secs(1))
+            .duration_since(std::time::UNIX_EPOCH);
+        assert!(read.is_err());
+        let error = Instant::from_clock_read(read).unwrap_err();
+        assert!(matches!(error, Error::Failure(_)));
+        assert_eq!(error.message(), "the system clock stands before the epoch");
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_clock_at_or_after_the_epoch_builds_its_instant() {
+        let at_epoch =
+            Instant::from_clock_read(Ok(std::time::Duration::ZERO)).expect("the epoch read builds");
+        assert_eq!(
+            at_epoch,
+            Instant::from_epoch_micros(0).expect("the epoch count builds")
+        );
+        let after = Instant::from_clock_read(Ok(std::time::Duration::from_micros(90_000_000)))
+            .expect("a later read builds");
+        assert_eq!(
+            after,
+            Instant::from_epoch_micros(90_000_000).expect("the later count builds")
+        );
     }
 }

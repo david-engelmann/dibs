@@ -784,7 +784,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
         ));
     }
     let registry = Registry::new(registry_path.unwrap());
-    let now = Instant::now_utc();
+    let now = Instant::now_utc()?;
     let item = args.positionals.first().cloned();
     match command.as_str() {
         "offer" => {
