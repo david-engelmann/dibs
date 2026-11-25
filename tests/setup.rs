@@ -326,12 +326,58 @@ fn scan_tree(root: &Path) -> ScanOutput {
     }
 }
 
+fn scan_tree_with_surplus(root: &Path, surplus: &Path) -> ScanOutput {
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .arg(root)
+        .arg(surplus)
+        .output()
+        .unwrap();
+    ScanOutput {
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
 #[test]
 fn codepoint_scan_reports_zero_for_the_repo() {
     let result = scan_tree(&root());
     assert_eq!(result.status, 0, "{}", result.stdout);
     assert!(result.stdout.contains("em dash U+2014 count 0"));
     assert!(result.stdout.contains("en dash U+2013 count 0"));
+}
+
+#[test]
+fn codepoint_scan_refuses_an_argument_after_the_root() {
+    let dir = temp_dir("surplus-argument");
+    std::fs::write(dir.join("clean.md"), "clean").unwrap();
+    let surplus = temp_dir("surplus-other");
+    let result = scan_tree_with_surplus(&dir, &surplus);
+    assert_eq!(result.status, 2, "{}", result.stdout);
+    assert!(
+        result
+            .stderr
+            .contains("scan error, the scan takes at most one argument, the scan root"),
+        "{}",
+        result.stderr
+    );
+}
+
+#[test]
+fn codepoint_scan_refuses_an_extra_argument_before_scanning() {
+    let dir = temp_dir("surplus-before-scan");
+    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
+    let surplus = temp_dir("surplus-before-scan-other");
+    let result = scan_tree_with_surplus(&dir, &surplus);
+    assert_eq!(result.status, 2, "{}", result.stdout);
+    assert!(
+        result
+            .stderr
+            .contains("scan error, the scan takes at most one argument, the scan root"),
+        "{}",
+        result.stderr
+    );
+    assert!(!result.stdout.contains("em dash U+2014 count"));
 }
 
 const CANONICAL_ABOVE_MARKER_SHA256: &str =
