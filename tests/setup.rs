@@ -380,6 +380,27 @@ fn codepoint_scan_refuses_an_extra_argument_before_scanning() {
     assert!(!result.stdout.contains("em dash U+2014 count"));
 }
 
+fn scan_current_dir(root: &Path) -> ScanOutput {
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .current_dir(root)
+        .output()
+        .unwrap();
+    ScanOutput {
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn codepoint_scan_with_no_argument_scans_the_current_directory() {
+    let dir = temp_dir("no-argument");
+    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
+    let result = scan_current_dir(&dir);
+    assert_eq!(result.status, 1);
+    assert!(result.stdout.contains("em dash U+2014 count 1"));
+}
+
 const CANONICAL_ABOVE_MARKER_SHA256: &str =
     "bb3e2fc1790b13729da3495c3f0902b968577f4e45ceb27e48e90b489f36e1a7";
 
