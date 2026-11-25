@@ -4,7 +4,7 @@
 //! U+2013 in every file under the scan root and exits 1 when either
 //! count is nonzero. What it counts, the counts it prints, the
 //! directory names it excludes below the scan root, and the binary
-//! suffixes it skips match the setup scanner, and four differences
+//! suffixes it skips match the setup scanner, and five differences
 //! from that scanner stand named here as deliberate behaviour of
 //! the port. The excluded directory names add target, the cargo
 //! output directory, because in a Rust repo that is the generated
@@ -16,7 +16,10 @@
 //! stand is a scan error at exit 2, where the setup scanner exited
 //! 0 with zero counts. A file that cannot be read is a clean scan
 //! error at exit 2, where the setup scanner let the failure escape
-//! as a traceback at exit 1. The walk excludes directories by name
+//! as a traceback at exit 1.
+//! An argument standing after the scan root is a scan error at
+//! exit 2, where the setup scanner took the first argument as the
+//! root and ignored the rest. The walk excludes directories by name
 //! below the scan root, so the name of an ancestor of the root can
 //! never exclude the root itself, and every file the walk reaches
 //! is scanned, whatever its name or suffix, apart from the known
@@ -150,6 +153,12 @@ fn err_line(args: std::fmt::Arguments) {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os().nth(2).is_some() {
+        err_line(format_args!(
+            "scan error, the scan takes at most one argument, the scan root"
+        ));
+        return ExitCode::from(2);
+    }
     let root = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
