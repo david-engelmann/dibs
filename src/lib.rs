@@ -517,7 +517,7 @@ impl Instant {
 
     /// The instant the system clock reports now, in UTC. Only the
     /// command line uses this, and it offers no override.
-    pub fn now_utc() -> Result<Instant, Error> {
+    pub fn now_utc() -> Result<Instant> {
         Instant::from_clock_read(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
     }
 
@@ -527,8 +527,8 @@ impl Instant {
     /// answers a failure naming the case, at the failure exit,
     /// instead of the epoch the standing form fabricated.
     fn from_clock_read(
-        read: Result<std::time::Duration, std::time::SystemTimeError>,
-    ) -> Result<Instant, Error> {
+        read: std::result::Result<std::time::Duration, std::time::SystemTimeError>,
+    ) -> Result<Instant> {
         let elapsed = read.map_err(|_| {
             Error::Failure("the system clock stands before the epoch".to_string())
         })?;
