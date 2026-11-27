@@ -1010,9 +1010,12 @@ fn damage_duplicate_keys_at_any_level() {
 
 #[test]
 fn damage_wrong_format_name() {
+    // DB-S3 mechanical update (DB-21): "dibs-registry/2" is now a supported
+    // format version, so pinning the unsupported-format branch uses
+    // "dibs-registry/99".
     let base = temp_dir("damage-format");
     let (directory, text) = mutated(&base, "case", |doc| {
-        doc["format"] = serde_json::json!("dibs-registry/2");
+        doc["format"] = serde_json::json!("dibs-registry/99");
     });
     assert_corrupt_and_unchanged(&directory, &text);
 }
@@ -3228,6 +3231,9 @@ fn compound_format_values_render_whole_in_the_format_refusal() {
     // other shape, or rendered a member in any other form,
     // fails these comparisons while every variant only pin
     // around them still passed.
+    // DB-S3 mechanical update (DB-21): the upward-compatible reader accepts
+    // 'dibs-registry/1' and 'dibs-registry/2', so the format refusal suffix
+    // names both versions.
     let base = temp_dir("format-compound");
     let (directory, text) = mutated(&base, "list-case", |doc| {
         doc["format"] = serde_json::json!(["dibs-registry/1", 2]);
@@ -3240,7 +3246,7 @@ fn compound_format_values_render_whole_in_the_format_refusal() {
     assert_eq!(
         error.message(),
         "the registry is corrupt, the format name is ['dibs-registry/1', 2], \
-         not 'dibs-registry/1'"
+         not 'dibs-registry/1' or 'dibs-registry/2'"
     );
     let (directory, text) = mutated(&base, "object-case", |doc| {
         doc["format"] = serde_json::json!({"name": "dibs-registry/1", "version": 2});
@@ -3253,7 +3259,7 @@ fn compound_format_values_render_whole_in_the_format_refusal() {
     assert_eq!(
         error.message(),
         "the registry is corrupt, the format name is \
-         {'name': 'dibs-registry/1', 'version': 2}, not 'dibs-registry/1'"
+         {'name': 'dibs-registry/1', 'version': 2}, not 'dibs-registry/1' or 'dibs-registry/2'"
     );
 }
 
@@ -3326,19 +3332,22 @@ fn cli_help_bodies_print_their_whole_texts() {
     // wording on lease-guarded subcommands, and the four DB-S2
     // subcommands (`offer-batch`, `claim-next`, `show`, `completions`)
     // under Obligations DB-17 through DB-20.
+    // DB-S3 mechanical update (DB-20, DB-22, DB-23, DB-24): main help and
+    // subcommand help bodies gained `reset`, `ready`, and `compact` plus the
+    // `/2` options on `offer` and `claim-next`.
     let main = run_cli(&["--help"], 0);
     assert_eq!(main.stderr, "");
     assert_eq!(
         main.stdout,
         concat!(
             "usage: dibs [-h] [-V] [-j] [--registry REGISTRY]\n",
-            "            {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions} ...\n",
+            "            {offer,offer-batch,claim,claim-next,renew,release,complete,reset,board,ready,show,history,compact,completions} ...\n",
             "\n",
             "Claim tasks from a shared backlog under leases that expire unless they are\n",
             "renewed.\n",
             "\n",
             "positional arguments:\n",
-            "  {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions}\n",
+            "  {offer,offer-batch,claim,claim-next,renew,release,complete,reset,board,ready,show,history,compact,completions}\n",
             "    offer               add an item to the backlog\n",
             "    offer-batch         add a batch of items from JSON Lines input\n",
             "    claim               lease an item under a new claim\n",
@@ -3346,9 +3355,12 @@ fn cli_help_bodies_print_their_whole_texts() {
             "    renew               extend the standing lease from its current expiry\n",
             "    release             end the standing lease early\n",
             "    complete            mark the item done under its standing lease\n",
+            "    reset               reset an exhausted item back to open\n",
             "    board               show the open and claimed items\n",
+            "    ready               show ready items ordered by priority and offer order\n",
             "    show                show the standing detail of one item\n",
             "    history             show the recorded claim history\n",
+            "    compact             archive history events through a sequence number\n",
             "    completions         print shell completion script\n",
             "\n",
             "options:\n",
@@ -3364,7 +3376,9 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         offer.stdout,
         concat!(
-            "usage: dibs offer [-h] [-j] [--registry REGISTRY] [--note NOTE] item\n",
+            "usage: dibs offer [-h] [-j] [--registry REGISTRY] [--note NOTE]\n",
+            "                  [--priority PRIORITY] [--tag TAG] [--depends-on ITEM]\n",
+            "                  [--max-takeovers MAX_TAKEOVERS] item\n",
             "\n",
             "positional arguments:\n",
             "  item\n",
@@ -3374,6 +3388,11 @@ fn cli_help_bodies_print_their_whole_texts() {
             "  -j, --json            emit deterministic JSON on stdout\n",
             "  --registry REGISTRY   the registry file holding the backlog\n",
             "  --note NOTE           a short payload note for the item\n",
+            "  --priority PRIORITY   task priority from 0 critical to 3 low\n",
+            "  --tag TAG             repeatable capability tag for the item\n",
+            "  --depends-on ITEM     repeatable prerequisite item id\n",
+            "  --max-takeovers MAX_TAKEOVERS\n",
+            "                        maximum takeovers before item becomes exhausted\n",
         )
     );
     let offer_batch = run_cli(&["offer-batch", "--help"], 0);
@@ -3414,7 +3433,8 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         claim_next.stdout,
         concat!(
-            "usage: dibs claim-next [-h] [-j] [--registry REGISTRY] --holder HOLDER --ttl TTL\n",
+            "usage: dibs claim-next [-h] [-j] [--registry REGISTRY] --holder HOLDER\n",
+            "                       --ttl TTL [--tag TAG]\n",
             "\n",
             "options:\n",
             "  -h, --help            show this help message and exit\n",
@@ -3422,6 +3442,7 @@ fn cli_help_bodies_print_their_whole_texts() {
             "  --registry REGISTRY   the registry file holding the backlog\n",
             "  --holder HOLDER\n",
             "  --ttl TTL             the lease length in seconds\n",
+            "  --tag TAG             repeatable required capability tag\n",
         )
     );
     let renew = run_cli(&["renew", "--help"], 0);
@@ -3485,6 +3506,22 @@ fn cli_help_bodies_print_their_whole_texts() {
             "  --epoch EPOCH\n",
         )
     );
+    let reset = run_cli(&["reset", "--help"], 0);
+    assert_eq!(reset.stderr, "");
+    assert_eq!(
+        reset.stdout,
+        concat!(
+            "usage: dibs reset [-h] [-j] [--registry REGISTRY] item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+        )
+    );
     let board = run_cli(&["board", "--help"], 0);
     assert_eq!(board.stderr, "");
     assert_eq!(
@@ -3496,6 +3533,20 @@ fn cli_help_bodies_print_their_whole_texts() {
             "  -h, --help            show this help message and exit\n",
             "  -j, --json            emit deterministic JSON on stdout\n",
             "  --registry REGISTRY   the registry file holding the backlog\n",
+        )
+    );
+    let ready = run_cli(&["ready", "--help"], 0);
+    assert_eq!(ready.stderr, "");
+    assert_eq!(
+        ready.stdout,
+        concat!(
+            "usage: dibs ready [-h] [-j] [--registry REGISTRY] [--tag TAG]\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --tag TAG             repeatable required capability tag\n",
         )
     );
     let show = run_cli(&["show", "--help"], 0);
@@ -3528,6 +3579,23 @@ fn cli_help_bodies_print_their_whole_texts() {
             "  -h, --help            show this help message and exit\n",
             "  -j, --json            emit deterministic JSON on stdout\n",
             "  --registry REGISTRY   the registry file holding the backlog\n",
+        )
+    );
+    let compact = run_cli(&["compact", "--help"], 0);
+    assert_eq!(compact.stderr, "");
+    assert_eq!(
+        compact.stdout,
+        concat!(
+            "usage: dibs compact [-h] [-j] [--registry REGISTRY] --through-seq THROUGH_SEQ\n",
+            "                    --archive ARCHIVE\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --through-seq THROUGH_SEQ\n",
+            "                        inclusive sequence number to compact through\n",
+            "  --archive ARCHIVE     JSON Lines archive file path\n",
         )
     );
     let completions = run_cli(&["completions", "--help"], 0);
@@ -3576,17 +3644,21 @@ fn invalid_registry_paths_refuse_at_exit_2_without_touching_disk() {
     let mut all_bad: Vec<String> = static_bad.iter().map(|s| (*s).to_string()).collect();
     all_bad.push(anchored_bad);
 
+    let archive_candidate = dir.join("valid-archive.jsonl");
+    let archive_str = archive_candidate.to_str().unwrap();
     for raw in &all_bad {
         let expected = format!(
             "invalid registry path {}, the path must name a file",
             dibs::py_repr(raw)
         );
         let registry = Registry::new(PathBuf::from(raw));
-        // DB-S2 extends DB-15 invalid-registry-path coverage to offer_many,
-        // claim_next, show, and board_details alongside the standing operations.
+        // DB-S2 and DB-S3 extend DB-15 invalid-registry-path coverage to
+        // offer_many, claim_next, show, board_details, ready, reset, and
+        // compact alongside the standing operations.
         for error in [
             expect_error(registry.board(&t0())),
             expect_error(registry.board_details(&t0())),
+            expect_error(registry.ready(&[], &t0())),
             expect_error(registry.show("task-one", &t0())),
             expect_error(registry.history(None)),
             expect_error(registry.offer("task-one", "", &t0())),
@@ -3596,6 +3668,8 @@ fn invalid_registry_paths_refuse_at_exit_2_without_touching_disk() {
             expect_error(registry.renew("task-one", "agent-a", "tok", 1, 60, &t0())),
             expect_error(registry.release("task-one", "agent-a", "tok", 1, &t0())),
             expect_error(registry.complete("task-one", "agent-a", "tok", 1, &t0())),
+            expect_error(registry.reset("task-one", &t0())),
+            expect_error(registry.compact(1, &archive_candidate, &t0())),
         ] {
             assert!(
                 matches!(error, Error::InvalidRequest(_)),
@@ -3610,9 +3684,20 @@ fn invalid_registry_paths_refuse_at_exit_2_without_touching_disk() {
         for subcmd in [
             vec!["--registry", raw.as_str(), "board"],
             vec!["board", "--registry", raw.as_str()],
+            vec!["--registry", raw.as_str(), "ready"],
             vec!["--registry", raw.as_str(), "show", "task-one"],
             vec!["--registry", raw.as_str(), "history"],
             vec!["--registry", raw.as_str(), "offer", "task-one"],
+            vec!["--registry", raw.as_str(), "reset", "task-one"],
+            vec![
+                "--registry",
+                raw.as_str(),
+                "compact",
+                "--through-seq",
+                "1",
+                "--archive",
+                archive_str,
+            ],
             vec![
                 "--registry",
                 raw.as_str(),
@@ -3756,6 +3841,7 @@ fn board_and_history_never_create_a_lock_file_on_disk() {
         "shared read lock must block exclusive try_lock"
     );
     assert_eq!(registry.board(&at(2)).unwrap().len(), 2);
+    assert_eq!(registry.ready(&[], &at(2)).unwrap().len(), 2);
     assert_eq!(registry.show("task-one", &at(2)).unwrap().id, "task-one");
     assert_eq!(registry.history(None).unwrap().len(), 2);
     held_shared.unlock().unwrap();
@@ -3765,10 +3851,11 @@ fn board_and_history_never_create_a_lock_file_on_disk() {
     drop(writer_probe);
 
     // Discriminating concurrency pin: while an exclusive lock is held on
-    // `registry.json.lock` over transient invalid bytes, `board`, `show`
-    // (added in DB-S2 under DB-19), and `history` must block on `lock_shared()`
-    // rather than proceeding lock-free (`Ok(None)`), reading only the valid
-    // bytes published before the exclusive lock releases.
+    // `registry.json.lock` over transient invalid bytes, `board`, `ready`
+    // (added in DB-S3 under DB-16/DB-22), `show` (added in DB-S2 under DB-19),
+    // and `history` must block on `lock_shared()` rather than proceeding
+    // lock-free (`Ok(None)`), reading only the valid bytes published before
+    // the exclusive lock releases.
     let valid_bytes = std::fs::read(&path).unwrap();
     let mut blocker_opts = std::fs::OpenOptions::new();
     blocker_opts.read(true).write(true);
@@ -3781,12 +3868,18 @@ fn board_and_history_never_create_a_lock_file_on_disk() {
     blocker.lock().unwrap();
     std::fs::write(&path, b"transient pre-publish").unwrap();
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
     let b_board = std::sync::Arc::clone(&barrier);
     let p_board = path.clone();
     let board_handle = std::thread::spawn(move || {
         b_board.wait();
         Registry::new(p_board).board(&at(2))
+    });
+    let b_ready = std::sync::Arc::clone(&barrier);
+    let p_ready = path.clone();
+    let ready_handle = std::thread::spawn(move || {
+        b_ready.wait();
+        Registry::new(p_ready).ready(&[], &at(2))
     });
     let b_show = std::sync::Arc::clone(&barrier);
     let p_show = path.clone();
@@ -3820,9 +3913,11 @@ fn board_and_history_never_create_a_lock_file_on_disk() {
     drop(blocker);
 
     let board_rows = board_handle.join().unwrap().unwrap();
+    let ready_details = ready_handle.join().unwrap().unwrap();
     let show_detail = show_handle.join().unwrap().unwrap();
     let history_events = history_handle.join().unwrap().unwrap();
     assert_eq!(board_rows.len(), 2);
+    assert_eq!(ready_details.len(), 2);
     assert_eq!(show_detail.id, "task-one");
     assert_eq!(history_events.len(), 2);
 }
@@ -5258,9 +5353,20 @@ fn cli_safe_credentials_env_fallbacks_version_and_completions() {
     }
 
     // Completions for bash, zsh, and fish succeed without --registry and cover
-    // all 11 subcommands and all 10 option flags.
+    // all 14 subcommands and all 16 option flags (DB-S3 mechanical update for
+    // DB-20, DB-22, DB-23, DB-24).
     for shell in ["bash", "zsh", "fish"] {
         let comp = run_cli_stdin_env(&["completions", shell], None, &[], 0);
+        let bash_sub_words: Vec<&str> = if shell == "bash" {
+            let line = comp
+                .stdout
+                .lines()
+                .find(|l| l.trim_start().starts_with("local subcommands=\""))
+                .expect("bash subcommands line");
+            line.split('"').nth(1).unwrap().split_whitespace().collect()
+        } else {
+            Vec::new()
+        };
         for sub in [
             "offer",
             "offer-batch",
@@ -5269,15 +5375,35 @@ fn cli_safe_credentials_env_fallbacks_version_and_completions() {
             "renew",
             "release",
             "complete",
+            "reset",
             "board",
+            "ready",
             "show",
             "history",
+            "compact",
             "completions",
         ] {
-            assert!(
-                comp.stdout.contains(sub),
-                "{shell} completions missing subcommand {sub}"
-            );
+            match shell {
+                "bash" => {
+                    assert!(
+                        bash_sub_words.contains(&sub),
+                        "bash subcommands variable missing word {sub}"
+                    );
+                }
+                "zsh" => {
+                    assert!(
+                        comp.stdout.contains(&format!("'{sub}:")),
+                        "zsh completions missing subcommand anchor '{sub}:"
+                    );
+                }
+                "fish" => {
+                    assert!(
+                        comp.stdout.contains(&format!("-a {sub} -d")),
+                        "fish completions missing subcommand anchor -a {sub} -d"
+                    );
+                }
+                _ => unreachable!(),
+            }
         }
         for flag in [
             "--help",
@@ -5285,11 +5411,17 @@ fn cli_safe_credentials_env_fallbacks_version_and_completions() {
             "--json",
             "--registry",
             "--note",
+            "--priority",
+            "--tag",
+            "--depends-on",
+            "--max-takeovers",
             "--file",
             "--holder",
             "--ttl",
             "--token",
             "--epoch",
+            "--through-seq",
+            "--archive",
         ] {
             assert!(
                 comp.stdout.contains(flag),
@@ -5303,11 +5435,17 @@ fn cli_safe_credentials_env_fallbacks_version_and_completions() {
                 "-l json",
                 "-l registry",
                 "-l note",
+                "-l priority",
+                "-l tag",
+                "-l depends-on",
+                "-l max-takeovers",
                 "-l file",
                 "-l holder",
                 "-l ttl",
                 "-l token",
                 "-l epoch",
+                "-l through-seq",
+                "-l archive",
             ] {
                 assert!(
                     comp.stdout.contains(opt),

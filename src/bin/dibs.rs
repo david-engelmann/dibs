@@ -20,12 +20,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use dibs::{
-    escape_json_string, parse_offer_batch_jsonl, ClaimGranted, Error, Event, Instant, ItemDetail,
-    Registry, Value,
+    escape_json_string, parse_offer_batch_jsonl, validate_max_takeovers, validate_name,
+    validate_priority, validate_through_seq, ClaimGranted, CompactSummary, Error, Event, Instant,
+    ItemDetail, OfferSpec, Registry, Value, PRIORITY_DEFAULT,
 };
 
-const MAIN_USAGE: &str = "usage: dibs [-h] [-V] [-j] [--registry REGISTRY]\n            {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions} ...";
-const COMMANDS: [&str; 11] = [
+const MAIN_USAGE: &str = "usage: dibs [-h] [-V] [-j] [--registry REGISTRY]\n            {offer,offer-batch,claim,claim-next,renew,release,complete,reset,board,ready,show,history,compact,completions} ...";
+const COMMANDS: [&str; 14] = [
     "offer",
     "offer-batch",
     "claim",
@@ -33,20 +34,23 @@ const COMMANDS: [&str; 11] = [
     "renew",
     "release",
     "complete",
+    "reset",
     "board",
+    "ready",
     "show",
     "history",
+    "compact",
     "completions",
 ];
 
 const MAIN_HELP: &str = "usage: dibs [-h] [-V] [-j] [--registry REGISTRY]
-            {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions} ...
+            {offer,offer-batch,claim,claim-next,renew,release,complete,reset,board,ready,show,history,compact,completions} ...
 
 Claim tasks from a shared backlog under leases that expire unless they are
 renewed.
 
 positional arguments:
-  {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions}
+  {offer,offer-batch,claim,claim-next,renew,release,complete,reset,board,ready,show,history,compact,completions}
     offer               add an item to the backlog
     offer-batch         add a batch of items from JSON Lines input
     claim               lease an item under a new claim
@@ -54,9 +58,12 @@ positional arguments:
     renew               extend the standing lease from its current expiry
     release             end the standing lease early
     complete            mark the item done under its standing lease
+    reset               reset an exhausted item back to open
     board               show the open and claimed items
+    ready               show ready items ordered by priority and offer order
     show                show the standing detail of one item
     history             show the recorded claim history
+    compact             archive history events through a sequence number
     completions         print shell completion script
 
 options:
@@ -68,13 +75,15 @@ options:
 
 fn sub_usage(command: &str) -> &'static str {
     match command {
-        "offer" => "usage: dibs offer [-h] [-j] [--registry REGISTRY] [--note NOTE] item",
+        "offer" => {
+            "usage: dibs offer [-h] [-j] [--registry REGISTRY] [--note NOTE]\n                  [--priority PRIORITY] [--tag TAG] [--depends-on ITEM]\n                  [--max-takeovers MAX_TAKEOVERS] item"
+        }
         "offer-batch" => "usage: dibs offer-batch [-h] [-j] [--registry REGISTRY] [--file FILE]",
         "claim" => {
             "usage: dibs claim [-h] [-j] [--registry REGISTRY] --holder HOLDER --ttl TTL\n                  item"
         }
         "claim-next" => {
-            "usage: dibs claim-next [-h] [-j] [--registry REGISTRY] --holder HOLDER --ttl TTL"
+            "usage: dibs claim-next [-h] [-j] [--registry REGISTRY] --holder HOLDER\n                       --ttl TTL [--tag TAG]"
         }
         "renew" => {
             "usage: dibs renew [-h] [-j] [--registry REGISTRY] --holder HOLDER\n                  [--token TOKEN] --epoch EPOCH --ttl TTL item"
@@ -85,8 +94,13 @@ fn sub_usage(command: &str) -> &'static str {
         "complete" => {
             "usage: dibs complete [-h] [-j] [--registry REGISTRY] --holder HOLDER\n                     [--token TOKEN] --epoch EPOCH item"
         }
+        "reset" => "usage: dibs reset [-h] [-j] [--registry REGISTRY] item",
         "board" => "usage: dibs board [-h] [-j] [--registry REGISTRY]",
+        "ready" => "usage: dibs ready [-h] [-j] [--registry REGISTRY] [--tag TAG]",
         "show" => "usage: dibs show [-h] [-j] [--registry REGISTRY] item",
+        "compact" => {
+            "usage: dibs compact [-h] [-j] [--registry REGISTRY] --through-seq THROUGH_SEQ\n                    --archive ARCHIVE"
+        }
         "completions" => "usage: dibs completions [-h] {bash,zsh,fish}",
         _ => "usage: dibs history [-h] [-j] [--registry REGISTRY] [item]",
     }
@@ -101,7 +115,12 @@ fn sub_help(command: &str) -> String {
             "  -h, --help            show this help message and exit\n",
             "  -j, --json            emit deterministic JSON on stdout\n",
             "  --registry REGISTRY   the registry file holding the backlog\n",
-            "  --note NOTE           a short payload note for the item",
+            "  --note NOTE           a short payload note for the item\n",
+            "  --priority PRIORITY   task priority from 0 critical to 3 low\n",
+            "  --tag TAG             repeatable capability tag for the item\n",
+            "  --depends-on ITEM     repeatable prerequisite item id\n",
+            "  --max-takeovers MAX_TAKEOVERS\n",
+            "                        maximum takeovers before item becomes exhausted",
         ),
         "offer-batch" => concat!(
             "options:\n",
@@ -126,7 +145,8 @@ fn sub_help(command: &str) -> String {
             "  -j, --json            emit deterministic JSON on stdout\n",
             "  --registry REGISTRY   the registry file holding the backlog\n",
             "  --holder HOLDER\n",
-            "  --ttl TTL             the lease length in seconds",
+            "  --ttl TTL             the lease length in seconds\n",
+            "  --tag TAG             repeatable required capability tag",
         ),
         "renew" => concat!(
             "positional arguments:\n",
@@ -151,11 +171,26 @@ fn sub_help(command: &str) -> String {
             "  --token TOKEN         lease bearer token, - for stdin, or DIBS_TOKEN\n",
             "  --epoch EPOCH",
         ),
+        "reset" => concat!(
+            "positional arguments:\n",
+            "  item\n\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog",
+        ),
         "board" => concat!(
             "options:\n",
             "  -h, --help            show this help message and exit\n",
             "  -j, --json            emit deterministic JSON on stdout\n",
             "  --registry REGISTRY   the registry file holding the backlog",
+        ),
+        "ready" => concat!(
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --tag TAG             repeatable required capability tag",
         ),
         "show" => concat!(
             "positional arguments:\n",
@@ -164,6 +199,15 @@ fn sub_help(command: &str) -> String {
             "  -h, --help            show this help message and exit\n",
             "  -j, --json            emit deterministic JSON on stdout\n",
             "  --registry REGISTRY   the registry file holding the backlog",
+        ),
+        "compact" => concat!(
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --through-seq THROUGH_SEQ\n",
+            "                        inclusive sequence number to compact through\n",
+            "  --archive ARCHIVE     JSON Lines archive file path",
         ),
         "completions" => concat!(
             "positional arguments:\n",
@@ -188,11 +232,20 @@ fn sub_help(command: &str) -> String {
 /// ambiguity messages follow.
 fn value_options(command: &str) -> &'static [&'static str] {
     match command {
-        "offer" => &["--note"],
+        "offer" => &[
+            "--note",
+            "--priority",
+            "--tag",
+            "--depends-on",
+            "--max-takeovers",
+        ],
         "offer-batch" => &["--file"],
-        "claim" | "claim-next" => &["--holder", "--ttl"],
+        "claim" => &["--holder", "--ttl"],
+        "claim-next" => &["--holder", "--ttl", "--tag"],
         "renew" => &["--holder", "--token", "--epoch", "--ttl"],
         "release" | "complete" => &["--holder", "--token", "--epoch"],
+        "ready" => &["--tag"],
+        "compact" => &["--through-seq", "--archive"],
         _ => &[],
     }
 }
@@ -202,13 +255,14 @@ fn required_options(command: &str) -> &'static [&'static str] {
         "claim" | "claim-next" => &["--holder", "--ttl"],
         "renew" => &["--holder", "--token", "--epoch", "--ttl"],
         "release" | "complete" => &["--holder", "--token", "--epoch"],
+        "compact" => &["--through-seq", "--archive"],
         _ => &[],
     }
 }
 
 fn positional_names(command: &str) -> &'static [&'static str] {
     match command {
-        "offer-batch" | "claim-next" | "board" => &[],
+        "offer-batch" | "claim-next" | "board" | "ready" | "compact" => &[],
         "completions" => &["shell"],
         _ => &["item"],
     }
@@ -218,7 +272,7 @@ fn positional_names(command: &str) -> &'static [&'static str] {
 /// ones it merely accepts: history takes an optional item.
 fn required_positionals(command: &str) -> &'static [&'static str] {
     match command {
-        "offer-batch" | "claim-next" | "board" | "history" => &[],
+        "offer-batch" | "claim-next" | "board" | "ready" | "compact" | "history" => &[],
         "completions" => &["shell"],
         _ => &["item"],
     }
@@ -227,12 +281,15 @@ fn required_positionals(command: &str) -> &'static [&'static str] {
 fn is_int_option(command: &str, option: &str) -> bool {
     matches!(
         (command, option),
-        ("claim", "--ttl")
+        ("offer", "--priority")
+            | ("offer", "--max-takeovers")
+            | ("claim", "--ttl")
             | ("claim-next", "--ttl")
             | ("renew", "--epoch")
             | ("renew", "--ttl")
             | ("release", "--epoch")
             | ("complete", "--epoch")
+            | ("compact", "--through-seq")
     )
 }
 
@@ -248,6 +305,13 @@ fn parser_error(usage: &'static str, prog: &str, message: String) -> ParserError
         prog: prog.to_string(),
         message,
     }
+}
+
+fn is_base64url_bearer_token(token: &str) -> bool {
+    token.len() == 43
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn is_option_like(token: &str) -> bool {
@@ -300,6 +364,7 @@ struct SubArgs {
     options: Vec<(String, SubValue)>,
     registry_path: Option<PathBuf>,
     file_path: Option<OsString>,
+    archive_path: Option<PathBuf>,
     json: bool,
     extras: Vec<String>,
 }
@@ -505,6 +570,7 @@ fn parse_sub(command: &str, tokens: &[OsString]) -> Result<SubArgs, ParserError>
     let path_options: &[&str] = match command {
         "completions" => &[],
         "offer-batch" => &["--registry", "--file"],
+        "compact" => &["--registry", "--archive"],
         _ => &["--registry"],
     };
     let positional_count = positional_names(command).len();
@@ -513,6 +579,7 @@ fn parse_sub(command: &str, tokens: &[OsString]) -> Result<SubArgs, ParserError>
         options: Vec::new(),
         registry_path: None,
         file_path: None,
+        archive_path: None,
         json: false,
         extras: Vec::new(),
     };
@@ -527,6 +594,8 @@ fn parse_sub(command: &str, tokens: &[OsString]) -> Result<SubArgs, ParserError>
             {
                 if opt == "--registry" {
                     result.registry_path = Some(PathBuf::from(raw_val));
+                } else if opt == "--archive" {
+                    result.archive_path = Some(PathBuf::from(raw_val));
                 } else {
                     result.file_path = Some(raw_val);
                 }
@@ -617,6 +686,24 @@ fn parse_sub(command: &str, tokens: &[OsString]) -> Result<SubArgs, ParserError>
                     }
                     continue;
                 }
+                Ok(Some("--archive")) => {
+                    if let Some(value) = inline_value {
+                        result.archive_path = Some(PathBuf::from(value));
+                        index += 1;
+                    } else if index + 1 < tokens.len()
+                        && !tokens[index + 1].to_str().is_some_and(is_option_like)
+                    {
+                        result.archive_path = Some(PathBuf::from(&tokens[index + 1]));
+                        index += 2;
+                    } else {
+                        return Err(parser_error(
+                            sub_usage(command),
+                            &format!("dibs {command}"),
+                            "argument --archive: expected one argument".to_string(),
+                        ));
+                    }
+                    continue;
+                }
                 Ok(Some(option)) => {
                     let raw = if let Some(value) = inline_value {
                         index += 1;
@@ -629,7 +716,9 @@ fn parse_sub(command: &str, tokens: &[OsString]) -> Result<SubArgs, ParserError>
                                 "an argument is not valid Unicode text".to_string(),
                             ));
                         };
-                        if is_option_like(next_str) {
+                        if !(option == "--token" && is_base64url_bearer_token(next_str))
+                            && is_option_like(next_str)
+                        {
                             return Err(parser_error(
                                 sub_usage(command),
                                 &format!("dibs {command}"),
@@ -724,6 +813,22 @@ fn option_text<'a>(args: &'a SubArgs, name: &str) -> Option<&'a str> {
     })
 }
 
+fn option_texts(args: &SubArgs, name: &str) -> Vec<String> {
+    args.options
+        .iter()
+        .filter_map(|(seen, value)| {
+            if seen == name {
+                match value {
+                    SubValue::Text(text) => Some(text.clone()),
+                    SubValue::Int(_) => None,
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn option_int<'a>(args: &'a SubArgs, name: &str) -> Option<&'a Value> {
     args.options.iter().rev().find_map(|(seen, value)| {
         if seen == name {
@@ -749,6 +854,8 @@ fn require(command: &str, args: &SubArgs) -> Result<(), ParserError> {
             option_int(args, name).is_some()
         } else if *name == "--token" {
             option_text(args, name).is_some() || std::env::var_os("DIBS_TOKEN").is_some()
+        } else if *name == "--archive" {
+            args.archive_path.is_some()
         } else {
             option_text(args, name).is_some()
         };
@@ -995,6 +1102,18 @@ fn render_event_json(event: &Event, out: &mut String) {
     out.push('}');
 }
 
+fn render_compact_json(summary: &CompactSummary, archive_utf8: &str) -> String {
+    let mut out = format!(
+        "{{\"through_seq\": {}, \"archived_count\": {}, \"remaining_count\": {}, \"archived_events_sha256\": ",
+        summary.through_seq, summary.archived_count, summary.remaining_count
+    );
+    escape_json_string(&summary.archived_events_sha256, &mut out);
+    out.push_str(", \"archive_path\": ");
+    escape_json_string(archive_utf8, &mut out);
+    out.push('}');
+    out
+}
+
 fn escape_note_line(note: &str) -> String {
     let mut out = String::with_capacity(note.len());
     for ch in note.chars() {
@@ -1049,21 +1168,21 @@ fn completion_script(shell: &str) -> &'static str {
             "    local cur prev words cword subcmd=\"\"\n",
             "    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n",
             "    prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n",
-            "    local subcommands=\"offer offer-batch claim claim-next renew release complete board show history completions\"\n",
+            "    local subcommands=\"offer offer-batch claim claim-next renew release complete reset board ready show history compact completions\"\n",
             "    local global_opts=\"-h --help -V --version -j --json --registry\"\n",
             "    local i\n",
             "    for ((i=1; i<COMP_CWORD; i++)); do\n",
             "        case \"${COMP_WORDS[i]}\" in\n",
-            "            --registry|--file|--note|--holder|--ttl|--token|--epoch)\n",
+            "            --registry|--file|--archive|--note|--priority|--tag|--depends-on|--max-takeovers|--holder|--ttl|--token|--epoch|--through-seq)\n",
             "                ((i++))\n",
             "                ;;\n",
-            "            offer|offer-batch|claim|claim-next|renew|release|complete|board|show|history|completions)\n",
+            "            offer|offer-batch|claim|claim-next|renew|release|complete|reset|board|ready|show|history|compact|completions)\n",
             "                subcmd=\"${COMP_WORDS[i]}\"\n",
             "                break\n",
             "                ;;\n",
             "        esac\n",
             "    done\n",
-            "    if [[ \"$prev\" == \"--registry\" || \"$prev\" == \"--file\" ]]; then\n",
+            "    if [[ \"$prev\" == \"--registry\" || \"$prev\" == \"--file\" || \"$prev\" == \"--archive\" ]]; then\n",
             "        local IFS=$'\\n'\n",
             "        COMPREPLY=($(compgen -f -- \"$cur\"))\n",
             "        return 0\n",
@@ -1078,17 +1197,23 @@ fn completion_script(shell: &str) -> &'static str {
             "    fi\n",
             "    case \"$subcmd\" in\n",
             "        offer)\n",
-            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --note\" -- \"$cur\")) ;;\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --note --priority --tag --depends-on --max-takeovers\" -- \"$cur\")) ;;\n",
             "        offer-batch)\n",
             "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --file\" -- \"$cur\")) ;;\n",
-            "        claim|claim-next)\n",
+            "        claim)\n",
             "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --holder --ttl\" -- \"$cur\")) ;;\n",
+            "        claim-next)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --holder --ttl --tag\" -- \"$cur\")) ;;\n",
             "        renew)\n",
             "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --holder --token --epoch --ttl\" -- \"$cur\")) ;;\n",
             "        release|complete)\n",
             "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --holder --token --epoch\" -- \"$cur\")) ;;\n",
-            "        board|show|history)\n",
+            "        ready)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --tag\" -- \"$cur\")) ;;\n",
+            "        reset|board|show|history)\n",
             "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry\" -- \"$cur\")) ;;\n",
+            "        compact)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --through-seq --archive\" -- \"$cur\")) ;;\n",
             "        completions)\n",
             "            COMPREPLY=($(compgen -W \"-h --help bash zsh fish\" -- \"$cur\")) ;;\n",
             "    esac\n",
@@ -1107,9 +1232,12 @@ fn completion_script(shell: &str) -> &'static str {
             "        'renew:extend the standing lease from its current expiry'\n",
             "        'release:end the standing lease early'\n",
             "        'complete:mark the item done under its standing lease'\n",
+            "        'reset:reset an exhausted item back to open'\n",
             "        'board:show the open and claimed items'\n",
+            "        'ready:show ready items ordered by priority and offer order'\n",
             "        'show:show the standing detail of one item'\n",
             "        'history:show the recorded claim history'\n",
+            "        'compact:archive history events through a sequence number'\n",
             "        'completions:print shell completion script'\n",
             "    )\n",
             "    _arguments -C \\\n",
@@ -1125,14 +1253,16 @@ fn completion_script(shell: &str) -> &'static str {
             "            ;;\n",
             "        args)\n",
             "            case \"$words[1]\" in\n",
-            "                offer) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--note=:note:' '1:item:' ;;\n",
+            "                offer) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--note=:note:' '--priority=:priority:(0 1 2 3)' '*--tag=:tag:' '*--depends-on=:item:' '--max-takeovers=:max_takeovers:' '1:item:' ;;\n",
             "                offer-batch) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--file=:file:_files' ;;\n",
             "                claim) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--ttl=:ttl:' '1:item:' ;;\n",
-            "                claim-next) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--ttl=:ttl:' ;;\n",
+            "                claim-next) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--ttl=:ttl:' '*--tag=:tag:' ;;\n",
             "                renew) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--token=:token:' '--epoch=:epoch:' '--ttl=:ttl:' '1:item:' ;;\n",
             "                release|complete) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--token=:token:' '--epoch=:epoch:' '1:item:' ;;\n",
             "                board) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' ;;\n",
-            "                show|history) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '1:item:' ;;\n",
+            "                ready) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '*--tag=:tag:' ;;\n",
+            "                reset|show|history) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '1:item:' ;;\n",
+            "                compact) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--through-seq=:through_seq:' '--archive=:archive:_files' ;;\n",
             "                completions) _arguments '(-h --help)'{-h,--help} '1:shell:(bash zsh fish)' ;;\n",
             "            esac\n",
             "            ;;\n",
@@ -1153,16 +1283,25 @@ fn completion_script(shell: &str) -> &'static str {
             "complete -c dibs -n '__fish_use_subcommand' -a renew -d 'extend the standing lease from its current expiry'\n",
             "complete -c dibs -n '__fish_use_subcommand' -a release -d 'end the standing lease early'\n",
             "complete -c dibs -n '__fish_use_subcommand' -a complete -d 'mark the item done under its standing lease'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a reset -d 'reset an exhausted item back to open'\n",
             "complete -c dibs -n '__fish_use_subcommand' -a board -d 'show the open and claimed items'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a ready -d 'show ready items ordered by priority and offer order'\n",
             "complete -c dibs -n '__fish_use_subcommand' -a show -d 'show the standing detail of one item'\n",
             "complete -c dibs -n '__fish_use_subcommand' -a history -d 'show the recorded claim history'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a compact -d 'archive history events through a sequence number'\n",
             "complete -c dibs -n '__fish_use_subcommand' -a completions -d 'print shell completion script'\n",
             "complete -c dibs -n '__fish_seen_subcommand_from offer' -l note -r -d 'a short payload --note for the item'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from offer' -l priority -r -d 'task --priority from 0 to 3'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from offer claim-next ready' -l tag -r -d 'capability --tag'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from offer' -l depends-on -r -d 'prerequisite item id for --depends-on'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from offer' -l max-takeovers -r -d 'maximum takeovers for --max-takeovers'\n",
             "complete -c dibs -n '__fish_seen_subcommand_from offer-batch' -l file -r -F -d 'JSON Lines batch --file, or - for standard input'\n",
             "complete -c dibs -n '__fish_seen_subcommand_from claim claim-next renew release complete' -l holder -r -d 'lease --holder id'\n",
             "complete -c dibs -n '__fish_seen_subcommand_from claim claim-next renew' -l ttl -r -d 'lease --ttl length in seconds'\n",
             "complete -c dibs -n '__fish_seen_subcommand_from renew release complete' -l token -r -d 'lease bearer --token'\n",
             "complete -c dibs -n '__fish_seen_subcommand_from renew release complete' -l epoch -r -d 'standing fencing --epoch'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from compact' -l through-seq -r -d 'sequence bound for --through-seq'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from compact' -l archive -r -F -d 'JSON Lines --archive file'\n",
             "complete -c dibs -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'\n",
         ),
     }
@@ -1319,7 +1458,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
                 MAIN_USAGE,
                 "dibs",
                 &format!(
-                    "argument command: invalid choice: {} (choose from 'offer', 'offer-batch', 'claim', 'claim-next', 'renew', 'release', 'complete', 'board', 'show', 'history', 'completions')",
+                    "argument command: invalid choice: {} (choose from 'offer', 'offer-batch', 'claim', 'claim-next', 'renew', 'release', 'complete', 'reset', 'board', 'ready', 'show', 'history', 'compact', 'completions')",
                     dibs::py_repr(token)
                 ),
             ));
@@ -1408,9 +1547,25 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
     match command.as_str() {
         "offer" => {
             let item = item.unwrap();
+            validate_name(&Value::Str(item.clone()), "item")?;
             let note = option_text(&args, "--note").unwrap_or("");
+            let priority = match option_int(&args, "--priority") {
+                Some(val) => validate_priority(val)?,
+                None => PRIORITY_DEFAULT,
+            };
+            let tags = option_texts(&args, "--tag");
+            let depends_on = option_texts(&args, "--depends-on");
+            let max_takeovers = match option_int(&args, "--max-takeovers") {
+                Some(val) => validate_max_takeovers(val)?,
+                None => None,
+            };
+            let spec = OfferSpec::new(&item, note)
+                .with_priority(priority)
+                .with_tags(tags)
+                .with_depends_on(depends_on)
+                .with_max_takeovers(max_takeovers);
             let now = Instant::now_utc()?;
-            registry.offer(&item, note, &now)?;
+            registry.offer_with(&spec, &now)?;
             if json_mode {
                 let mut out = String::from("{\"item\": ");
                 escape_json_string(&item, &mut out);
@@ -1455,8 +1610,9 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
         "claim-next" => {
             let holder = option_text(&args, "--holder").unwrap();
             let ttl = ttl_argument_holder(holder, option_int(&args, "--ttl").unwrap())?;
+            let tags = option_texts(&args, "--tag");
             let now = Instant::now_utc()?;
-            let granted = registry.claim_next(holder, ttl, &now)?;
+            let granted = registry.claim_next_with_tags(holder, ttl, &tags, &now)?;
             if json_mode {
                 out_line(format_args!("{}", render_claim_json(&granted)));
             } else {
@@ -1525,6 +1681,22 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
                 out_line(format_args!("completed {item}"));
             }
         }
+        "reset" => {
+            let item = item.unwrap();
+            let now = Instant::now_utc()?;
+            let detail = registry.reset(&item, &now)?;
+            if json_mode {
+                let mut out = String::from("{\"item\": ");
+                escape_json_string(&item, &mut out);
+                out.push_str(&format!(
+                    ", \"status\": \"open\", \"epoch\": {}, \"takeover_count\": 0}}",
+                    detail.epoch
+                ));
+                out_line(format_args!("{out}"));
+            } else {
+                out_line(format_args!("reset {item}"));
+            }
+        }
         "board" => {
             let now = Instant::now_utc()?;
             if json_mode {
@@ -1549,8 +1721,31 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
                             row.epoch
                         ));
                     } else {
-                        out_line(format_args!("{} open epoch={}", row.id, row.epoch));
+                        out_line(format_args!(
+                            "{} {} epoch={}",
+                            row.id, row.status, row.epoch
+                        ));
                     }
+                }
+            }
+        }
+        "ready" => {
+            let tags = option_texts(&args, "--tag");
+            let now = Instant::now_utc()?;
+            let ready_items = registry.ready(&tags, &now)?;
+            if json_mode {
+                let mut out = String::from("[");
+                for (idx, detail) in ready_items.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    render_item_detail_json(detail, &mut out);
+                }
+                out.push(']');
+                out_line(format_args!("{out}"));
+            } else {
+                for detail in ready_items {
+                    out_line(format_args!("{} open epoch={}", detail.id, detail.epoch));
                 }
             }
         }
@@ -1564,6 +1759,37 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
                 out_line(format_args!("{out}"));
             } else {
                 print_item_detail_human(&detail);
+            }
+        }
+        "compact" => {
+            let through_seq = validate_through_seq(option_int(&args, "--through-seq").unwrap())?;
+            let archive_path = args.archive_path.as_ref().unwrap();
+            registry.validate_registry_path()?;
+            registry.validate_archive_path(archive_path)?;
+            let archive_utf8 = if json_mode {
+                match archive_path.to_str() {
+                    Some(text) => Some(text),
+                    None => {
+                        return Err(Error::InvalidRequest(
+                            "--json requires a UTF-8 --archive path".to_string(),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            let now = Instant::now_utc()?;
+            let summary = registry.compact(through_seq, archive_path, &now)?;
+            if json_mode {
+                out_line(format_args!(
+                    "{}",
+                    render_compact_json(&summary, archive_utf8.unwrap())
+                ));
+            } else {
+                out_line(format_args!(
+                    "compacted {} events through seq {}",
+                    summary.archived_count, summary.through_seq
+                ));
             }
         }
         _ => {
