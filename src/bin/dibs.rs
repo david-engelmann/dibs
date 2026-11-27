@@ -1,95 +1,196 @@
 //! Command line for dibs, a thin shell over the dibs library.
 //!
-//! Every command names the registry file first. The clock the
-//! command line uses is the wall clock in UTC, and no flag
-//! overrides it, so the expiry a caller sees is the expiry the
-//! machine clock gives. Errors the protocol raises are printed
-//! as one line on stderr with the exit code the error carries,
-//! and no traceback is ever printed for them. The argument parser
-//! mirrors the Python argparse surface of the Round 1 command
-//! line: the same usage texts, the same parser error messages at
-//! exit 2, unambiguous prefix abbreviations of long options, the
-//! equals form, and parser extras reported by the top level
-//! parser. Arguments are read from the operating system
-//! unconverted: the registry path is carried as a path, and an
-//! argument that is not Unicode text in any other position is
-//! refused as a parser error, never a panic.
+//! The registry file may be named before or after the subcommand
+//! with --registry, or supplied through DIBS_REGISTRY when omitted.
+//! The clock the command line uses is the wall clock in UTC, and no
+//! flag overrides it, so the expiry a caller sees is the expiry the
+//! machine clock gives. Errors the protocol raises are printed as
+//! one line on stderr with the exit code the error carries, and no
+//! traceback is ever printed for them. The argument parser mirrors
+//! the Python argparse surface of the Round 1 command line: the same
+//! parser error shapes at exit 2, unambiguous prefix abbreviations
+//! of long options, the equals form, and parser extras reported by
+//! the top level parser. Arguments are read from the operating
+//! system unconverted: path arguments (--registry and --file) are
+//! carried as raw paths, and an argument that is not Unicode text in
+//! any other position is refused as a parser error, never a panic.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use dibs::{Error, Instant, Registry, Value};
+use dibs::{
+    escape_json_string, parse_offer_batch_jsonl, ClaimGranted, Error, Event, Instant, ItemDetail,
+    Registry, Value,
+};
 
-const MAIN_USAGE: &str = "usage: dibs [-h] --registry REGISTRY\n            {offer,claim,renew,release,complete,board,history} ...";
-const COMMANDS: [&str; 7] = [
-    "offer", "claim", "renew", "release", "complete", "board", "history",
+const MAIN_USAGE: &str = "usage: dibs [-h] [-V] [-j] [--registry REGISTRY]\n            {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions} ...";
+const COMMANDS: [&str; 11] = [
+    "offer",
+    "offer-batch",
+    "claim",
+    "claim-next",
+    "renew",
+    "release",
+    "complete",
+    "board",
+    "show",
+    "history",
+    "completions",
 ];
 
-const MAIN_HELP: &str = "usage: dibs [-h] --registry REGISTRY
-            {offer,claim,renew,release,complete,board,history} ...
+const MAIN_HELP: &str = "usage: dibs [-h] [-V] [-j] [--registry REGISTRY]
+            {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions} ...
 
 Claim tasks from a shared backlog under leases that expire unless they are
 renewed.
 
 positional arguments:
-  {offer,claim,renew,release,complete,board,history}
+  {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions}
     offer               add an item to the backlog
+    offer-batch         add a batch of items from JSON Lines input
     claim               lease an item under a new claim
+    claim-next          lease the first ready item in the backlog
     renew               extend the standing lease from its current expiry
     release             end the standing lease early
     complete            mark the item done under its standing lease
     board               show the open and claimed items
+    show                show the standing detail of one item
     history             show the recorded claim history
+    completions         print shell completion script
 
 options:
   -h, --help            show this help message and exit
-  --registry REGISTRY   the registry file holding the backlog, created by the
-                        first mutation";
+  -V, --version         show program version and exit
+  -j, --json            emit deterministic JSON on stdout
+  --registry REGISTRY   the registry file holding the backlog, or DIBS_REGISTRY
+                        when omitted, created by the first mutation";
 
 fn sub_usage(command: &str) -> &'static str {
     match command {
-        "offer" => "usage: dibs offer [-h] [--note NOTE] item",
-        "claim" => "usage: dibs claim [-h] --holder HOLDER --ttl TTL item",
-        "renew" => {
-            "usage: dibs renew [-h] --holder HOLDER --token TOKEN --epoch EPOCH --ttl TTL\n                  item"
+        "offer" => "usage: dibs offer [-h] [-j] [--registry REGISTRY] [--note NOTE] item",
+        "offer-batch" => "usage: dibs offer-batch [-h] [-j] [--registry REGISTRY] [--file FILE]",
+        "claim" => {
+            "usage: dibs claim [-h] [-j] [--registry REGISTRY] --holder HOLDER --ttl TTL\n                  item"
         }
-        "release" => "usage: dibs release [-h] --holder HOLDER --token TOKEN --epoch EPOCH item",
-        "complete" => "usage: dibs complete [-h] --holder HOLDER --token TOKEN --epoch EPOCH item",
-        "board" => "usage: dibs board [-h]",
-        _ => "usage: dibs history [-h] [item]",
+        "claim-next" => {
+            "usage: dibs claim-next [-h] [-j] [--registry REGISTRY] --holder HOLDER --ttl TTL"
+        }
+        "renew" => {
+            "usage: dibs renew [-h] [-j] [--registry REGISTRY] --holder HOLDER\n                  [--token TOKEN] --epoch EPOCH --ttl TTL item"
+        }
+        "release" => {
+            "usage: dibs release [-h] [-j] [--registry REGISTRY] --holder HOLDER\n                    [--token TOKEN] --epoch EPOCH item"
+        }
+        "complete" => {
+            "usage: dibs complete [-h] [-j] [--registry REGISTRY] --holder HOLDER\n                     [--token TOKEN] --epoch EPOCH item"
+        }
+        "board" => "usage: dibs board [-h] [-j] [--registry REGISTRY]",
+        "show" => "usage: dibs show [-h] [-j] [--registry REGISTRY] item",
+        "completions" => "usage: dibs completions [-h] {bash,zsh,fish}",
+        _ => "usage: dibs history [-h] [-j] [--registry REGISTRY] [item]",
     }
 }
 
 fn sub_help(command: &str) -> String {
     let body = match command {
-        "offer" => {
-            "positional arguments:\n  item\n\noptions:\n  -h, --help   show this help message and exit\n  --note NOTE  a short payload note for the item"
-        }
-        "claim" => {
-            "positional arguments:\n  item\n\noptions:\n  -h, --help       show this help message and exit\n  --holder HOLDER\n  --ttl TTL        the lease length in seconds"
-        }
-        "renew" => {
-            "positional arguments:\n  item\n\noptions:\n  -h, --help       show this help message and exit\n  --holder HOLDER\n  --token TOKEN\n  --epoch EPOCH\n  --ttl TTL        the added lease length in seconds"
-        }
-        "release" | "complete" => {
-            "positional arguments:\n  item\n\noptions:\n  -h, --help       show this help message and exit\n  --holder HOLDER\n  --token TOKEN\n  --epoch EPOCH"
-        }
-        "board" => "options:\n  -h, --help  show this help message and exit",
-        _ => {
-            "positional arguments:\n  item\n\noptions:\n  -h, --help  show this help message and exit"
-        }
+        "offer" => concat!(
+            "positional arguments:\n",
+            "  item\n\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --note NOTE           a short payload note for the item",
+        ),
+        "offer-batch" => concat!(
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --file FILE           JSON Lines batch file, or - for standard input",
+        ),
+        "claim" => concat!(
+            "positional arguments:\n",
+            "  item\n\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --holder HOLDER\n",
+            "  --ttl TTL             the lease length in seconds",
+        ),
+        "claim-next" => concat!(
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --holder HOLDER\n",
+            "  --ttl TTL             the lease length in seconds",
+        ),
+        "renew" => concat!(
+            "positional arguments:\n",
+            "  item\n\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --holder HOLDER\n",
+            "  --token TOKEN         lease bearer token, - for stdin, or DIBS_TOKEN\n",
+            "  --epoch EPOCH\n",
+            "  --ttl TTL             the added lease length in seconds",
+        ),
+        "release" | "complete" => concat!(
+            "positional arguments:\n",
+            "  item\n\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --holder HOLDER\n",
+            "  --token TOKEN         lease bearer token, - for stdin, or DIBS_TOKEN\n",
+            "  --epoch EPOCH",
+        ),
+        "board" => concat!(
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog",
+        ),
+        "show" => concat!(
+            "positional arguments:\n",
+            "  item\n\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog",
+        ),
+        "completions" => concat!(
+            "positional arguments:\n",
+            "  {bash,zsh,fish}\n\n",
+            "options:\n",
+            "  -h, --help  show this help message and exit",
+        ),
+        _ => concat!(
+            "positional arguments:\n",
+            "  item\n\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog",
+        ),
     };
     format!("{}\n\n{body}", sub_usage(command))
 }
 
-/// The value options of one subcommand in the order the Python
-/// parser defined them, the order its required argument reports
-/// and its ambiguity messages follow.
+/// The value options of one subcommand in the order the parser
+/// defines them, the order its required argument reports and its
+/// ambiguity messages follow.
 fn value_options(command: &str) -> &'static [&'static str] {
     match command {
         "offer" => &["--note"],
-        "claim" => &["--holder", "--ttl"],
+        "offer-batch" => &["--file"],
+        "claim" | "claim-next" => &["--holder", "--ttl"],
         "renew" => &["--holder", "--token", "--epoch", "--ttl"],
         "release" | "complete" => &["--holder", "--token", "--epoch"],
         _ => &[],
@@ -98,7 +199,7 @@ fn value_options(command: &str) -> &'static [&'static str] {
 
 fn required_options(command: &str) -> &'static [&'static str] {
     match command {
-        "claim" => &["--holder", "--ttl"],
+        "claim" | "claim-next" => &["--holder", "--ttl"],
         "renew" => &["--holder", "--token", "--epoch", "--ttl"],
         "release" | "complete" => &["--holder", "--token", "--epoch"],
         _ => &[],
@@ -107,7 +208,8 @@ fn required_options(command: &str) -> &'static [&'static str] {
 
 fn positional_names(command: &str) -> &'static [&'static str] {
     match command {
-        "board" => &[],
+        "offer-batch" | "claim-next" | "board" => &[],
+        "completions" => &["shell"],
         _ => &["item"],
     }
 }
@@ -116,7 +218,8 @@ fn positional_names(command: &str) -> &'static [&'static str] {
 /// ones it merely accepts: history takes an optional item.
 fn required_positionals(command: &str) -> &'static [&'static str] {
     match command {
-        "board" | "history" => &[],
+        "offer-batch" | "claim-next" | "board" | "history" => &[],
+        "completions" => &["shell"],
         _ => &["item"],
     }
 }
@@ -125,6 +228,7 @@ fn is_int_option(command: &str, option: &str) -> bool {
     matches!(
         (command, option),
         ("claim", "--ttl")
+            | ("claim-next", "--ttl")
             | ("renew", "--epoch")
             | ("renew", "--ttl")
             | ("release", "--epoch")
@@ -167,14 +271,14 @@ fn is_option_like(token: &str) -> bool {
 /// parser, the argparse way: an exact match wins, an
 /// unambiguous prefix matches, an ambiguous prefix is an
 /// error, and no match means the token is an extra.
-fn resolve_long<'a>(name: &'a str, candidates: &[&'a str]) -> Result<Option<&'a str>, String> {
-    if candidates.contains(&name) {
-        return Ok(Some(name));
+fn resolve_long<'a>(name: &str, candidates: &[&'a str]) -> Result<Option<&'a str>, String> {
+    if let Some(&exact) = candidates.iter().find(|&&candidate| candidate == name) {
+        return Ok(Some(exact));
     }
-    let matches: Vec<&str> = candidates
+    let matches: Vec<&'a str> = candidates
         .iter()
         .filter(|candidate| candidate.starts_with(name))
-        .cloned()
+        .copied()
         .collect();
     match matches.len() {
         0 => Ok(None),
@@ -194,6 +298,9 @@ enum SubValue {
 struct SubArgs {
     positionals: Vec<String>,
     options: Vec<(String, SubValue)>,
+    registry_path: Option<PathBuf>,
+    file_path: Option<OsString>,
+    json: bool,
     extras: Vec<String>,
 }
 
@@ -298,11 +405,6 @@ fn py_digit_value(c: char) -> Option<u32> {
 /// validation prints the number the caller typed rather than a
 /// parser failure.
 fn python_int(text: &str) -> Option<Value> {
-    // The trim set is the Python integer conversion's own,
-    // which is the Unicode whitespace set exactly. The wider
-    // set str.strip takes adds the separator controls U+001C
-    // to U+001F, and the conversion refuses those, as a probe
-    // against the Python runtime shows.
     let trimmed = text.trim_matches(|c: char| c.is_whitespace());
     let (negative, body) = if let Some(rest) = trimmed.strip_prefix('-') {
         (true, rest)
@@ -336,12 +438,6 @@ fn python_int(text: &str) -> Option<Value> {
     if previous_underscore || !seen_digit {
         return None;
     }
-    // The conversion refuses a digit string past its limit of
-    // 4300 digits, counted over the digit characters as they
-    // stand collected here, leading zeros included and
-    // underscores excluded, so a longer string is no value at
-    // all and the argument draws the parser's invalid int
-    // value error.
     if digits.len() > 4300 {
         return None;
     }
@@ -364,27 +460,87 @@ fn python_int(text: &str) -> Option<Value> {
     }
 }
 
-/// Parse one subcommand's arguments. Option values are drawn
+/// Extract the raw OsString value of a path option in `--opt=value`
+/// form on Unix before Unicode conversion so non UTF-8 path bytes
+/// survive intact both before and after `<subcommand>`.
+#[cfg(unix)]
+fn path_equals_value<'a>(
+    token: &OsString,
+    candidates: &[&'a str],
+    path_options: &[&'a str],
+) -> Option<(&'a str, OsString)> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let bytes = token.as_bytes();
+    if !bytes.starts_with(b"--") {
+        return None;
+    }
+    let pos = bytes.iter().position(|&b| b == b'=')?;
+    if pos <= 2 {
+        return None;
+    }
+    let name = std::str::from_utf8(&bytes[..pos]).ok()?;
+    let matched = resolve_long(name, candidates).ok()??;
+    if path_options.contains(&matched) {
+        Some((matched, OsString::from_vec(bytes[pos + 1..].to_vec())))
+    } else {
+        None
+    }
+}
+
+/// Parse one subcommand's raw OsString arguments. Path options
+/// (--registry and --file) keep raw operating system bytes; every
+/// other token must be valid UTF-8 text. Option values are drawn
 /// from the following token unless it is option like, numeric
 /// options are converted as they are consumed, and tokens the
 /// subcommand does not consume are collected as extras for the
-/// top level parser to report. A double dash stops option
-/// handling, and when an extra follows it the dash itself is
-/// reported with the extras, as the Python parser reported it.
-fn parse_sub(command: &str, tokens: &[String]) -> Result<SubArgs, ParserError> {
-    let mut candidates: Vec<&str> = vec!["--help"];
+/// top level parser to report.
+fn parse_sub(command: &str, tokens: &[OsString]) -> Result<SubArgs, ParserError> {
+    let mut candidates: Vec<&str> = if command == "completions" {
+        vec!["--help"]
+    } else {
+        vec!["--help", "--json", "--registry"]
+    };
     candidates.extend_from_slice(value_options(command));
+    #[cfg(unix)]
+    let path_options: &[&str] = match command {
+        "completions" => &[],
+        "offer-batch" => &["--registry", "--file"],
+        _ => &["--registry"],
+    };
     let positional_count = positional_names(command).len();
     let mut result = SubArgs {
         positionals: Vec::new(),
         options: Vec::new(),
+        registry_path: None,
+        file_path: None,
+        json: false,
         extras: Vec::new(),
     };
     let mut index = 0;
     let mut after_separator = false;
     let mut separator_pending = false;
     while index < tokens.len() {
-        let token = &tokens[index];
+        #[cfg(unix)]
+        if !after_separator {
+            if let Some((opt, raw_val)) =
+                path_equals_value(&tokens[index], &candidates, path_options)
+            {
+                if opt == "--registry" {
+                    result.registry_path = Some(PathBuf::from(raw_val));
+                } else {
+                    result.file_path = Some(raw_val);
+                }
+                index += 1;
+                continue;
+            }
+        }
+        let Some(token) = tokens[index].to_str() else {
+            return Err(parser_error(
+                sub_usage(command),
+                &format!("dibs {command}"),
+                "an argument is not valid Unicode text".to_string(),
+            ));
+        };
         if !after_separator && token == "--" {
             after_separator = true;
             separator_pending = true;
@@ -395,24 +551,93 @@ fn parse_sub(command: &str, tokens: &[String]) -> Result<SubArgs, ParserError> {
             out_line(format_args!("{}", sub_help(command)));
             std::process::exit(0);
         }
+        if !after_separator && command != "completions" && token == "-j" {
+            result.json = true;
+            index += 1;
+            continue;
+        }
         if !after_separator && token.starts_with("--") && token.len() > 2 {
             let (name, inline_value) = match token.find('=') {
                 Some(pos) => (&token[..pos], Some(token[pos + 1..].to_string())),
-                None => (&token[..], None),
+                None => (token, None),
             };
             match resolve_long(name, &candidates) {
                 Ok(Some("--help")) => {
                     out_line(format_args!("{}", sub_help(command)));
                     std::process::exit(0);
                 }
+                Ok(Some("--json")) => {
+                    if let Some(value) = inline_value {
+                        return Err(parser_error(
+                            sub_usage(command),
+                            &format!("dibs {command}"),
+                            format!(
+                                "argument -j/--json: ignored explicit argument {}",
+                                dibs::py_repr(&value)
+                            ),
+                        ));
+                    }
+                    result.json = true;
+                    index += 1;
+                    continue;
+                }
+                Ok(Some("--registry")) => {
+                    if let Some(value) = inline_value {
+                        result.registry_path = Some(PathBuf::from(value));
+                        index += 1;
+                    } else if index + 1 < tokens.len()
+                        && !tokens[index + 1].to_str().is_some_and(is_option_like)
+                    {
+                        result.registry_path = Some(PathBuf::from(&tokens[index + 1]));
+                        index += 2;
+                    } else {
+                        return Err(parser_error(
+                            sub_usage(command),
+                            &format!("dibs {command}"),
+                            "argument --registry: expected one argument".to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                Ok(Some("--file")) => {
+                    if let Some(value) = inline_value {
+                        result.file_path = Some(OsString::from(value));
+                        index += 1;
+                    } else if index + 1 < tokens.len()
+                        && !tokens[index + 1].to_str().is_some_and(is_option_like)
+                    {
+                        result.file_path = Some(tokens[index + 1].clone());
+                        index += 2;
+                    } else {
+                        return Err(parser_error(
+                            sub_usage(command),
+                            &format!("dibs {command}"),
+                            "argument --file: expected one argument".to_string(),
+                        ));
+                    }
+                    continue;
+                }
                 Ok(Some(option)) => {
                     let raw = if let Some(value) = inline_value {
                         index += 1;
                         value
-                    } else if index + 1 < tokens.len() && !is_option_like(&tokens[index + 1]) {
-                        let value = tokens[index + 1].clone();
+                    } else if index + 1 < tokens.len() {
+                        let Some(next_str) = tokens[index + 1].to_str() else {
+                            return Err(parser_error(
+                                sub_usage(command),
+                                &format!("dibs {command}"),
+                                "an argument is not valid Unicode text".to_string(),
+                            ));
+                        };
+                        if is_option_like(next_str) {
+                            return Err(parser_error(
+                                sub_usage(command),
+                                &format!("dibs {command}"),
+                                format!("argument {option}: expected one argument"),
+                            ));
+                        }
                         index += 2;
-                        value
+                        next_str.to_string()
                     } else {
                         return Err(parser_error(
                             sub_usage(command),
@@ -450,7 +675,7 @@ fn parse_sub(command: &str, tokens: &[String]) -> Result<SubArgs, ParserError> {
                         result.extras.push("--".to_string());
                         separator_pending = false;
                     }
-                    result.extras.push(token.clone());
+                    result.extras.push(token.to_string());
                     index += 1;
                     continue;
                 }
@@ -468,18 +693,18 @@ fn parse_sub(command: &str, tokens: &[String]) -> Result<SubArgs, ParserError> {
                 result.extras.push("--".to_string());
                 separator_pending = false;
             }
-            result.extras.push(token.clone());
+            result.extras.push(token.to_string());
             index += 1;
             continue;
         }
         if result.positionals.len() < positional_count {
-            result.positionals.push(token.clone());
+            result.positionals.push(token.to_string());
         } else {
             if separator_pending {
                 result.extras.push("--".to_string());
                 separator_pending = false;
             }
-            result.extras.push(token.clone());
+            result.extras.push(token.to_string());
         }
         index += 1;
     }
@@ -522,6 +747,8 @@ fn require(command: &str, args: &SubArgs) -> Result<(), ParserError> {
     for name in required_options(command) {
         let present = if is_int_option(command, name) {
             option_int(args, name).is_some()
+        } else if *name == "--token" {
+            option_text(args, name).is_some() || std::env::var_os("DIBS_TOKEN").is_some()
         } else {
             option_text(args, name).is_some()
         };
@@ -546,18 +773,22 @@ fn require(command: &str, args: &SubArgs) -> Result<(), ParserError> {
 /// Write one line of command output through a locked stdout
 /// handle, and end the process quietly at exit 1 when the
 /// write fails (DB-A8).
-///
-/// The printing macros panic on a failed write, so a board
-/// piped into a reader that closes early died with a panic
-/// message at exit 101, and a claim whose token line could
-/// not be printed died the same way after its lease already
-/// stood. A failed write is an ordinary failure of the
-/// command, reported by the exit code alone.
 fn out_line(args: std::fmt::Arguments) {
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     if writeln!(lock, "{args}").is_err() {
+        std::process::exit(1);
+    }
+}
+
+/// Write raw text without appending an extra newline through a
+/// locked stdout handle, exiting quietly at exit 1 on failure.
+fn out_raw(text: &str) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    if lock.write_all(text.as_bytes()).is_err() {
         std::process::exit(1);
     }
 }
@@ -584,12 +815,6 @@ fn report_error(error: &Error) -> ExitCode {
     ExitCode::from(error.exit_code() as u8)
 }
 
-/// The time to live of a claim or renew, as a plain integer. The
-/// value the parser produced is validated through the library
-/// validator here when it is wider than the typed call carries,
-/// after the names have been validated in the order the library
-/// validates them, so the refusal and its wording are the
-/// library's own.
 fn ttl_argument(item: &str, holder: &str, value: &Value) -> Result<i64, Error> {
     match value {
         Value::Int(number) if *number >= i64::MIN as i128 && *number <= i64::MAX as i128 => {
@@ -603,15 +828,359 @@ fn ttl_argument(item: &str, holder: &str, value: &Value) -> Result<i64, Error> {
     }
 }
 
-/// The presented epoch of a guarded operation, as the integer
-/// the typed call carries. A value wider than the integer width
-/// is presented as a count no standing epoch can equal, and the
-/// possession check refuses it in its standing order.
+fn ttl_argument_holder(holder: &str, value: &Value) -> Result<i64, Error> {
+    match value {
+        Value::Int(number) if *number >= i64::MIN as i128 && *number <= i64::MAX as i128 => {
+            Ok(*number as i64)
+        }
+        _ => {
+            dibs::validate_name(&Value::Str(holder.to_string()), "holder")?;
+            dibs::validate_ttl(value)
+        }
+    }
+}
+
 fn epoch_argument(value: &Value) -> i128 {
     match value {
         Value::Int(number) => *number,
         _ => i128::MAX,
     }
+}
+
+fn read_stdin_token() -> Result<String, Error> {
+    use std::io::Read;
+    let stdin = std::io::stdin();
+    let mut buf = Vec::with_capacity(257);
+    stdin
+        .lock()
+        .take(257)
+        .read_to_end(&mut buf)
+        .map_err(|err| Error::Failure(format!("standard input cannot be read, {err}")))?;
+    if buf.len() > 256 {
+        return Err(Error::InvalidRequest(
+            "stdin token exceeds 256 bytes".to_string(),
+        ));
+    }
+    let text = std::str::from_utf8(&buf)
+        .map_err(|_| Error::InvalidRequest("stdin token is not valid UTF-8".to_string()))?;
+    let trimmed = text.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() {
+        return Err(Error::InvalidRequest("stdin token is empty".to_string()));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn resolve_token(args: &SubArgs) -> Result<String, Error> {
+    if let Some(cli_token) = option_text(args, "--token") {
+        if cli_token == "-" {
+            return read_stdin_token();
+        }
+        return Ok(cli_token.to_string());
+    }
+    let Some(raw) = std::env::var_os("DIBS_TOKEN") else {
+        return Err(Error::InvalidRequest(
+            "missing token, pass --token or set DIBS_TOKEN".to_string(),
+        ));
+    };
+    let text = raw
+        .into_string()
+        .map_err(|_| Error::InvalidRequest("DIBS_TOKEN is not valid UTF-8".to_string()))?;
+    if text.is_empty() {
+        return Err(Error::InvalidRequest("DIBS_TOKEN is empty".to_string()));
+    }
+    Ok(text)
+}
+
+fn read_offer_batch_input(file_arg: Option<&OsString>) -> Result<String, Error> {
+    let bytes = match file_arg {
+        None => {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .lock()
+                .read_to_end(&mut buf)
+                .map_err(|err| Error::Failure(format!("standard input cannot be read, {err}")))?;
+            buf
+        }
+        Some(path) if path.to_str() == Some("-") => {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .lock()
+                .read_to_end(&mut buf)
+                .map_err(|err| Error::Failure(format!("standard input cannot be read, {err}")))?;
+            buf
+        }
+        Some(path) => std::fs::read(PathBuf::from(path))
+            .map_err(|err| Error::Failure(format!("the offer batch file cannot be read, {err}")))?,
+    };
+    String::from_utf8(bytes).map_err(|err| {
+        Error::InvalidRequest(format!("offer batch input is not valid UTF-8, {err}"))
+    })
+}
+
+fn push_opt_json_str(value: &Option<String>, out: &mut String) {
+    match value {
+        Some(text) => escape_json_string(text, out),
+        None => out.push_str("null"),
+    }
+}
+
+fn push_json_str_list(items: &[String], out: &mut String) {
+    out.push('[');
+    for (idx, item) in items.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        escape_json_string(item, out);
+    }
+    out.push(']');
+}
+
+fn render_claim_json(granted: &ClaimGranted) -> String {
+    let mut out = String::from("{\"item\": ");
+    escape_json_string(&granted.item, &mut out);
+    out.push_str(", \"holder\": ");
+    escape_json_string(&granted.holder, &mut out);
+    out.push_str(", \"token\": ");
+    escape_json_string(&granted.token, &mut out);
+    out.push_str(&format!(", \"epoch\": {}, \"expires_at\": ", granted.epoch));
+    escape_json_string(&dibs::format_instant(&granted.expires_at), &mut out);
+    out.push('}');
+    out
+}
+
+fn render_item_detail_json(detail: &ItemDetail, out: &mut String) {
+    out.push_str("{\"id\": ");
+    escape_json_string(&detail.id, out);
+    out.push_str(", \"note\": ");
+    escape_json_string(&detail.note, out);
+    out.push_str(", \"status\": ");
+    escape_json_string(&detail.status, out);
+    out.push_str(", \"effective_status\": ");
+    escape_json_string(&detail.effective_status, out);
+    out.push_str(&format!(", \"priority\": {}, \"tags\": ", detail.priority));
+    push_json_str_list(&detail.tags, out);
+    out.push_str(", \"depends_on\": ");
+    push_json_str_list(&detail.depends_on, out);
+    out.push_str(", \"holder\": ");
+    push_opt_json_str(&detail.holder, out);
+    out.push_str(", \"expires_at\": ");
+    push_opt_json_str(&detail.expires_at, out);
+    out.push_str(&format!(
+        ", \"epoch\": {}, \"takeover_count\": {}, \"max_takeovers\": ",
+        detail.epoch, detail.takeover_count
+    ));
+    match detail.max_takeovers {
+        Some(cap) => out.push_str(&cap.to_string()),
+        None => out.push_str("null"),
+    }
+    out.push('}');
+}
+
+fn render_event_json(event: &Event, out: &mut String) {
+    out.push_str(&format!("{{\"seq\": {}, \"at\": ", event.seq));
+    escape_json_string(&event.at, out);
+    out.push_str(", \"kind\": ");
+    escape_json_string(&event.kind, out);
+    out.push_str(", \"item\": ");
+    escape_json_string(&event.item, out);
+    out.push_str(", \"holder\": ");
+    push_opt_json_str(&event.holder, out);
+    out.push_str(&format!(
+        ", \"epoch\": {}, \"expires_at\": null, \"note\": null, \"previous_holder\": ",
+        event.epoch
+    ));
+    push_opt_json_str(&event.previous_holder, out);
+    out.push('}');
+}
+
+fn escape_note_line(note: &str) -> String {
+    let mut out = String::with_capacity(note.len());
+    for ch in note.chars() {
+        match ch {
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn print_item_detail_human(detail: &ItemDetail) {
+    let tags = if detail.tags.is_empty() {
+        "-".to_string()
+    } else {
+        detail.tags.join(",")
+    };
+    let deps = if detail.depends_on.is_empty() {
+        "-".to_string()
+    } else {
+        detail.depends_on.join(",")
+    };
+    let max_takeovers = detail
+        .max_takeovers
+        .map(|cap| cap.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    out_line(format_args!("id {}", detail.id));
+    out_line(format_args!("note {}", escape_note_line(&detail.note)));
+    out_line(format_args!("status {}", detail.status));
+    out_line(format_args!("effective_status {}", detail.effective_status));
+    out_line(format_args!("priority {}", detail.priority));
+    out_line(format_args!("tags {tags}"));
+    out_line(format_args!("depends_on {deps}"));
+    out_line(format_args!(
+        "holder {}",
+        detail.holder.as_deref().unwrap_or("-")
+    ));
+    out_line(format_args!(
+        "expires_at {}",
+        detail.expires_at.as_deref().unwrap_or("-")
+    ));
+    out_line(format_args!("epoch {}", detail.epoch));
+    out_line(format_args!("takeover_count {}", detail.takeover_count));
+    out_line(format_args!("max_takeovers {max_takeovers}"));
+}
+
+fn completion_script(shell: &str) -> &'static str {
+    match shell {
+        "bash" => concat!(
+            "_dibs_completions() {\n",
+            "    local cur prev words cword subcmd=\"\"\n",
+            "    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n",
+            "    prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n",
+            "    local subcommands=\"offer offer-batch claim claim-next renew release complete board show history completions\"\n",
+            "    local global_opts=\"-h --help -V --version -j --json --registry\"\n",
+            "    local i\n",
+            "    for ((i=1; i<COMP_CWORD; i++)); do\n",
+            "        case \"${COMP_WORDS[i]}\" in\n",
+            "            --registry|--file|--note|--holder|--ttl|--token|--epoch)\n",
+            "                ((i++))\n",
+            "                ;;\n",
+            "            offer|offer-batch|claim|claim-next|renew|release|complete|board|show|history|completions)\n",
+            "                subcmd=\"${COMP_WORDS[i]}\"\n",
+            "                break\n",
+            "                ;;\n",
+            "        esac\n",
+            "    done\n",
+            "    if [[ \"$prev\" == \"--registry\" || \"$prev\" == \"--file\" ]]; then\n",
+            "        local IFS=$'\\n'\n",
+            "        COMPREPLY=($(compgen -f -- \"$cur\"))\n",
+            "        return 0\n",
+            "    fi\n",
+            "    if [[ -z \"$subcmd\" ]]; then\n",
+            "        if [[ \"$cur\" == -* ]]; then\n",
+            "            COMPREPLY=($(compgen -W \"$global_opts\" -- \"$cur\"))\n",
+            "        else\n",
+            "            COMPREPLY=($(compgen -W \"$subcommands\" -- \"$cur\"))\n",
+            "        fi\n",
+            "        return 0\n",
+            "    fi\n",
+            "    case \"$subcmd\" in\n",
+            "        offer)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --note\" -- \"$cur\")) ;;\n",
+            "        offer-batch)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --file\" -- \"$cur\")) ;;\n",
+            "        claim|claim-next)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --holder --ttl\" -- \"$cur\")) ;;\n",
+            "        renew)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --holder --token --epoch --ttl\" -- \"$cur\")) ;;\n",
+            "        release|complete)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry --holder --token --epoch\" -- \"$cur\")) ;;\n",
+            "        board|show|history)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help -j --json --registry\" -- \"$cur\")) ;;\n",
+            "        completions)\n",
+            "            COMPREPLY=($(compgen -W \"-h --help bash zsh fish\" -- \"$cur\")) ;;\n",
+            "    esac\n",
+            "}\n",
+            "complete -F _dibs_completions dibs\n",
+        ),
+        "zsh" => concat!(
+            "#compdef dibs\n",
+            "_dibs() {\n",
+            "    local -a subcommands\n",
+            "    subcommands=(\n",
+            "        'offer:add an item to the backlog'\n",
+            "        'offer-batch:add a batch of items from JSON Lines input'\n",
+            "        'claim:lease an item under a new claim'\n",
+            "        'claim-next:lease the first ready item in the backlog'\n",
+            "        'renew:extend the standing lease from its current expiry'\n",
+            "        'release:end the standing lease early'\n",
+            "        'complete:mark the item done under its standing lease'\n",
+            "        'board:show the open and claimed items'\n",
+            "        'show:show the standing detail of one item'\n",
+            "        'history:show the recorded claim history'\n",
+            "        'completions:print shell completion script'\n",
+            "    )\n",
+            "    _arguments -C \\\n",
+            "        '(-h --help)'{-h,--help}'[show help message and exit]' \\\n",
+            "        '(-V --version)'{-V,--version}'[show program version and exit]' \\\n",
+            "        '(-j --json)'{-j,--json}'[emit deterministic JSON on stdout]' \\\n",
+            "        '--registry=[the registry file holding the backlog]:registry:_files' \\\n",
+            "        '1:command:->cmd' \\\n",
+            "        '*::arg:->args'\n",
+            "    case \"$state\" in\n",
+            "        cmd)\n",
+            "            _describe -t commands 'dibs command' subcommands\n",
+            "            ;;\n",
+            "        args)\n",
+            "            case \"$words[1]\" in\n",
+            "                offer) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--note=:note:' '1:item:' ;;\n",
+            "                offer-batch) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--file=:file:_files' ;;\n",
+            "                claim) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--ttl=:ttl:' '1:item:' ;;\n",
+            "                claim-next) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--ttl=:ttl:' ;;\n",
+            "                renew) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--token=:token:' '--epoch=:epoch:' '--ttl=:ttl:' '1:item:' ;;\n",
+            "                release|complete) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '--holder=:holder:' '--token=:token:' '--epoch=:epoch:' '1:item:' ;;\n",
+            "                board) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' ;;\n",
+            "                show|history) _arguments '(-h --help)'{-h,--help} '(-j --json)'{-j,--json} '--registry=:registry:_files' '1:item:' ;;\n",
+            "                completions) _arguments '(-h --help)'{-h,--help} '1:shell:(bash zsh fish)' ;;\n",
+            "            esac\n",
+            "            ;;\n",
+            "    esac\n",
+            "}\n",
+            "_dibs \"$@\"\n",
+        ),
+        _ => concat!(
+            "complete -c dibs -f\n",
+            "complete -c dibs -s h -l help -d 'show --help message and exit'\n",
+            "complete -c dibs -n 'not __fish_seen_subcommand_from completions' -s j -l json -d 'emit deterministic --json on stdout'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -s V -l version -d 'show program --version and exit'\n",
+            "complete -c dibs -n 'not __fish_seen_subcommand_from completions' -l registry -r -F -d 'the --registry file holding the backlog'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a offer -d 'add an item to the backlog'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a offer-batch -d 'add a batch of items from JSON Lines input'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a claim -d 'lease an item under a new claim'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a claim-next -d 'lease the first ready item in the backlog'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a renew -d 'extend the standing lease from its current expiry'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a release -d 'end the standing lease early'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a complete -d 'mark the item done under its standing lease'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a board -d 'show the open and claimed items'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a show -d 'show the standing detail of one item'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a history -d 'show the recorded claim history'\n",
+            "complete -c dibs -n '__fish_use_subcommand' -a completions -d 'print shell completion script'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from offer' -l note -r -d 'a short payload --note for the item'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from offer-batch' -l file -r -F -d 'JSON Lines batch --file, or - for standard input'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from claim claim-next renew release complete' -l holder -r -d 'lease --holder id'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from claim claim-next renew' -l ttl -r -d 'lease --ttl length in seconds'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from renew release complete' -l token -r -d 'lease bearer --token'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from renew release complete' -l epoch -r -d 'standing fencing --epoch'\n",
+            "complete -c dibs -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'\n",
+        ),
+    }
+}
+
+fn has_json_flag_in_tail(tail: &[OsString]) -> bool {
+    tail.iter().any(|arg| {
+        arg.to_str().is_some_and(|text| {
+            text == "-j"
+                || resolve_long(
+                    text.split('=').next().unwrap_or(text),
+                    &["--help", "--version", "--json", "--registry"],
+                )
+                .ok()
+                .flatten()
+                    == Some("--json")
+        })
+    })
 }
 
 fn run() -> ExitCode {
@@ -622,43 +1191,19 @@ fn run() -> ExitCode {
     }
 }
 
-/// The registry value of the equals form, taken unconverted.
-/// The option name is plain ASCII, so it is matched on the
-/// argument's bytes before any text conversion, and the value
-/// keeps the bytes the operating system carried, the same
-/// carry the spaced form gets. Without byte level access to
-/// arguments the equals form stays text only.
-#[cfg(unix)]
-fn registry_equals_value(token: &OsString) -> Option<OsString> {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    token
-        .as_bytes()
-        .strip_prefix(b"--registry=")
-        .map(|rest| OsString::from_vec(rest.to_vec()))
-}
-
 fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
-    // Parse the top level: the registry option and the subcommand
-    // word, with the remaining tokens handed to the subcommand.
-    // The first token that is not an option is the subcommand,
-    // and a double dash before it is taken as the subcommand word
-    // itself, as the Python parser took it. The registry value is
-    // the one argument carried unconverted in both its forms,
-    // because a path may hold bytes that are not Unicode; every
-    // other argument is text, and one that is not Unicode is a
-    // parser error. The word is judged against the command set
-    // where it is taken, before the tokens after it are
-    // converted, so an unlisted word refuses as an invalid
-    // choice whatever follows it (DB-A49).
-    let mut registry_path: Option<PathBuf> = None;
+    let top_candidates = ["--help", "--version", "--json", "--registry"];
+    let mut top_registry: Option<PathBuf> = None;
+    let mut top_json = false;
     let mut index = 0;
     let mut command: Option<String> = None;
-    let mut rest: Vec<String> = Vec::new();
+    let mut sub_slice: &[OsString] = &[];
     let mut extras: Vec<String> = Vec::new();
     while index < argv.len() {
         #[cfg(unix)]
-        if let Some(value) = registry_equals_value(&argv[index]) {
-            registry_path = Some(PathBuf::from(value));
+        if let Some((_, value)) = path_equals_value(&argv[index], &top_candidates, &["--registry"])
+        {
+            top_registry = Some(PathBuf::from(value));
             index += 1;
             continue;
         }
@@ -673,24 +1218,76 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             out_line(format_args!("{MAIN_HELP}"));
             return Ok(ExitCode::from(0));
         }
+        if token == "-V" {
+            if top_json || has_json_flag_in_tail(&argv[index + 1..]) {
+                return Ok(parser_fail(
+                    MAIN_USAGE,
+                    "dibs",
+                    "argument -j/--json: not allowed with argument -V/--version",
+                ));
+            }
+            out_line(format_args!("dibs {}", env!("CARGO_PKG_VERSION")));
+            return Ok(ExitCode::from(0));
+        }
+        if token == "-j" {
+            top_json = true;
+            index += 1;
+            continue;
+        }
         if token.starts_with("--") && token.len() > 2 {
             let (name, inline_value) = match token.find('=') {
                 Some(pos) => (&token[..pos], Some(token[pos + 1..].to_string())),
                 None => (token, None),
             };
-            match resolve_long(name, &["--help", "--registry"]) {
+            match resolve_long(name, &top_candidates) {
                 Ok(Some("--help")) => {
                     out_line(format_args!("{MAIN_HELP}"));
                     return Ok(ExitCode::from(0));
                 }
+                Ok(Some("--version")) => {
+                    if let Some(value) = inline_value {
+                        return Ok(parser_fail(
+                            MAIN_USAGE,
+                            "dibs",
+                            &format!(
+                                "argument -V/--version: ignored explicit argument {}",
+                                dibs::py_repr(&value)
+                            ),
+                        ));
+                    }
+                    if top_json || has_json_flag_in_tail(&argv[index + 1..]) {
+                        return Ok(parser_fail(
+                            MAIN_USAGE,
+                            "dibs",
+                            "argument -j/--json: not allowed with argument -V/--version",
+                        ));
+                    }
+                    out_line(format_args!("dibs {}", env!("CARGO_PKG_VERSION")));
+                    return Ok(ExitCode::from(0));
+                }
+                Ok(Some("--json")) => {
+                    if let Some(value) = inline_value {
+                        return Ok(parser_fail(
+                            MAIN_USAGE,
+                            "dibs",
+                            &format!(
+                                "argument -j/--json: ignored explicit argument {}",
+                                dibs::py_repr(&value)
+                            ),
+                        ));
+                    }
+                    top_json = true;
+                    index += 1;
+                    continue;
+                }
                 Ok(Some("--registry")) => {
                     if let Some(value) = inline_value {
-                        registry_path = Some(PathBuf::from(value));
+                        top_registry = Some(PathBuf::from(value));
                         index += 1;
                     } else if index + 1 < argv.len()
                         && !argv[index + 1].to_str().is_some_and(is_option_like)
                     {
-                        registry_path = Some(PathBuf::from(&argv[index + 1]));
+                        top_registry = Some(PathBuf::from(&argv[index + 1]));
                         index += 2;
                     } else {
                         return Ok(parser_fail(
@@ -722,30 +1319,18 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
                 MAIN_USAGE,
                 "dibs",
                 &format!(
-                    "argument command: invalid choice: {} (choose from 'offer', 'claim', 'renew', 'release', 'complete', 'board', 'history')",
+                    "argument command: invalid choice: {} (choose from 'offer', 'offer-batch', 'claim', 'claim-next', 'renew', 'release', 'complete', 'board', 'show', 'history', 'completions')",
                     dibs::py_repr(token)
                 ),
             ));
         }
         command = Some(token.to_string());
-        rest = Vec::new();
-        for argument in &argv[index + 1..] {
-            match argument.to_str() {
-                Some(text) => rest.push(text.to_string()),
-                None => {
-                    return Ok(parser_fail(
-                        sub_usage(token),
-                        &format!("dibs {token}"),
-                        "an argument is not valid Unicode text",
-                    ));
-                }
-            }
-        }
+        sub_slice = &argv[index + 1..];
         break;
     }
     let Some(command) = command else {
         let mut missing = Vec::new();
-        if registry_path.is_none() {
+        if top_registry.is_none() && std::env::var_os("DIBS_REGISTRY").is_none() {
             missing.push("--registry");
         }
         missing.push("command");
@@ -758,7 +1343,7 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             ),
         ));
     };
-    let args = match parse_sub(&command, &rest) {
+    let args = match parse_sub(&command, sub_slice) {
         Ok(args) => args,
         Err(failure) => {
             return Ok(parser_fail(failure.usage, &failure.prog, &failure.message));
@@ -767,13 +1352,49 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
     if let Err(failure) = require(&command, &args) {
         return Ok(parser_fail(failure.usage, &failure.prog, &failure.message));
     }
-    if registry_path.is_none() {
+    let json_mode = top_json || args.json;
+    if command == "completions" {
+        if json_mode {
+            return Ok(parser_fail(
+                sub_usage("completions"),
+                "dibs completions",
+                "argument -j/--json: not allowed with completions",
+            ));
+        }
+        extras.extend(args.extras.iter().cloned());
+        if !extras.is_empty() {
+            return Ok(parser_fail(
+                MAIN_USAGE,
+                "dibs",
+                &format!("unrecognized arguments: {}", extras.join(" ")),
+            ));
+        }
+        let shell = &args.positionals[0];
+        if !matches!(shell.as_str(), "bash" | "zsh" | "fish") {
+            return Ok(parser_fail(
+                sub_usage("completions"),
+                "dibs completions",
+                &format!(
+                    "argument shell: invalid choice: {} (choose from 'bash', 'zsh', 'fish')",
+                    dibs::py_repr(shell)
+                ),
+            ));
+        }
+        out_raw(completion_script(shell));
+        return Ok(ExitCode::from(0));
+    }
+    let registry_path = args
+        .registry_path
+        .clone()
+        .or(top_registry)
+        .or_else(|| std::env::var_os("DIBS_REGISTRY").map(PathBuf::from));
+    let Some(registry_path) = registry_path else {
         return Ok(parser_fail(
             MAIN_USAGE,
             "dibs",
             "the following arguments are required: --registry",
         ));
-    }
+    };
     extras.extend(args.extras.iter().cloned());
     if !extras.is_empty() {
         return Ok(parser_fail(
@@ -782,86 +1403,197 @@ fn dispatch(argv: &[OsString]) -> Result<ExitCode, Error> {
             &format!("unrecognized arguments: {}", extras.join(" ")),
         ));
     }
-    let registry = Registry::new(registry_path.unwrap());
-    let now = Instant::now_utc()?;
+    let registry = Registry::new(registry_path);
     let item = args.positionals.first().cloned();
     match command.as_str() {
         "offer" => {
             let item = item.unwrap();
             let note = option_text(&args, "--note").unwrap_or("");
+            let now = Instant::now_utc()?;
             registry.offer(&item, note, &now)?;
-            out_line(format_args!("offered {item}"));
+            if json_mode {
+                let mut out = String::from("{\"item\": ");
+                escape_json_string(&item, &mut out);
+                out.push_str(", \"status\": \"open\", \"epoch\": 0}");
+                out_line(format_args!("{out}"));
+            } else {
+                out_line(format_args!("offered {item}"));
+            }
+        }
+        "offer-batch" => {
+            registry.validate_registry_path()?;
+            let raw_input = read_offer_batch_input(args.file_path.as_ref())?;
+            let specs = parse_offer_batch_jsonl(&raw_input)?;
+            let now = Instant::now_utc()?;
+            let offered = registry.offer_many(&specs, &now)?;
+            if json_mode {
+                let mut out = format!("{{\"count\": {}, \"offered\": ", offered.len());
+                push_json_str_list(&offered, &mut out);
+                out.push('}');
+                out_line(format_args!("{out}"));
+            } else {
+                out_line(format_args!("offered {}", offered.len()));
+            }
         }
         "claim" => {
             let item = item.unwrap();
             let holder = option_text(&args, "--holder").unwrap();
             let ttl = ttl_argument(&item, holder, option_int(&args, "--ttl").unwrap())?;
+            let now = Instant::now_utc()?;
             let granted = registry.claim(&item, holder, ttl, &now)?;
-            out_line(format_args!("token {}", granted.token));
-            out_line(format_args!("epoch {}", granted.epoch));
-            out_line(format_args!(
-                "expires_at {}",
-                dibs::format_instant(&granted.expires_at)
-            ));
+            if json_mode {
+                out_line(format_args!("{}", render_claim_json(&granted)));
+            } else {
+                out_line(format_args!("token {}", granted.token));
+                out_line(format_args!("epoch {}", granted.epoch));
+                out_line(format_args!(
+                    "expires_at {}",
+                    dibs::format_instant(&granted.expires_at)
+                ));
+            }
+        }
+        "claim-next" => {
+            let holder = option_text(&args, "--holder").unwrap();
+            let ttl = ttl_argument_holder(holder, option_int(&args, "--ttl").unwrap())?;
+            let now = Instant::now_utc()?;
+            let granted = registry.claim_next(holder, ttl, &now)?;
+            if json_mode {
+                out_line(format_args!("{}", render_claim_json(&granted)));
+            } else {
+                out_line(format_args!("item {}", granted.item));
+                out_line(format_args!("token {}", granted.token));
+                out_line(format_args!("epoch {}", granted.epoch));
+                out_line(format_args!(
+                    "expires_at {}",
+                    dibs::format_instant(&granted.expires_at)
+                ));
+            }
         }
         "renew" => {
             let item = item.unwrap();
             let holder = option_text(&args, "--holder").unwrap();
-            let token = option_text(&args, "--token").unwrap();
+            let token = resolve_token(&args)?;
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
             let ttl = ttl_argument(&item, holder, option_int(&args, "--ttl").unwrap())?;
-            let expires = registry.renew(&item, holder, token, epoch, ttl, &now)?;
-            out_line(format_args!(
-                "expires_at {}",
-                dibs::format_instant(&expires)
-            ));
+            let now = Instant::now_utc()?;
+            let expires = registry.renew(&item, holder, &token, epoch, ttl, &now)?;
+            let expires_str = dibs::format_instant(&expires);
+            if json_mode {
+                let mut out = String::from("{\"item\": ");
+                escape_json_string(&item, &mut out);
+                out.push_str(", \"holder\": ");
+                escape_json_string(holder, &mut out);
+                out.push_str(&format!(", \"epoch\": {epoch}, \"expires_at\": "));
+                escape_json_string(&expires_str, &mut out);
+                out.push('}');
+                out_line(format_args!("{out}"));
+            } else {
+                out_line(format_args!("expires_at {expires_str}"));
+            }
         }
         "release" => {
             let item = item.unwrap();
             let holder = option_text(&args, "--holder").unwrap();
-            let token = option_text(&args, "--token").unwrap();
+            let token = resolve_token(&args)?;
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
-            registry.release(&item, holder, token, epoch, &now)?;
-            out_line(format_args!("released {item}"));
+            let now = Instant::now_utc()?;
+            registry.release(&item, holder, &token, epoch, &now)?;
+            if json_mode {
+                let mut out = String::from("{\"item\": ");
+                escape_json_string(&item, &mut out);
+                out.push_str(&format!(", \"status\": \"open\", \"epoch\": {epoch}}}"));
+                out_line(format_args!("{out}"));
+            } else {
+                out_line(format_args!("released {item}"));
+            }
         }
         "complete" => {
             let item = item.unwrap();
             let holder = option_text(&args, "--holder").unwrap();
-            let token = option_text(&args, "--token").unwrap();
+            let token = resolve_token(&args)?;
             let epoch = epoch_argument(option_int(&args, "--epoch").unwrap());
-            registry.complete(&item, holder, token, epoch, &now)?;
-            out_line(format_args!("completed {item}"));
+            let now = Instant::now_utc()?;
+            registry.complete(&item, holder, &token, epoch, &now)?;
+            if json_mode {
+                let mut out = String::from("{\"item\": ");
+                escape_json_string(&item, &mut out);
+                out.push_str(&format!(
+                    ", \"status\": \"completed\", \"epoch\": {epoch}}}"
+                ));
+                out_line(format_args!("{out}"));
+            } else {
+                out_line(format_args!("completed {item}"));
+            }
         }
         "board" => {
-            for row in registry.board(&now)? {
-                if row.status == "claimed" {
-                    out_line(format_args!(
-                        "{} claimed holder={} expires_at={} epoch={}",
-                        row.id,
-                        row.holder.as_deref().unwrap_or_default(),
-                        row.expires_at.as_deref().unwrap_or_default(),
-                        row.epoch
-                    ));
-                } else {
-                    out_line(format_args!("{} open epoch={}", row.id, row.epoch));
+            let now = Instant::now_utc()?;
+            if json_mode {
+                let details = registry.board_details(&now)?;
+                let mut out = String::from("[");
+                for (idx, detail) in details.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    render_item_detail_json(detail, &mut out);
+                }
+                out.push(']');
+                out_line(format_args!("{out}"));
+            } else {
+                for row in registry.board(&now)? {
+                    if row.status == "claimed" {
+                        out_line(format_args!(
+                            "{} claimed holder={} expires_at={} epoch={}",
+                            row.id,
+                            row.holder.as_deref().unwrap_or_default(),
+                            row.expires_at.as_deref().unwrap_or_default(),
+                            row.epoch
+                        ));
+                    } else {
+                        out_line(format_args!("{} open epoch={}", row.id, row.epoch));
+                    }
                 }
             }
         }
+        "show" => {
+            let item = item.unwrap();
+            let now = Instant::now_utc()?;
+            let detail = registry.show(&item, &now)?;
+            if json_mode {
+                let mut out = String::new();
+                render_item_detail_json(&detail, &mut out);
+                out_line(format_args!("{out}"));
+            } else {
+                print_item_detail_human(&detail);
+            }
+        }
         _ => {
-            for event in registry.history(item.as_deref())? {
-                let mut line = format!(
-                    "{} {} item={} holder={} at={} epoch={}",
-                    event.seq,
-                    event.kind,
-                    event.item,
-                    event.holder.as_deref().unwrap_or("-"),
-                    event.at,
-                    event.epoch
-                );
-                if let Some(previous) = &event.previous_holder {
-                    line.push_str(&format!(" previous_holder={previous}"));
+            let events = registry.history(item.as_deref())?;
+            if json_mode {
+                let mut out = String::from("[");
+                for (idx, event) in events.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(", ");
+                    }
+                    render_event_json(event, &mut out);
                 }
-                out_line(format_args!("{line}"));
+                out.push(']');
+                out_line(format_args!("{out}"));
+            } else {
+                for event in events {
+                    let mut line = format!(
+                        "{} {} item={} holder={} at={} epoch={}",
+                        event.seq,
+                        event.kind,
+                        event.item,
+                        event.holder.as_deref().unwrap_or("-"),
+                        event.at,
+                        event.epoch
+                    );
+                    if let Some(previous) = &event.previous_holder {
+                        line.push_str(&format!(" previous_holder={previous}"));
+                    }
+                    out_line(format_args!("{line}"));
+                }
             }
         }
     }
