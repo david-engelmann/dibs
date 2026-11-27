@@ -12,23 +12,26 @@
 //! class of the refusal, so a Python caller can tell the classes
 //! apart the way a shell caller tells them apart by exit code.
 //!
-//! The one surface the command line does not have is the instant.
-//! The command line reads the wall clock and offers no override,
-//! and the library takes the current instant as an argument to
-//! every operation that judges a lease. The binding mirrors the
-//! library exactly and takes the instant as ISO 8601 text on
-//! every such operation, parsed by the library parser, and it
-//! never invents a clock of its own. History judges no lease and
-//! takes no instant, here as in the library.
+//! The command line reads the wall clock in UTC and offers no
+//! override, and the Rust library takes the current instant as an
+//! explicit argument on every operation that judges a lease. Under
+//! the slice DB-S2 contract amendment, this binding defaults now
+//! to None on every lease evaluating operation, reading the UTC
+//! wall clock through Instant::now_utc when now is omitted or None
+//! and parsing an explicit ISO 8601 string through the library
+//! parser when supplied. History judges no lease and takes no
+//! instant, here as in the library.
 
 use std::path::PathBuf;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyInt};
+use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyInt, PyString};
 
-use dibs_core::{BoardRow, ClaimGranted, Error, Event, Instant, Registry, Value};
+use dibs_core::{
+    BoardRow, ClaimGranted, Error, Event, Instant, ItemDetail, OfferSpec, Registry, Value,
+};
 
 create_exception!(dibs, DibsError, pyo3::exceptions::PyException);
 create_exception!(dibs, InvalidNameError, DibsError);
@@ -70,17 +73,6 @@ fn refuse_boolean(value: &Bound<'_, PyAny>, name: &str) -> PyResult<()> {
 
 /// The canonical decimal text of an integer too wide for the
 /// 128 bit width, taken from the value arithmetically.
-///
-/// The digits come from the integer operations bit_length and
-/// to_bytes and a base conversion here, never from a text
-/// conversion of the value, because the interpreter caps the
-/// digits of an integer to text conversion and a refusal past
-/// that cap must still print the number whole, and because a
-/// text conversion would print whatever an overridden __str__
-/// says rather than the digits of the value. The two operations
-/// run on the int type itself with the value passed to them,
-/// never on the value, so an override of either method on a
-/// subclass of int cannot stand in for the arithmetic either.
 fn decimal_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
     let int_type = value.py().get_type::<PyInt>();
     let bits: usize = int_type.call_method1("bit_length", (value,))?.extract()?;
@@ -103,11 +95,6 @@ fn decimal_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
             carry = widened >> 8;
         }
     }
-    // A magnitude with no nonzero byte is the value zero, and
-    // its digits are 0. Naming that case outright keeps the
-    // scan for the first nonzero byte from ever subtracting
-    // from the length of an empty magnitude, whatever a
-    // conversion hands back.
     let first = match magnitude.iter().position(|byte| *byte != 0) {
         Some(index) => index,
         None => return Ok("0".to_string()),
@@ -140,11 +127,7 @@ fn decimal_text(value: &Bound<'_, PyAny>) -> PyResult<String> {
 }
 
 /// Keep an integer argument whole, at 128 bit width when it fits
-/// and as its canonical decimal text when it does not, the way
-/// the command line converter keeps it, so a later library
-/// validation prints the number the caller typed rather than a
-/// conversion failure at this layer. A value that is no integer
-/// at all fails extraction as a plain type error.
+/// and as its canonical decimal text when it does not.
 fn integer_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     match value.extract::<i128>() {
         Ok(number) => Ok(Value::Int(number)),
@@ -159,14 +142,6 @@ fn integer_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
 }
 
 /// Resolve the time to live argument of a claim or a renew.
-///
-/// A time to live that fits the typed call passes straight to
-/// it. A wider one is validated through the library validators
-/// here, after the names have been validated in the order the
-/// library validates them, so the refusal and its wording are
-/// the library's own. This is the resolution the command line
-/// performs for its own wider values, performed here with the
-/// same library calls.
 fn ttl_argument(item: &str, holder: &str, value: &Bound<'_, PyAny>) -> PyResult<i64> {
     refuse_boolean(value, "ttl")?;
     let wide = integer_value(value)?;
@@ -183,13 +158,24 @@ fn ttl_argument(item: &str, holder: &str, value: &Bound<'_, PyAny>) -> PyResult<
     }
 }
 
+/// Resolve the time to live argument of claim_next, which names
+/// no item upfront.
+fn ttl_argument_holder(holder: &str, value: &Bound<'_, PyAny>) -> PyResult<i64> {
+    refuse_boolean(value, "ttl")?;
+    let wide = integer_value(value)?;
+    match &wide {
+        Value::Int(number) if *number >= i64::MIN as i128 && *number <= i64::MAX as i128 => {
+            Ok(*number as i64)
+        }
+        _ => {
+            dibs_core::validate_name(&Value::Str(holder.to_string()), "holder")
+                .map_err(to_py_error)?;
+            dibs_core::validate_ttl(&wide).map_err(to_py_error)
+        }
+    }
+}
+
 /// Resolve the presented epoch argument of a guarded operation.
-///
-/// The value passes at the width the typed call carries. A value
-/// wider than that width is presented as a count no standing
-/// epoch can equal, and the library possession check refuses it
-/// in its standing order, exactly as the command line presents
-/// its own wider values.
 fn epoch_argument(value: &Bound<'_, PyAny>) -> PyResult<i128> {
     refuse_boolean(value, "epoch")?;
     match value.extract::<i128>() {
@@ -204,15 +190,7 @@ fn epoch_argument(value: &Bound<'_, PyAny>) -> PyResult<i128> {
     }
 }
 
-/// Parse the instant argument with the library parser.
-///
-/// The text is ISO 8601 in the family the library accepts, and
-/// the parse is the library's own, so a spelling the library
-/// takes is a spelling this surface takes. Text the parser
-/// refuses draws the invalid request error of the library, in
-/// the wording the stored instant refusal uses, and a parsed
-/// instant with no offset is refused downstream by the library
-/// itself as a naive current instant.
+/// Parse an explicit instant argument with the library parser.
 fn instant_argument(text: &str) -> PyResult<Instant> {
     dibs_core::parse_instant(text).map_err(|_| {
         to_py_error(Error::InvalidRequest(format!(
@@ -222,11 +200,76 @@ fn instant_argument(text: &str) -> PyResult<Instant> {
     })
 }
 
+/// Resolve the optional now argument, defaulting to the UTC wall
+/// clock when None is passed or omitted (amended DB-3).
+fn resolve_now(now: Option<&str>) -> PyResult<Instant> {
+    match now {
+        Some(text) => instant_argument(text),
+        None => Instant::now_utc().map_err(to_py_error),
+    }
+}
+
+fn extract_offer_specs(specs: &Bound<'_, PyAny>) -> PyResult<Vec<OfferSpec>> {
+    if specs.is_instance_of::<PyString>()
+        || specs.is_instance_of::<PyBytes>()
+        || specs.is_instance_of::<PyByteArray>()
+        || specs.is_instance_of::<PyDict>()
+    {
+        return Err(PyTypeError::new_err(
+            "specs must be an iterable of item ids or offer dicts, not a single str, bytes, or dict",
+        ));
+    }
+    let mut out = Vec::new();
+    for item_res in specs.try_iter()? {
+        let entry = item_res?;
+        if entry.is_instance_of::<PyString>() {
+            let id: String = entry.extract()?;
+            out.push(OfferSpec {
+                id,
+                note: String::new(),
+            });
+        } else if entry.is_instance_of::<PyDict>() {
+            let dict: Bound<'_, PyDict> = entry.extract()?;
+            for (k, _) in dict.iter() {
+                let key: String = k.extract().map_err(|_| {
+                    to_py_error(Error::InvalidRequest(
+                        "offer spec dictionary keys must be strings".to_string(),
+                    ))
+                })?;
+                if key != "id" && key != "note" {
+                    return Err(to_py_error(Error::InvalidRequest(format!(
+                        "offer spec carries unknown field {}",
+                        dibs_core::py_repr(&key)
+                    ))));
+                }
+            }
+            let Some(id_any) = dict.get_item("id")? else {
+                return Err(to_py_error(Error::InvalidRequest(
+                    "offer spec dictionary is missing required field 'id'".to_string(),
+                )));
+            };
+            let id: String = id_any
+                .extract()
+                .map_err(|_| PyTypeError::new_err("offer spec 'id' must be a string"))?;
+            let note = match dict.get_item("note")? {
+                None => String::new(),
+                Some(note_any) if note_any.is_none() => String::new(),
+                Some(note_any) => note_any.extract().map_err(|_| {
+                    PyTypeError::new_err("offer spec 'note' must be a string or None")
+                })?,
+            };
+            out.push(OfferSpec { id, note });
+        } else {
+            return Err(PyTypeError::new_err(
+                "each offer spec must be a string item id or a dictionary",
+            ));
+        }
+    }
+    Ok(out)
+}
+
 /// Translate the one return of a claim into a plain dictionary
-/// carrying the issued token and the lease facts. This return is
-/// the only place a token appears on this surface, exactly as
-/// the claim output is the only place one appears on the
-/// command line.
+/// carrying the issued token and the lease facts.
 fn claim_dict(py: Python<'_>, granted: &ClaimGranted) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("item", &granted.item)?;
@@ -238,8 +281,7 @@ fn claim_dict(py: Python<'_>, granted: &ClaimGranted) -> PyResult<Py<PyDict>> {
 }
 
 /// Translate one board row into a plain dictionary carrying the
-/// facts the board prints for the item, and no token and no
-/// token hash, as the board itself carries neither.
+/// six v1 board fields, with no token and no token hash.
 fn board_dict(py: Python<'_>, row: &BoardRow) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("id", &row.id)?;
@@ -251,9 +293,28 @@ fn board_dict(py: Python<'_>, row: &BoardRow) -> PyResult<Py<PyDict>> {
     Ok(dict.unbind())
 }
 
+/// Translate one ItemDetail into the twelve key summary dictionary,
+/// with no token and no token hash.
+fn item_detail_dict(py: Python<'_>, detail: &ItemDetail) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", &detail.id)?;
+    dict.set_item("note", &detail.note)?;
+    dict.set_item("status", &detail.status)?;
+    dict.set_item("effective_status", &detail.effective_status)?;
+    dict.set_item("priority", detail.priority)?;
+    dict.set_item("tags", &detail.tags)?;
+    dict.set_item("depends_on", &detail.depends_on)?;
+    dict.set_item("holder", &detail.holder)?;
+    dict.set_item("expires_at", &detail.expires_at)?;
+    dict.set_item("epoch", detail.epoch)?;
+    dict.set_item("takeover_count", detail.takeover_count)?;
+    dict.set_item("max_takeovers", detail.max_takeovers)?;
+    Ok(dict.unbind())
+}
+
 /// Translate one history event into a plain dictionary carrying
 /// the facts the history prints for the event, and no token and
-/// no token hash, as the history itself carries neither.
+/// no token hash.
 fn event_dict(py: Python<'_>, event: &Event) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("seq", event.seq)?;
@@ -267,42 +328,53 @@ fn event_dict(py: Python<'_>, event: &Event) -> PyResult<Py<PyDict>> {
 }
 
 /// Add an item to the backlog and record the offered event.
-///
-/// The note argument is the offer note and defaults to the empty
-/// note the command line records when no note is given. The now
-/// argument is the current instant as ISO 8601 text.
 #[pyfunction]
-#[pyo3(signature = (registry, item, now, note = None))]
+#[pyo3(signature = (registry, item, now = None, note = None))]
 fn offer(
     py: Python<'_>,
     registry: PathBuf,
     item: &str,
-    now: &str,
+    now: Option<&str>,
     note: Option<&str>,
 ) -> PyResult<()> {
-    let now = instant_argument(now)?;
+    let now = resolve_now(now)?;
     let note = note.unwrap_or_default();
     let registry = Registry::new(registry);
     py.detach(|| registry.offer(item, note, &now))
         .map_err(to_py_error)
 }
 
+/// Add a batch of items to the backlog all or nothing under one
+/// exclusive lock and return the offered item ids in order.
+#[pyfunction]
+#[pyo3(signature = (registry, specs, now = None))]
+fn offer_many(
+    py: Python<'_>,
+    registry: PathBuf,
+    specs: &Bound<'_, PyAny>,
+    now: Option<&str>,
+) -> PyResult<Vec<String>> {
+    let parsed_specs = extract_offer_specs(specs)?;
+    let now = resolve_now(now)?;
+    let registry = Registry::new(registry);
+    py.detach(|| registry.offer_many(&parsed_specs, &now))
+        .map_err(to_py_error)
+}
+
 /// Lease an open or expired item and return the issued token
 /// and the lease facts as a plain dictionary.
-///
-/// The ttl argument is the lease length in seconds and the now
-/// argument is the current instant as ISO 8601 text.
 #[pyfunction]
+#[pyo3(signature = (registry, item, holder, ttl, now = None))]
 fn claim(
     py: Python<'_>,
     registry: PathBuf,
     item: &str,
     holder: &str,
     ttl: &Bound<'_, PyAny>,
-    now: &str,
+    now: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
     let ttl = ttl_argument(item, holder, ttl)?;
-    let now = instant_argument(now)?;
+    let now = resolve_now(now)?;
     let registry = Registry::new(registry);
     let granted = py
         .detach(|| registry.claim(item, holder, ttl, &now))
@@ -310,22 +382,30 @@ fn claim(
     claim_dict(py, &granted)
 }
 
+/// Lease the first open or expired item in offer order and return
+/// the issued token and the lease facts as a plain dictionary.
+#[pyfunction]
+#[pyo3(signature = (registry, holder, ttl, now = None))]
+fn claim_next(
+    py: Python<'_>,
+    registry: PathBuf,
+    holder: &str,
+    ttl: &Bound<'_, PyAny>,
+    now: Option<&str>,
+) -> PyResult<Py<PyDict>> {
+    let ttl = ttl_argument_holder(holder, ttl)?;
+    let now = resolve_now(now)?;
+    let registry = Registry::new(registry);
+    let granted = py
+        .detach(|| registry.claim_next(holder, ttl, &now))
+        .map_err(to_py_error)?;
+    claim_dict(py, &granted)
+}
+
 /// Extend the standing lease from its current expiry and return
 /// the new expiry as a plain dictionary.
-///
-/// The epoch argument is the standing epoch the claim returned,
-/// and the token argument is the issued token, and the ttl
-/// argument is the added lease length in seconds, and the now
-/// argument is the current instant as ISO 8601 text.
-///
-/// The argument count is deliberate, because this signature
-/// mirrors the library renew call one for one, and the binding
-/// translates that call rather than restructuring it, so
-/// gathering the arguments into a parameter struct of the
-/// binding's own invention would add a shape the library does
-/// not have, and the too many arguments allow below carries
-/// this reason.
 #[pyfunction]
+#[pyo3(signature = (registry, item, holder, token, epoch, ttl, now = None))]
 #[allow(clippy::too_many_arguments)]
 fn renew(
     py: Python<'_>,
@@ -335,11 +415,11 @@ fn renew(
     token: &str,
     epoch: &Bound<'_, PyAny>,
     ttl: &Bound<'_, PyAny>,
-    now: &str,
+    now: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
     let epoch = epoch_argument(epoch)?;
     let ttl = ttl_argument(item, holder, ttl)?;
-    let now = instant_argument(now)?;
+    let now = resolve_now(now)?;
     let registry = Registry::new(registry);
     let expires = py
         .detach(|| registry.renew(item, holder, token, epoch, ttl, &now))
@@ -350,11 +430,8 @@ fn renew(
 }
 
 /// End the standing lease early and return the item to open.
-///
-/// The epoch argument is the standing epoch the claim returned,
-/// and the token argument is the issued token, and the now
-/// argument is the current instant as ISO 8601 text.
 #[pyfunction]
+#[pyo3(signature = (registry, item, holder, token, epoch, now = None))]
 fn release(
     py: Python<'_>,
     registry: PathBuf,
@@ -362,22 +439,18 @@ fn release(
     holder: &str,
     token: &str,
     epoch: &Bound<'_, PyAny>,
-    now: &str,
+    now: Option<&str>,
 ) -> PyResult<()> {
     let epoch = epoch_argument(epoch)?;
-    let now = instant_argument(now)?;
+    let now = resolve_now(now)?;
     let registry = Registry::new(registry);
     py.detach(|| registry.release(item, holder, token, epoch, &now))
         .map_err(to_py_error)
 }
 
-/// Mark the item done under its standing lease. Completion is
-/// terminal, and the item accepts no claim afterwards.
-///
-/// The epoch argument is the standing epoch the claim returned,
-/// and the token argument is the issued token, and the now
-/// argument is the current instant as ISO 8601 text.
+/// Mark the item done under its standing lease.
 #[pyfunction]
+#[pyo3(signature = (registry, item, holder, token, epoch, now = None))]
 fn complete(
     py: Python<'_>,
     registry: PathBuf,
@@ -385,32 +458,41 @@ fn complete(
     holder: &str,
     token: &str,
     epoch: &Bound<'_, PyAny>,
-    now: &str,
+    now: Option<&str>,
 ) -> PyResult<()> {
     let epoch = epoch_argument(epoch)?;
-    let now = instant_argument(now)?;
+    let now = resolve_now(now)?;
     let registry = Registry::new(registry);
     py.detach(|| registry.complete(item, holder, token, epoch, &now))
         .map_err(to_py_error)
 }
 
-/// Return the items standing on the board in offer order, the
-/// open items and the live claimed items, as plain dictionaries,
-/// with each lease state evaluated at the instant the now
-/// argument names, as ISO 8601 text.
+/// Return the items standing on the board in offer order as plain
+/// six key dictionaries evaluated at now.
 #[pyfunction]
-fn board(py: Python<'_>, registry: PathBuf, now: &str) -> PyResult<Vec<Py<PyDict>>> {
-    let now = instant_argument(now)?;
+#[pyo3(signature = (registry, now = None))]
+fn board(py: Python<'_>, registry: PathBuf, now: Option<&str>) -> PyResult<Vec<Py<PyDict>>> {
+    let now = resolve_now(now)?;
     let registry = Registry::new(registry);
     let rows = py.detach(|| registry.board(&now)).map_err(to_py_error)?;
     rows.iter().map(|row| board_dict(py, row)).collect()
 }
 
+/// Return the twelve key detail dictionary for one item evaluated
+/// at now.
+#[pyfunction]
+#[pyo3(signature = (registry, item, now = None))]
+fn show(py: Python<'_>, registry: PathBuf, item: &str, now: Option<&str>) -> PyResult<Py<PyDict>> {
+    let now = resolve_now(now)?;
+    let registry = Registry::new(registry);
+    let detail = py
+        .detach(|| registry.show(item, &now))
+        .map_err(to_py_error)?;
+    item_detail_dict(py, &detail)
+}
+
 /// Return the recorded events in order as plain dictionaries,
 /// or only the events of the one item the item argument names.
-///
-/// History judges no lease and takes no instant, here as in the
-/// library.
 #[pyfunction]
 #[pyo3(signature = (registry, item = None))]
 fn history(py: Python<'_>, registry: PathBuf, item: Option<&str>) -> PyResult<Vec<Py<PyDict>>> {
@@ -433,11 +515,14 @@ fn _dibs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CorruptError", m.py().get_type::<CorruptError>())?;
     m.add("FailureError", m.py().get_type::<FailureError>())?;
     m.add_function(wrap_pyfunction!(offer, m)?)?;
+    m.add_function(wrap_pyfunction!(offer_many, m)?)?;
     m.add_function(wrap_pyfunction!(claim, m)?)?;
+    m.add_function(wrap_pyfunction!(claim_next, m)?)?;
     m.add_function(wrap_pyfunction!(renew, m)?)?;
     m.add_function(wrap_pyfunction!(release, m)?)?;
     m.add_function(wrap_pyfunction!(complete, m)?)?;
     m.add_function(wrap_pyfunction!(board, m)?)?;
+    m.add_function(wrap_pyfunction!(show, m)?)?;
     m.add_function(wrap_pyfunction!(history, m)?)?;
     Ok(())
 }

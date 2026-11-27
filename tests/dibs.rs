@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use dibs::{
-    check_possession, validate_name, validate_note, validate_ttl, Error, Instant, Item, Registry,
-    Value,
+    check_possession, validate_name, validate_note, validate_ttl, Error, Instant, Item, OfferSpec,
+    Registry, Value,
 };
 
 mod common;
@@ -2022,7 +2022,11 @@ struct CliOutput {
 }
 
 fn run_cli(args: &[&str], expect: i32) -> CliOutput {
+    // DB-S2 scrubs DIBS_REGISTRY and DIBS_TOKEN so ambient shell
+    // environment variables cannot perturb standing CLI tests.
     let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .env_remove("DIBS_REGISTRY")
+        .env_remove("DIBS_TOKEN")
         .args(args)
         .output()
         .unwrap();
@@ -3009,8 +3013,11 @@ fn cli_invalid_command_word_refuses_before_the_arguments_after_it_are_converted(
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // DB-S2 mechanical update: MAIN_USAGE gained `[-V] [-j]` and made
+    // `[--registry REGISTRY]` optional when `DIBS_REGISTRY` is set
+    // under Obligation DB-20.
     assert!(
-        stderr.starts_with("usage: dibs [-h] --registry REGISTRY"),
+        stderr.starts_with("usage: dibs [-h] [-V] [-j] [--registry REGISTRY]"),
         "{stderr}"
     );
     assert!(stderr.contains("invalid choice: 'bogus'"), "{stderr}");
@@ -3312,44 +3319,44 @@ fn possession_check_judges_holder_then_epoch_then_token() {
 
 #[test]
 fn cli_help_bodies_print_their_whole_texts() {
-    // The eight help bodies stand pinned as whole texts. What the
-    // parser pins already hold is the usage lines, which the parser
-    // error path shares, and one absence, the time override flag the
-    // surface carries none of. The bodies themselves, the descriptions
-    // and the option lists a caller reads on an explicit help flag,
-    // were compared nowhere, so a dropped option line or a reworded
-    // description passed every suite. Each comparison below fails on
-    // any drift inside its body. One line of the main body is pinned
-    // in its standing form deliberately: the board line is the wording
-    // DB-A33 records, its correction queued in PR 132, and when that
-    // correction lands this pin fails until the expected text is
-    // updated in the same pass, so the correction cannot land silently
-    // past the guard.
+    // The help bodies stand pinned as whole texts.
+    // DB-S2 mechanical update: main help and subcommand help bodies
+    // gained `-V, --version`, `-j, --json`, flexible `--registry`
+    // placement (`DIBS_REGISTRY` fallback), `--token` stdin/env
+    // wording on lease-guarded subcommands, and the four DB-S2
+    // subcommands (`offer-batch`, `claim-next`, `show`, `completions`)
+    // under Obligations DB-17 through DB-20.
     let main = run_cli(&["--help"], 0);
     assert_eq!(main.stderr, "");
     assert_eq!(
         main.stdout,
         concat!(
-            "usage: dibs [-h] --registry REGISTRY\n",
-            "            {offer,claim,renew,release,complete,board,history} ...\n",
+            "usage: dibs [-h] [-V] [-j] [--registry REGISTRY]\n",
+            "            {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions} ...\n",
             "\n",
             "Claim tasks from a shared backlog under leases that expire unless they are\n",
             "renewed.\n",
             "\n",
             "positional arguments:\n",
-            "  {offer,claim,renew,release,complete,board,history}\n",
+            "  {offer,offer-batch,claim,claim-next,renew,release,complete,board,show,history,completions}\n",
             "    offer               add an item to the backlog\n",
+            "    offer-batch         add a batch of items from JSON Lines input\n",
             "    claim               lease an item under a new claim\n",
+            "    claim-next          lease the first ready item in the backlog\n",
             "    renew               extend the standing lease from its current expiry\n",
             "    release             end the standing lease early\n",
             "    complete            mark the item done under its standing lease\n",
             "    board               show the open and claimed items\n",
+            "    show                show the standing detail of one item\n",
             "    history             show the recorded claim history\n",
+            "    completions         print shell completion script\n",
             "\n",
             "options:\n",
             "  -h, --help            show this help message and exit\n",
-            "  --registry REGISTRY   the registry file holding the backlog, created by the\n",
-            "                        first mutation\n",
+            "  -V, --version         show program version and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog, or DIBS_REGISTRY\n",
+            "                        when omitted, created by the first mutation\n",
         )
     );
     let offer = run_cli(&["offer", "--help"], 0);
@@ -3357,14 +3364,30 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         offer.stdout,
         concat!(
-            "usage: dibs offer [-h] [--note NOTE] item\n",
+            "usage: dibs offer [-h] [-j] [--registry REGISTRY] [--note NOTE] item\n",
             "\n",
             "positional arguments:\n",
             "  item\n",
             "\n",
             "options:\n",
-            "  -h, --help   show this help message and exit\n",
-            "  --note NOTE  a short payload note for the item\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --note NOTE           a short payload note for the item\n",
+        )
+    );
+    let offer_batch = run_cli(&["offer-batch", "--help"], 0);
+    assert_eq!(offer_batch.stderr, "");
+    assert_eq!(
+        offer_batch.stdout,
+        concat!(
+            "usage: dibs offer-batch [-h] [-j] [--registry REGISTRY] [--file FILE]\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --file FILE           JSON Lines batch file, or - for standard input\n",
         )
     );
     let claim = run_cli(&["claim", "--help"], 0);
@@ -3372,15 +3395,33 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         claim.stdout,
         concat!(
-            "usage: dibs claim [-h] --holder HOLDER --ttl TTL item\n",
+            "usage: dibs claim [-h] [-j] [--registry REGISTRY] --holder HOLDER --ttl TTL\n",
+            "                  item\n",
             "\n",
             "positional arguments:\n",
             "  item\n",
             "\n",
             "options:\n",
-            "  -h, --help       show this help message and exit\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
             "  --holder HOLDER\n",
-            "  --ttl TTL        the lease length in seconds\n",
+            "  --ttl TTL             the lease length in seconds\n",
+        )
+    );
+    let claim_next = run_cli(&["claim-next", "--help"], 0);
+    assert_eq!(claim_next.stderr, "");
+    assert_eq!(
+        claim_next.stdout,
+        concat!(
+            "usage: dibs claim-next [-h] [-j] [--registry REGISTRY] --holder HOLDER --ttl TTL\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+            "  --holder HOLDER\n",
+            "  --ttl TTL             the lease length in seconds\n",
         )
     );
     let renew = run_cli(&["renew", "--help"], 0);
@@ -3388,18 +3429,20 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         renew.stdout,
         concat!(
-            "usage: dibs renew [-h] --holder HOLDER --token TOKEN --epoch EPOCH --ttl TTL\n",
-            "                  item\n",
+            "usage: dibs renew [-h] [-j] [--registry REGISTRY] --holder HOLDER\n",
+            "                  [--token TOKEN] --epoch EPOCH --ttl TTL item\n",
             "\n",
             "positional arguments:\n",
             "  item\n",
             "\n",
             "options:\n",
-            "  -h, --help       show this help message and exit\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
             "  --holder HOLDER\n",
-            "  --token TOKEN\n",
+            "  --token TOKEN         lease bearer token, - for stdin, or DIBS_TOKEN\n",
             "  --epoch EPOCH\n",
-            "  --ttl TTL        the added lease length in seconds\n",
+            "  --ttl TTL             the added lease length in seconds\n",
         )
     );
     let release = run_cli(&["release", "--help"], 0);
@@ -3407,15 +3450,18 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         release.stdout,
         concat!(
-            "usage: dibs release [-h] --holder HOLDER --token TOKEN --epoch EPOCH item\n",
+            "usage: dibs release [-h] [-j] [--registry REGISTRY] --holder HOLDER\n",
+            "                    [--token TOKEN] --epoch EPOCH item\n",
             "\n",
             "positional arguments:\n",
             "  item\n",
             "\n",
             "options:\n",
-            "  -h, --help       show this help message and exit\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
             "  --holder HOLDER\n",
-            "  --token TOKEN\n",
+            "  --token TOKEN         lease bearer token, - for stdin, or DIBS_TOKEN\n",
             "  --epoch EPOCH\n",
         )
     );
@@ -3424,15 +3470,18 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         complete.stdout,
         concat!(
-            "usage: dibs complete [-h] --holder HOLDER --token TOKEN --epoch EPOCH item\n",
+            "usage: dibs complete [-h] [-j] [--registry REGISTRY] --holder HOLDER\n",
+            "                     [--token TOKEN] --epoch EPOCH item\n",
             "\n",
             "positional arguments:\n",
             "  item\n",
             "\n",
             "options:\n",
-            "  -h, --help       show this help message and exit\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
             "  --holder HOLDER\n",
-            "  --token TOKEN\n",
+            "  --token TOKEN         lease bearer token, - for stdin, or DIBS_TOKEN\n",
             "  --epoch EPOCH\n",
         )
     );
@@ -3441,10 +3490,28 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         board.stdout,
         concat!(
-            "usage: dibs board [-h]\n",
+            "usage: dibs board [-h] [-j] [--registry REGISTRY]\n",
             "\n",
             "options:\n",
-            "  -h, --help  show this help message and exit\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+        )
+    );
+    let show = run_cli(&["show", "--help"], 0);
+    assert_eq!(show.stderr, "");
+    assert_eq!(
+        show.stdout,
+        concat!(
+            "usage: dibs show [-h] [-j] [--registry REGISTRY] item\n",
+            "\n",
+            "positional arguments:\n",
+            "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
         )
     );
     let history = run_cli(&["history", "--help"], 0);
@@ -3452,10 +3519,26 @@ fn cli_help_bodies_print_their_whole_texts() {
     assert_eq!(
         history.stdout,
         concat!(
-            "usage: dibs history [-h] [item]\n",
+            "usage: dibs history [-h] [-j] [--registry REGISTRY] [item]\n",
             "\n",
             "positional arguments:\n",
             "  item\n",
+            "\n",
+            "options:\n",
+            "  -h, --help            show this help message and exit\n",
+            "  -j, --json            emit deterministic JSON on stdout\n",
+            "  --registry REGISTRY   the registry file holding the backlog\n",
+        )
+    );
+    let completions = run_cli(&["completions", "--help"], 0);
+    assert_eq!(completions.stderr, "");
+    assert_eq!(
+        completions.stdout,
+        concat!(
+            "usage: dibs completions [-h] {bash,zsh,fish}\n",
+            "\n",
+            "positional arguments:\n",
+            "  {bash,zsh,fish}\n",
             "\n",
             "options:\n",
             "  -h, --help  show this help message and exit\n",
@@ -3499,11 +3582,17 @@ fn invalid_registry_paths_refuse_at_exit_2_without_touching_disk() {
             dibs::py_repr(raw)
         );
         let registry = Registry::new(PathBuf::from(raw));
+        // DB-S2 extends DB-15 invalid-registry-path coverage to offer_many,
+        // claim_next, show, and board_details alongside the standing operations.
         for error in [
             expect_error(registry.board(&t0())),
+            expect_error(registry.board_details(&t0())),
+            expect_error(registry.show("task-one", &t0())),
             expect_error(registry.history(None)),
             expect_error(registry.offer("task-one", "", &t0())),
+            expect_error(registry.offer_many(&[OfferSpec::new("task-one", "")], &t0())),
             expect_error(registry.claim("task-one", "agent-a", 60, &t0())),
+            expect_error(registry.claim_next("agent-a", 60, &t0())),
             expect_error(registry.renew("task-one", "agent-a", "tok", 1, 60, &t0())),
             expect_error(registry.release("task-one", "agent-a", "tok", 1, &t0())),
             expect_error(registry.complete("task-one", "agent-a", "tok", 1, &t0())),
@@ -3520,10 +3609,30 @@ fn invalid_registry_paths_refuse_at_exit_2_without_touching_disk() {
 
         for subcmd in [
             vec!["--registry", raw.as_str(), "board"],
+            vec!["board", "--registry", raw.as_str()],
+            vec!["--registry", raw.as_str(), "show", "task-one"],
             vec!["--registry", raw.as_str(), "history"],
             vec!["--registry", raw.as_str(), "offer", "task-one"],
+            vec![
+                "--registry",
+                raw.as_str(),
+                "offer-batch",
+                "--file",
+                "missing-batch.jsonl",
+            ],
+            vec![
+                "--registry",
+                raw.as_str(),
+                "claim-next",
+                "--holder",
+                "agent-a",
+                "--ttl",
+                "60",
+            ],
         ] {
             let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+                .env_remove("DIBS_REGISTRY")
+                .env_remove("DIBS_TOKEN")
                 .current_dir(&dir)
                 .args(&subcmd)
                 .output()
@@ -3647,6 +3756,7 @@ fn board_and_history_never_create_a_lock_file_on_disk() {
         "shared read lock must block exclusive try_lock"
     );
     assert_eq!(registry.board(&at(2)).unwrap().len(), 2);
+    assert_eq!(registry.show("task-one", &at(2)).unwrap().id, "task-one");
     assert_eq!(registry.history(None).unwrap().len(), 2);
     held_shared.unlock().unwrap();
     drop(held_shared);
@@ -3655,10 +3765,10 @@ fn board_and_history_never_create_a_lock_file_on_disk() {
     drop(writer_probe);
 
     // Discriminating concurrency pin: while an exclusive lock is held on
-    // `registry.json.lock` over transient invalid bytes, both `board` and
-    // `history` must block on `lock_shared()` rather than proceeding
-    // lock-free (`Ok(None)`), reading only the valid bytes published
-    // before the exclusive lock releases.
+    // `registry.json.lock` over transient invalid bytes, `board`, `show`
+    // (added in DB-S2 under DB-19), and `history` must block on `lock_shared()`
+    // rather than proceeding lock-free (`Ok(None)`), reading only the valid
+    // bytes published before the exclusive lock releases.
     let valid_bytes = std::fs::read(&path).unwrap();
     let mut blocker_opts = std::fs::OpenOptions::new();
     blocker_opts.read(true).write(true);
@@ -3671,12 +3781,18 @@ fn board_and_history_never_create_a_lock_file_on_disk() {
     blocker.lock().unwrap();
     std::fs::write(&path, b"transient pre-publish").unwrap();
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
     let b_board = std::sync::Arc::clone(&barrier);
     let p_board = path.clone();
     let board_handle = std::thread::spawn(move || {
         b_board.wait();
         Registry::new(p_board).board(&at(2))
+    });
+    let b_show = std::sync::Arc::clone(&barrier);
+    let p_show = path.clone();
+    let show_handle = std::thread::spawn(move || {
+        b_show.wait();
+        Registry::new(p_show).show("task-one", &at(2))
     });
     let b_hist = std::sync::Arc::clone(&barrier);
     let p_hist = path.clone();
@@ -3704,8 +3820,10 @@ fn board_and_history_never_create_a_lock_file_on_disk() {
     drop(blocker);
 
     let board_rows = board_handle.join().unwrap().unwrap();
+    let show_detail = show_handle.join().unwrap().unwrap();
     let history_events = history_handle.join().unwrap().unwrap();
     assert_eq!(board_rows.len(), 2);
+    assert_eq!(show_detail.id, "task-one");
     assert_eq!(history_events.len(), 2);
 }
 
@@ -3782,11 +3900,14 @@ fn board_and_history_succeed_inside_a_read_only_directory() {
     std::fs::remove_file(&lock_path).unwrap();
 
     // Case 1: mode 0555 directory with no .lock file standing on disk.
+    // DB-S2 extends read-only directory verification to Registry::show (DB-19).
     std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     let rows = registry.board(&t0()).unwrap();
+    let detail = registry.show("task-one", &t0()).unwrap();
     let events = registry.history(None).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id, "task-one");
+    assert_eq!(detail.id, "task-one");
     assert_eq!(events.len(), 1);
     assert!(!lock_path.exists());
 
@@ -3796,12 +3917,14 @@ fn board_and_history_succeed_inside_a_read_only_directory() {
     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
     std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     assert_eq!(registry.board(&t0()).unwrap().len(), 1);
+    assert_eq!(registry.show("task-one", &t0()).unwrap().id, "task-one");
     assert_eq!(registry.history(None).unwrap().len(), 1);
 
     // Case 3: unreadable .lock file (0000) falls back lock-free over the registry.
     std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
     assert_eq!(registry.board(&t0()).unwrap().len(), 1);
+    assert_eq!(registry.show("task-one", &t0()).unwrap().id, "task-one");
     assert_eq!(registry.history(None).unwrap().len(), 1);
 
     // Restore permissions so temp directory cleanup always succeeds.
@@ -3834,5 +3957,1472 @@ fn exclusive_lock_creation_honors_a_group_writable_umask() {
     assert_eq!(
         mode, 0o664,
         "expected group-writable 0o664 under umask 0o002, got {mode:04o}"
+    );
+}
+
+fn run_cli_stdin_env(
+    args: &[&str],
+    stdin_bytes: Option<&[u8]>,
+    envs: &[(&str, Option<&str>)],
+    expect: i32,
+) -> CliOutput {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dibs"));
+    cmd.env_remove("DIBS_REGISTRY").env_remove("DIBS_TOKEN");
+    for (key, val) in envs {
+        match val {
+            Some(v) => {
+                cmd.env(key, v);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
+    cmd.args(args);
+    if stdin_bytes.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    if let Some(bytes) = stdin_bytes {
+        if let Some(mut handle) = child.stdin.take() {
+            let _ = handle.write_all(bytes);
+        }
+    }
+    let output = child.wait_with_output().unwrap();
+    let result = CliOutput {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    };
+    assert_eq!(
+        result.code, expect,
+        "args {args:?} stdout: {} stderr: {}",
+        result.stdout, result.stderr
+    );
+    result
+}
+
+fn object_keys(val: &Value) -> Vec<&str> {
+    let Value::Object(pairs) = val else {
+        panic!("expected JSON object, got {val:?}");
+    };
+    pairs.iter().map(|(k, _)| k.as_str()).collect()
+}
+
+fn object_field<'a>(val: &'a Value, key: &str) -> &'a Value {
+    let Value::Object(pairs) = val else {
+        panic!("expected JSON object, got {val:?}");
+    };
+    pairs
+        .iter()
+        .find_map(|(k, v)| if k == key { Some(v) } else { None })
+        .unwrap_or_else(|| panic!("missing key {key} in {val:?}"))
+}
+
+#[test]
+fn claim_next_selects_first_claimable_takes_over_expired_and_refuses_empty() {
+    let dir = temp_dir("claim-next-lifecycle");
+
+    // Missing registry under non-existent parent refuses cleanly at exit 1
+    // without creating directories, registry files, or lock files.
+    let missing_path = dir.join("deep").join("missing.json");
+    let missing_reg = Registry::new(missing_path.clone());
+    let err = expect_error(missing_reg.claim_next("agent-a", 60, &t0()));
+    assert!(matches!(err, Error::Refusal(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(err.message(), "no ready item stands in the backlog");
+    assert!(!dir.join("deep").exists());
+    assert!(!missing_path.exists());
+
+    // Missing registry inside an existing directory also creates neither
+    // registry file nor .lock file.
+    let existing_missing = dir.join("missing.json");
+    let existing_missing_reg = Registry::new(existing_missing.clone());
+    let err_existing = expect_error(existing_missing_reg.claim_next("agent-a", 60, &t0()));
+    assert!(
+        matches!(err_existing, Error::Refusal(_)),
+        "{err_existing:?}"
+    );
+    assert_eq!(err_existing.exit_code(), 1);
+    assert_eq!(
+        err_existing.message(),
+        "no ready item stands in the backlog"
+    );
+    assert!(!existing_missing.exists());
+    assert!(!dir.join("missing.json.lock").exists());
+
+    // Epoch fence: when the first open item stands at u64::MAX, claim_next
+    // refuses at exit 1 rather than overflowing or skipping item 0.
+    let top_path = dir.join("epoch-top.json");
+    let top_doc = "{\"format\": \"dibs-registry/1\", \"items\": [\
+        {\"id\": \"task-top\", \"note\": \"\", \"status\": \"open\", \"holder\": null, \
+         \"token_hash\": null, \"epoch\": 18446744073709551615, \"expires_at\": null}, \
+        {\"id\": \"task-next\", \"note\": \"\", \"status\": \"open\", \"holder\": null, \
+         \"token_hash\": null, \"epoch\": 0, \"expires_at\": null}], \"history\": []}";
+    std::fs::write(&top_path, top_doc).unwrap();
+    let top_reg = Registry::new(top_path.clone());
+    let top_err = expect_error(top_reg.claim_next("agent-a", 60, &t0()));
+    assert!(matches!(top_err, Error::Refusal(_)), "{top_err:?}");
+    assert_eq!(top_err.exit_code(), 1);
+    assert!(top_err.message().contains("18446744073709551615"));
+    assert!(top_err
+        .message()
+        .contains("no epoch past it can be assigned"));
+    let top_cli = run_cli_stdin_env(
+        &[
+            "--registry",
+            top_path.to_str().unwrap(),
+            "claim-next",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "60",
+        ],
+        None,
+        &[],
+        1,
+    );
+    assert!(top_cli.stderr.contains("18446744073709551615"));
+    assert_eq!(std::fs::read(&top_path).unwrap(), top_doc.as_bytes());
+
+    // Invalid inputs and invalid paths refuse at exit 2 before touching disk.
+    assert_invalid_name(missing_reg.claim_next("Bad Holder", 60, &t0()));
+    assert_invalid_ttl(missing_reg.claim_next("agent-a", 0, &t0()));
+    let late = Instant::from_civil(9999, 12, 31, 23, 59, 0, 0, Some(0)).unwrap();
+    assert_invalid_ttl(missing_reg.claim_next("agent-a", 3600, &late));
+    let bad_path_err =
+        expect_error(Registry::new(PathBuf::from("")).claim_next("agent-a", 60, &t0()));
+    assert!(matches!(bad_path_err, Error::InvalidRequest(_)));
+    assert_eq!(bad_path_err.exit_code(), 2);
+
+    // Succeeding human-mode CLI `dibs claim-next` emits all 4 lines and matches board & show.
+    let human_path = dir.join("human-next.json");
+    let human_str = human_path.to_str().unwrap();
+    run_cli_stdin_env(
+        &[
+            "--registry",
+            human_str,
+            "offer",
+            "task-human",
+            "--note",
+            "human check",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let human_claim = run_cli_stdin_env(
+        &[
+            "--registry",
+            human_str,
+            "claim-next",
+            "--holder",
+            "agent-h",
+            "--ttl",
+            "600",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let claim_lines: Vec<&str> = human_claim.stdout.lines().collect();
+    assert_eq!(claim_lines.len(), 4, "{}", human_claim.stdout);
+    assert_eq!(claim_lines[0], "item task-human");
+    let human_tok = claim_lines[1].strip_prefix("token ").unwrap();
+    assert_eq!(human_tok.len(), 43);
+    assert_eq!(claim_lines[2], "epoch 1");
+    let human_exp = claim_lines[3].strip_prefix("expires_at ").unwrap();
+    let check_board = run_cli_stdin_env(&["--registry", human_str, "board"], None, &[], 0);
+    assert_eq!(
+        check_board.stdout,
+        format!("task-human claimed holder=agent-h expires_at={human_exp} epoch=1\n")
+    );
+    let check_show = run_cli_stdin_env(
+        &["--registry", human_str, "show", "task-human"],
+        None,
+        &[],
+        0,
+    );
+    assert!(check_show
+        .stdout
+        .contains(&format!("expires_at {human_exp}\n")));
+
+    // Selection skips live claimed and completed items and picks first open item.
+    let path = dir.join("registry.json");
+    let registry = Registry::new(path.clone());
+    registry
+        .offer_many(
+            &[
+                OfferSpec::new("task-a", "first"),
+                OfferSpec::new("task-b", "second"),
+                OfferSpec::new("task-c", "third"),
+            ],
+            &t0(),
+        )
+        .unwrap();
+
+    let first = registry.claim_next("agent-a", 60, &at(0)).unwrap();
+    assert_eq!(first.item, "task-a");
+    assert_eq!(first.holder, "agent-a");
+    assert_eq!(first.epoch, 1);
+    assert_eq!(first.expires_at, at(60));
+
+    let second = registry.claim_next("agent-b", 60, &at(1)).unwrap();
+    assert_eq!(second.item, "task-b");
+    assert_eq!(second.epoch, 1);
+    registry
+        .complete("task-b", "agent-b", &second.token, 1, &at(2))
+        .unwrap();
+
+    // At t+10, task-a is live-claimed and task-b is completed, so claim_next
+    // selects task-c.
+    let third = registry.claim_next("agent-c", 60, &at(10)).unwrap();
+    assert_eq!(third.item, "task-c");
+    assert_eq!(third.epoch, 1);
+
+    // At t+20, zero claimable items stand; refusal leaves registry byte-identical.
+    let before = std::fs::read(&path).unwrap();
+    let exhausted = expect_error(registry.claim_next("agent-d", 60, &at(20)));
+    assert!(matches!(exhausted, Error::Refusal(_)), "{exhausted:?}");
+    assert_eq!(exhausted.message(), "no ready item stands in the backlog");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // At exact expiry boundary t+60 of task-a, claim_next takes over task-a
+    // at epoch 2 and records taken_over naming previous_holder agent-a.
+    let takeover = registry.claim_next("agent-d", 60, &at(60)).unwrap();
+    assert_eq!(takeover.item, "task-a");
+    assert_eq!(takeover.holder, "agent-d");
+    assert_eq!(takeover.epoch, 2);
+    assert_ne!(takeover.token, first.token);
+
+    let events = registry.history(Some("task-a")).unwrap();
+    let last = events.last().unwrap();
+    assert_eq!(last.kind, "taken_over");
+    assert_eq!(last.holder.as_deref(), Some("agent-d"));
+    assert_eq!(last.previous_holder.as_deref(), Some("agent-a"));
+    assert_eq!(last.epoch, 2);
+}
+
+#[test]
+fn claim_next_sixteen_way_process_race_has_sixteen_first_try_winners() {
+    let dir = temp_dir("claim-next-16-race");
+    let path = dir.join("registry.json");
+    let registry = Registry::new(path.clone());
+    let specs: Vec<OfferSpec> = (0..16)
+        .map(|idx| OfferSpec::new(format!("item-{idx:02}"), format!("payload {idx}")))
+        .collect();
+    registry.offer_many(&specs, &t0()).unwrap();
+
+    // Spawn all 16 OS processes concurrently before waiting on any of them.
+    let mut spawned = Vec::with_capacity(16);
+    for idx in 0..16 {
+        spawned.push(
+            Command::new(env!("CARGO_BIN_EXE_dibs"))
+                .env_remove("DIBS_REGISTRY")
+                .env_remove("DIBS_TOKEN")
+                .arg("--registry")
+                .arg(&path)
+                .arg("claim-next")
+                .arg("--holder")
+                .arg(format!("agent-{idx:02}"))
+                .arg("--ttl")
+                .arg("600")
+                .arg("--json")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+
+    let mut claimed_items = std::collections::BTreeSet::new();
+    let mut tokens = std::collections::BTreeSet::new();
+    for (idx, child) in spawned.into_iter().enumerate() {
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "worker {idx} failed on first try: {stderr}"
+        );
+        assert_eq!(stderr, "");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: Value = serde_json::from_str(stdout.trim()).unwrap();
+        assert_eq!(
+            object_keys(&parsed),
+            vec!["item", "holder", "token", "epoch", "expires_at"]
+        );
+        let Value::Str(item_id) = object_field(&parsed, "item") else {
+            panic!("expected string item");
+        };
+        let Value::Str(tok) = object_field(&parsed, "token") else {
+            panic!("expected string token");
+        };
+        assert_eq!(tok.len(), 43);
+        assert_eq!(object_field(&parsed, "epoch"), &Value::Int(1));
+        assert!(
+            claimed_items.insert(item_id.clone()),
+            "duplicate winner on {item_id}"
+        );
+        assert!(tokens.insert(tok.clone()), "duplicate token issued");
+    }
+    let expected_items: std::collections::BTreeSet<String> =
+        (0..16).map(|idx| format!("item-{idx:02}")).collect();
+    assert_eq!(claimed_items, expected_items);
+
+    // 17th claim-next exits 1 cleanly and leaves registry bytes untouched.
+    let before = std::fs::read(&path).unwrap();
+    let path_str = path.to_str().unwrap();
+    let seventeenth = run_cli_stdin_env(
+        &[
+            "--registry",
+            path_str,
+            "claim-next",
+            "--holder",
+            "agent-16",
+            "--ttl",
+            "600",
+        ],
+        None,
+        &[],
+        1,
+    );
+    assert_eq!(seventeenth.stdout, "");
+    assert_eq!(
+        seventeenth.stderr,
+        "error: no ready item stands in the backlog\n"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    let events = registry.history(None).unwrap();
+    assert_eq!(events.len(), 32);
+    let seqs: Vec<i128> = events.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=32).collect::<Vec<i128>>());
+}
+
+#[test]
+fn offer_many_and_cli_offer_batch_enforce_all_or_nothing_atomicity() {
+    let dir = temp_dir("offer-batch-atomicity");
+    let path = dir.join("registry.json");
+    let path_str = path.to_str().unwrap();
+    let registry = Registry::new(path.clone());
+
+    // Empty batch and intra-batch duplicate refuse at exit 2 without touching disk.
+    let empty_err = expect_error(registry.offer_many(&[], &t0()));
+    assert!(matches!(empty_err, Error::InvalidRequest(_)));
+    assert_eq!(empty_err.exit_code(), 2);
+    assert!(!path.exists());
+
+    let dup_err = expect_error(registry.offer_many(
+        &[
+            OfferSpec::new("task-one", "a"),
+            OfferSpec::new("task-two", "b"),
+            OfferSpec::new("task-one", "c"),
+        ],
+        &t0(),
+    ));
+    assert!(matches!(dup_err, Error::InvalidRequest(_)));
+    assert_eq!(dup_err.exit_code(), 2);
+    assert!(!path.exists());
+
+    let bad_note_err = expect_error(registry.offer_many(
+        &[
+            OfferSpec::new("task-one", "ok"),
+            OfferSpec::new("task-two", "x".repeat(201)),
+        ],
+        &t0(),
+    ));
+    assert!(matches!(bad_note_err, Error::InvalidRequest(_)));
+    assert_eq!(bad_note_err.exit_code(), 2);
+    assert!(!path.exists());
+
+    // Invalid item name and naive / out-of-range Instant refuse at exit 2 without touching disk.
+    let bad_name_err = expect_error(registry.offer_many(
+        &[
+            OfferSpec::new("task-one", "ok"),
+            OfferSpec::new("Bad Name", "ok"),
+        ],
+        &t0(),
+    ));
+    assert!(matches!(bad_name_err, Error::InvalidName(_)));
+    assert_eq!(bad_name_err.exit_code(), 2);
+    assert!(!path.exists());
+
+    let naive = Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, None).unwrap();
+    let early = Instant::from_civil(1, 1, 1, 0, 0, 0, 0, Some(3_600_000_000)).unwrap();
+    for bad_now in [naive, early] {
+        let now_err =
+            expect_error(registry.offer_many(&[OfferSpec::new("task-one", "ok")], &bad_now));
+        assert!(matches!(now_err, Error::InvalidRequest(_)));
+        assert_eq!(now_err.exit_code(), 2);
+        assert!(!path.exists());
+    }
+
+    // Valid batch via --file on CLI writes dibs-registry/1 format cleanly.
+    let batch_file = dir.join("batch.jsonl");
+    std::fs::write(
+        &batch_file,
+        "\n  \n{\"id\": \"task-one\", \"note\": \"first note\"}\n{\"id\": \"task-two\"}\n",
+    )
+    .unwrap();
+    let out = run_cli_stdin_env(
+        &[
+            "--registry",
+            path_str,
+            "offer-batch",
+            "--file",
+            batch_file.to_str().unwrap(),
+        ],
+        None,
+        &[],
+        0,
+    );
+    assert_eq!(out.stdout, "offered 2\n");
+
+    let before = std::fs::read(&path).unwrap();
+    let raw_doc: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(raw_doc["format"], "dibs-registry/1");
+
+    // Standing duplicate on item 3 of 5 refuses the ENTIRE batch at exit 1,
+    // leaving items 1 and 2 unwritten and registry bytes untouched.
+    let standing_dup = run_cli_stdin_env(
+        &["--registry", path_str, "offer-batch"],
+        Some(
+            concat!(
+                "{\"id\": \"fresh-1\"}\n",
+                "{\"id\": \"fresh-2\"}\n",
+                "{\"id\": \"task-two\"}\n",
+                "{\"id\": \"fresh-4\"}\n",
+                "{\"id\": \"fresh-5\"}\n",
+            )
+            .as_bytes(),
+        ),
+        &[],
+        1,
+    );
+    assert_eq!(standing_dup.stdout, "");
+    assert_eq!(
+        standing_dup.stderr,
+        "error: item 'task-two' already stands in the backlog\n"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(registry.board(&t0()).unwrap().len(), 2);
+
+    // Malformed JSONL shapes all refuse at exit 2 leaving registry untouched.
+    for bad_jsonl in [
+        "",
+        "   \n\t\n",
+        "{not json}\n",
+        "[1, 2]\n",
+        "{\"note\": \"missing id\"}\n",
+        "{\"id\": \"fresh-1\", \"unknown\": 1}\n",
+        "{\"id\": \"fresh-1\", \"id\": \"fresh-2\"}\n",
+        "{\"id\": \"fresh-1\"}\n{\"id\": \"fresh-1\"}\n",
+        "{\"id\": \"Bad Name\"}\n",
+    ] {
+        let res = run_cli_stdin_env(
+            &["--registry", path_str, "offer-batch", "--file", "-"],
+            Some(bad_jsonl.as_bytes()),
+            &[],
+            2,
+        );
+        assert_eq!(res.stdout, "");
+        assert!(res.stderr.starts_with("error: "), "{}", res.stderr);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    // Valid stdin batch with --json appends consecutively.
+    let stdin_ok = run_cli_stdin_env(
+        &["--registry", path_str, "offer-batch", "--json"],
+        Some(b"{\"id\": \"task-three\", \"note\": \"third\"}\n{\"id\": \"task-four\"}\n"),
+        &[],
+        0,
+    );
+    assert_eq!(
+        stdin_ok.stdout,
+        "{\"count\": 2, \"offered\": [\"task-three\", \"task-four\"]}\n"
+    );
+    assert_eq!(registry.board(&t0()).unwrap().len(), 4);
+    assert_eq!(registry.history(None).unwrap().len(), 4);
+}
+
+#[test]
+fn show_evaluates_lazy_expiry_takeovers_and_never_creates_lock_file() {
+    let dir = temp_dir("show-lazy-expiry");
+    let path = dir.join("registry.json");
+    let lock_path = dir.join("registry.json.lock");
+    let path_str = path.to_str().unwrap();
+    let registry = Registry::new(path.clone());
+
+    // Missing registry refuses with NotFound at exit 1 and creates no lock file.
+    let missing_err = expect_error(registry.show("task-one", &t0()));
+    assert!(matches!(missing_err, Error::NotFound(_)));
+    assert_eq!(missing_err.exit_code(), 1);
+    assert_eq!(
+        missing_err.message(),
+        "item 'task-one' does not stand in the backlog"
+    );
+    assert!(!lock_path.exists());
+
+    assert_invalid_name(registry.show("Bad Name", &t0()));
+    let bad_reg_err = expect_error(Registry::new(PathBuf::from("sub/")).show("task-one", &t0()));
+    assert!(matches!(bad_reg_err, Error::InvalidRequest(_)));
+    assert_eq!(bad_reg_err.exit_code(), 2);
+
+    // Naive and out-of-UTC-range instants refuse at exit 2 on show and board_details.
+    let naive = Instant::from_civil(2031, 5, 4, 12, 0, 0, 0, None).unwrap();
+    let early = Instant::from_civil(1, 1, 1, 0, 0, 0, 0, Some(3_600_000_000)).unwrap();
+    for bad_now in [naive, early] {
+        let show_err = expect_error(registry.show("task-one", &bad_now));
+        assert!(matches!(show_err, Error::InvalidRequest(_)));
+        assert_eq!(show_err.exit_code(), 2);
+        let details_err = expect_error(registry.board_details(&bad_now));
+        assert!(matches!(details_err, Error::InvalidRequest(_)));
+        assert_eq!(details_err.exit_code(), 2);
+    }
+
+    registry
+        .offer("task-one", "line one\r\nline two", &t0())
+        .unwrap();
+    // Claim with a multi-hour TTL from wall clock so CLI `show` sees it live,
+    // and also verify deterministic injected instants via library `show`.
+    let cli_claim = run_cli_stdin_env(
+        &[
+            "--registry",
+            path_str,
+            "claim",
+            "task-one",
+            "--holder",
+            "agent-a",
+            "--ttl",
+            "3600",
+            "--json",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let claim_val: Value = serde_json::from_str(cli_claim.stdout.trim()).unwrap();
+    let Value::Str(tok1) = object_field(&claim_val, "token").clone() else {
+        panic!("expected token");
+    };
+    let Value::Str(exp1) = object_field(&claim_val, "expires_at").clone() else {
+        panic!("expected expires_at");
+    };
+    let exp1_inst = dibs::parse_instant(&exp1).unwrap();
+    let just_before = Instant::from_epoch_micros(exp1_inst.epoch_micros().unwrap() - 1).unwrap();
+
+    // Remove lock file and verify show never recreates it.
+    std::fs::remove_file(&lock_path).unwrap();
+    let live = registry.show("task-one", &just_before).unwrap();
+    assert!(!lock_path.exists());
+    assert_eq!(live.id, "task-one");
+    assert_eq!(live.note, "line one\r\nline two");
+    assert_eq!(live.status, "claimed");
+    assert_eq!(live.effective_status, "claimed");
+    assert_eq!(live.priority, 2);
+    assert!(live.tags.is_empty());
+    assert!(live.depends_on.is_empty());
+    assert_eq!(live.holder.as_deref(), Some("agent-a"));
+    assert_eq!(live.expires_at.as_deref(), Some(exp1.as_str()));
+    assert_eq!(live.epoch, 1);
+    assert_eq!(live.takeover_count, 0);
+    assert_eq!(live.max_takeovers, None);
+
+    // Human CLI show in live-claimed state prints all 12 lines verbatim
+    // (escaping both \r and \n in note) and creates no lock file.
+    let cli_human_live =
+        run_cli_stdin_env(&["--registry", path_str, "show", "task-one"], None, &[], 0);
+    assert!(!lock_path.exists());
+    assert_eq!(
+        cli_human_live.stdout,
+        format!(
+            concat!(
+                "id task-one\n",
+                "note line one\\r\\nline two\n",
+                "status claimed\n",
+                "effective_status claimed\n",
+                "priority 2\n",
+                "tags -\n",
+                "depends_on -\n",
+                "holder agent-a\n",
+                "expires_at {}\n",
+                "epoch 1\n",
+                "takeover_count 0\n",
+                "max_takeovers -\n",
+            ),
+            exp1
+        )
+    );
+
+    // Lazy expiry at exact boundary exp1_inst: status & effective_status become open,
+    // holder & expires_at clear to None.
+    let expired = registry.show("task-one", &exp1_inst).unwrap();
+    assert_eq!(expired.status, "open");
+    assert_eq!(expired.effective_status, "open");
+    assert_eq!(expired.holder, None);
+    assert_eq!(expired.expires_at, None);
+    assert_eq!(expired.epoch, 1);
+    assert_eq!(expired.takeover_count, 0);
+
+    // Takeover increments takeover_count to 1, and completion renders `-` for
+    // null holder and expires_at across all 12 human lines.
+    let second = registry
+        .claim("task-one", "agent-b", 60, &exp1_inst)
+        .unwrap();
+    assert_ne!(second.token, tok1);
+    let after_takeover = registry
+        .show("task-one", &exp1_inst.plus_seconds(1))
+        .unwrap();
+    assert_eq!(after_takeover.status, "claimed");
+    assert_eq!(after_takeover.effective_status, "claimed");
+    assert_eq!(after_takeover.holder.as_deref(), Some("agent-b"));
+    assert_eq!(after_takeover.epoch, 2);
+    assert_eq!(after_takeover.takeover_count, 1);
+
+    registry
+        .complete(
+            "task-one",
+            "agent-b",
+            &second.token,
+            2,
+            &exp1_inst.plus_seconds(2),
+        )
+        .unwrap();
+    let completed = registry
+        .show("task-one", &exp1_inst.plus_seconds(3))
+        .unwrap();
+    assert_eq!(completed.status, "completed");
+    assert_eq!(completed.effective_status, "completed");
+    assert_eq!(completed.holder, None);
+    assert_eq!(completed.expires_at, None);
+    assert_eq!(completed.epoch, 2);
+    assert_eq!(completed.takeover_count, 1);
+
+    let cli_human_done =
+        run_cli_stdin_env(&["--registry", path_str, "show", "task-one"], None, &[], 0);
+    assert_eq!(
+        cli_human_done.stdout,
+        concat!(
+            "id task-one\n",
+            "note line one\\r\\nline two\n",
+            "status completed\n",
+            "effective_status completed\n",
+            "priority 2\n",
+            "tags -\n",
+            "depends_on -\n",
+            "holder -\n",
+            "expires_at -\n",
+            "epoch 2\n",
+            "takeover_count 1\n",
+            "max_takeovers -\n",
+        )
+    );
+}
+
+#[test]
+fn cli_json_mode_emits_exact_ordered_keys_and_never_leaks_token_hash() {
+    let dir = temp_dir("cli-json-all-subcommands");
+    let path = dir.join("registry.json");
+    let path_str = path.to_str().unwrap();
+
+    // 1. offer (--json before subcommand)
+    let offer_res = run_cli_stdin_env(
+        &[
+            "--json",
+            "--registry",
+            path_str,
+            "offer",
+            "task-one",
+            "--note",
+            "alpha",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let offer_val: Value = serde_json::from_str(offer_res.stdout.trim()).unwrap();
+    assert_eq!(object_keys(&offer_val), vec!["item", "status", "epoch"]);
+    assert_eq!(
+        offer_res.stdout,
+        "{\"item\": \"task-one\", \"status\": \"open\", \"epoch\": 0}\n"
+    );
+
+    // 2. offer-batch (-j after subcommand)
+    let batch_res = run_cli_stdin_env(
+        &["--registry", path_str, "offer-batch", "-j"],
+        Some(b"{\"id\": \"task-two\", \"note\": \"beta\"}\n{\"id\": \"task-three\"}\n"),
+        &[],
+        0,
+    );
+    let batch_val: Value = serde_json::from_str(batch_res.stdout.trim()).unwrap();
+    assert_eq!(object_keys(&batch_val), vec!["count", "offered"]);
+
+    // 3. claim (--json after subcommand)
+    let claim_res = run_cli_stdin_env(
+        &[
+            "--registry",
+            path_str,
+            "claim",
+            "task-one",
+            "--holder",
+            "alice",
+            "--ttl",
+            "600",
+            "--json",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let claim_val: Value = serde_json::from_str(claim_res.stdout.trim()).unwrap();
+    assert_eq!(
+        object_keys(&claim_val),
+        vec!["item", "holder", "token", "epoch", "expires_at"]
+    );
+    let Value::Str(tok1) = object_field(&claim_val, "token").clone() else {
+        panic!("expected token string");
+    };
+    let Value::Str(claim1_exp) = object_field(&claim_val, "expires_at").clone() else {
+        panic!("expected expires_at string");
+    };
+    let hash1 = dibs::token_hash(&tok1);
+
+    // 4. claim-next (-j before subcommand)
+    let next_res = run_cli_stdin_env(
+        &[
+            "-j",
+            "--registry",
+            path_str,
+            "claim-next",
+            "--holder",
+            "bob",
+            "--ttl",
+            "600",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let next_val: Value = serde_json::from_str(next_res.stdout.trim()).unwrap();
+    assert_eq!(
+        object_keys(&next_val),
+        vec!["item", "holder", "token", "epoch", "expires_at"]
+    );
+    assert_eq!(
+        object_field(&next_val, "item"),
+        &Value::Str("task-two".to_string())
+    );
+    let Value::Str(tok2) = object_field(&next_val, "token").clone() else {
+        panic!("expected token string");
+    };
+    let Value::Str(claim2_exp) = object_field(&next_val, "expires_at").clone() else {
+        panic!("expected expires_at string");
+    };
+    let hash2 = dibs::token_hash(&tok2);
+
+    // 5. renew (--json)
+    let renew_res = run_cli_stdin_env(
+        &[
+            "--registry",
+            path_str,
+            "renew",
+            "task-one",
+            "--holder",
+            "alice",
+            "--token",
+            &tok1,
+            "--epoch",
+            "1",
+            "--ttl",
+            "120",
+            "--json",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let renew_val: Value = serde_json::from_str(renew_res.stdout.trim()).unwrap();
+    assert_eq!(
+        object_keys(&renew_val),
+        vec!["item", "holder", "epoch", "expires_at"]
+    );
+    assert_eq!(
+        object_field(&renew_val, "item"),
+        &Value::Str("task-one".to_string())
+    );
+    assert_eq!(
+        object_field(&renew_val, "holder"),
+        &Value::Str("alice".to_string())
+    );
+    assert_eq!(object_field(&renew_val, "epoch"), &Value::Int(1));
+    let expected_renew_exp =
+        dibs::format_instant(&dibs::parse_instant(&claim1_exp).unwrap().plus_seconds(120));
+    assert_eq!(
+        object_field(&renew_val, "expires_at"),
+        &Value::Str(expected_renew_exp.clone())
+    );
+
+    // 6. board (--json) & 7. show (--json) while leases stand
+    let detail_keys = vec![
+        "id",
+        "note",
+        "status",
+        "effective_status",
+        "priority",
+        "tags",
+        "depends_on",
+        "holder",
+        "expires_at",
+        "epoch",
+        "takeover_count",
+        "max_takeovers",
+    ];
+    let board_res = run_cli_stdin_env(&["--registry", path_str, "board", "--json"], None, &[], 0);
+    let Value::Array(board_items) = serde_json::from_str::<Value>(board_res.stdout.trim()).unwrap()
+    else {
+        panic!("expected array");
+    };
+    assert_eq!(board_items.len(), 3);
+    for elem in &board_items {
+        assert_eq!(object_keys(elem), detail_keys);
+        assert_eq!(object_field(elem, "priority"), &Value::Int(2));
+        assert_eq!(object_field(elem, "tags"), &Value::Array(vec![]));
+        assert_eq!(object_field(elem, "depends_on"), &Value::Array(vec![]));
+        assert_eq!(object_field(elem, "takeover_count"), &Value::Int(0));
+        assert_eq!(object_field(elem, "max_takeovers"), &Value::Null);
+    }
+    assert_eq!(
+        object_field(&board_items[0], "id"),
+        &Value::Str("task-one".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[0], "note"),
+        &Value::Str("alpha".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[0], "status"),
+        &Value::Str("claimed".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[0], "effective_status"),
+        &Value::Str("claimed".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[0], "holder"),
+        &Value::Str("alice".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[0], "expires_at"),
+        &Value::Str(expected_renew_exp)
+    );
+    assert_eq!(object_field(&board_items[0], "epoch"), &Value::Int(1));
+
+    assert_eq!(
+        object_field(&board_items[1], "id"),
+        &Value::Str("task-two".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[1], "holder"),
+        &Value::Str("bob".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[1], "expires_at"),
+        &Value::Str(claim2_exp)
+    );
+    assert_eq!(
+        object_field(&board_items[2], "id"),
+        &Value::Str("task-three".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[2], "status"),
+        &Value::Str("open".to_string())
+    );
+    assert_eq!(
+        object_field(&board_items[2], "effective_status"),
+        &Value::Str("open".to_string())
+    );
+    assert_eq!(object_field(&board_items[2], "holder"), &Value::Null);
+    assert_eq!(object_field(&board_items[2], "expires_at"), &Value::Null);
+    assert_eq!(object_field(&board_items[2], "epoch"), &Value::Int(0));
+
+    let show_res = run_cli_stdin_env(
+        &["--registry", path_str, "show", "task-one", "--json"],
+        None,
+        &[],
+        0,
+    );
+    let show_val: Value = serde_json::from_str(show_res.stdout.trim()).unwrap();
+    assert_eq!(object_keys(&show_val), detail_keys);
+    assert_eq!(show_val, board_items[0]);
+
+    // 8. release (--json)
+    let release_res = run_cli_stdin_env(
+        &[
+            "--registry",
+            path_str,
+            "release",
+            "task-two",
+            "--holder",
+            "bob",
+            "--token",
+            &tok2,
+            "--epoch",
+            "1",
+            "--json",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let release_val: Value = serde_json::from_str(release_res.stdout.trim()).unwrap();
+    assert_eq!(object_keys(&release_val), vec!["item", "status", "epoch"]);
+    assert_eq!(
+        release_res.stdout,
+        "{\"item\": \"task-two\", \"status\": \"open\", \"epoch\": 1}\n"
+    );
+
+    // 9. complete (--json)
+    let complete_res = run_cli_stdin_env(
+        &[
+            "--registry",
+            path_str,
+            "complete",
+            "task-one",
+            "--holder",
+            "alice",
+            "--token",
+            &tok1,
+            "--epoch",
+            "1",
+            "--json",
+        ],
+        None,
+        &[],
+        0,
+    );
+    let complete_val: Value = serde_json::from_str(complete_res.stdout.trim()).unwrap();
+    assert_eq!(object_keys(&complete_val), vec!["item", "status", "epoch"]);
+    assert_eq!(
+        complete_res.stdout,
+        "{\"item\": \"task-one\", \"status\": \"completed\", \"epoch\": 1}\n"
+    );
+
+    // 10. history (--json)
+    let history_res =
+        run_cli_stdin_env(&["--registry", path_str, "history", "--json"], None, &[], 0);
+    let Value::Array(events) = serde_json::from_str::<Value>(history_res.stdout.trim()).unwrap()
+    else {
+        panic!("expected history array");
+    };
+    assert_eq!(events.len(), 8);
+    let event_keys = vec![
+        "seq",
+        "at",
+        "kind",
+        "item",
+        "holder",
+        "epoch",
+        "expires_at",
+        "note",
+        "previous_holder",
+    ];
+    let expected_history: [(i128, &str, &str, Option<&str>, i128); 8] = [
+        (1, "offered", "task-one", None, 0),
+        (2, "offered", "task-two", None, 0),
+        (3, "offered", "task-three", None, 0),
+        (4, "claimed", "task-one", Some("alice"), 1),
+        (5, "claimed", "task-two", Some("bob"), 1),
+        (6, "renewed", "task-one", Some("alice"), 1),
+        (7, "released", "task-two", Some("bob"), 1),
+        (8, "completed", "task-one", Some("alice"), 1),
+    ];
+    for (ev, (seq, kind, item_name, holder, epoch)) in events.iter().zip(expected_history) {
+        assert_eq!(object_keys(ev), event_keys);
+        assert_eq!(object_field(ev, "seq"), &Value::Int(seq));
+        assert_eq!(object_field(ev, "kind"), &Value::Str(kind.to_string()));
+        assert_eq!(object_field(ev, "item"), &Value::Str(item_name.to_string()));
+        let exp_holder = holder
+            .map(|h| Value::Str(h.to_string()))
+            .unwrap_or(Value::Null);
+        assert_eq!(object_field(ev, "holder"), &exp_holder);
+        assert_eq!(object_field(ev, "epoch"), &Value::Int(epoch));
+        assert_eq!(object_field(ev, "expires_at"), &Value::Null);
+        assert_eq!(object_field(ev, "note"), &Value::Null);
+        assert_eq!(object_field(ev, "previous_holder"), &Value::Null);
+    }
+
+    // Strict single-line JSON check and zero secret leakage check across all 10 subcommands.
+    for out_text in [
+        &offer_res.stdout,
+        &batch_res.stdout,
+        &claim_res.stdout,
+        &next_res.stdout,
+        &renew_res.stdout,
+        &board_res.stdout,
+        &show_res.stdout,
+        &release_res.stdout,
+        &complete_res.stdout,
+        &history_res.stdout,
+    ] {
+        assert!(out_text.ends_with('\n'), "{out_text}");
+        assert!(
+            !out_text[..out_text.len() - 1].contains(['\n', '\r']),
+            "multiline JSON output: {out_text:?}"
+        );
+        assert!(!out_text.contains("token_hash"), "{out_text}");
+        assert!(!out_text.contains(&hash1), "{out_text}");
+        assert!(!out_text.contains(&hash2), "{out_text}");
+    }
+    for non_claim_out in [
+        &offer_res.stdout,
+        &batch_res.stdout,
+        &renew_res.stdout,
+        &board_res.stdout,
+        &show_res.stdout,
+        &release_res.stdout,
+        &complete_res.stdout,
+        &history_res.stdout,
+    ] {
+        assert!(!non_claim_out.contains(&tok1), "{non_claim_out}");
+        assert!(!non_claim_out.contains(&tok2), "{non_claim_out}");
+    }
+}
+
+#[test]
+fn cli_safe_credentials_env_fallbacks_version_and_completions() {
+    let dir = temp_dir("cli-safe-creds");
+    let path = dir.join("registry.json");
+    let path_str = path.to_str().unwrap();
+
+    // Missing --registry when DIBS_REGISTRY is unset fails at exit 2 with parser error.
+    let missing_reg = run_cli_stdin_env(&["board"], None, &[], 2);
+    assert!(
+        missing_reg
+            .stderr
+            .contains("the following arguments are required: --registry"),
+        "{}",
+        missing_reg.stderr
+    );
+
+    // Missing --token on renew, release, and complete when DIBS_TOKEN is unset
+    // fails at exit 2 with parser error.
+    for missing_tok_args in [
+        vec![
+            "--registry",
+            path_str,
+            "renew",
+            "task-env",
+            "--holder",
+            "alice",
+            "--epoch",
+            "1",
+            "--ttl",
+            "60",
+        ],
+        vec![
+            "--registry",
+            path_str,
+            "release",
+            "task-env",
+            "--holder",
+            "alice",
+            "--epoch",
+            "1",
+        ],
+        vec![
+            "--registry",
+            path_str,
+            "complete",
+            "task-env",
+            "--holder",
+            "alice",
+            "--epoch",
+            "1",
+        ],
+    ] {
+        let missing_tok = run_cli_stdin_env(&missing_tok_args, None, &[], 2);
+        assert!(
+            missing_tok
+                .stderr
+                .contains("the following arguments are required: --token"),
+            "{}",
+            missing_tok.stderr
+        );
+    }
+
+    // DIBS_REGISTRY fallback and post-subcommand --registry override.
+    run_cli_stdin_env(
+        &["offer", "task-env", "--note", "from env"],
+        None,
+        &[("DIBS_REGISTRY", Some(path_str))],
+        0,
+    );
+    let other_path = dir.join("other.json");
+    let other_str = other_path.to_str().unwrap();
+    run_cli_stdin_env(
+        &["offer", "task-override", "--registry", other_str],
+        None,
+        &[("DIBS_REGISTRY", Some(path_str))],
+        0,
+    );
+    let env_board = run_cli_stdin_env(&["board"], None, &[("DIBS_REGISTRY", Some(path_str))], 0);
+    assert_eq!(env_board.stdout, "task-env open epoch=0\n");
+    let post_board = run_cli_stdin_env(&["board", "--registry", other_str], None, &[], 0);
+    assert_eq!(post_board.stdout, "task-override open epoch=0\n");
+
+    // Empty DIBS_REGISTRY="" triggers DB-15 path validation at exit 2.
+    let empty_env_reg = run_cli_stdin_env(&["board"], None, &[("DIBS_REGISTRY", Some(""))], 2);
+    assert_eq!(
+        empty_env_reg.stderr,
+        "error: invalid registry path '', the path must name a file\n"
+    );
+
+    // Non-UTF-8 stdin bytes on offer-batch refuse at exit 2.
+    let bad_batch_utf8 = run_cli_stdin_env(
+        &["offer-batch"],
+        Some(b"bad\xff\n"),
+        &[("DIBS_REGISTRY", Some(path_str))],
+        2,
+    );
+    assert!(
+        bad_batch_utf8
+            .stderr
+            .starts_with("error: offer batch input is not valid UTF-8"),
+        "{}",
+        bad_batch_utf8.stderr
+    );
+
+    // Claim task-env, then exercise --token - round-trip and boundaries.
+    let claim_out = run_cli_stdin_env(
+        &["claim-next", "--holder", "alice", "--ttl", "600", "--json"],
+        None,
+        &[("DIBS_REGISTRY", Some(path_str))],
+        0,
+    );
+    let claim_val: Value = serde_json::from_str(claim_out.stdout.trim()).unwrap();
+    let Value::Str(tok) = object_field(&claim_val, "token").clone() else {
+        panic!("expected token");
+    };
+
+    // Non-UTF-8 stdin bytes on --token - refuse at exit 2.
+    let bad_tok_utf8 = run_cli_stdin_env(
+        &[
+            "renew", "task-env", "--holder", "alice", "--token", "-", "--epoch", "1", "--ttl", "60",
+        ],
+        Some(b"bad\xff\n"),
+        &[("DIBS_REGISTRY", Some(path_str))],
+        2,
+    );
+    assert_eq!(
+        bad_tok_utf8.stderr,
+        "error: stdin token is not valid UTF-8\n"
+    );
+
+    // --token - empty EOF and CRLF-only refuse at exit 2.
+    for empty_in in [b"".as_slice(), b"\n".as_slice(), b"\r\n".as_slice()] {
+        let res = run_cli_stdin_env(
+            &[
+                "renew", "task-env", "--holder", "alice", "--token", "-", "--epoch", "1", "--ttl",
+                "60",
+            ],
+            Some(empty_in),
+            &[("DIBS_REGISTRY", Some(path_str))],
+            2,
+        );
+        assert_eq!(res.stderr, "error: stdin token is empty\n");
+    }
+
+    // --token - boundary: 256 bytes passes length guard (reaches possession check at exit 1),
+    // whereas 257 bytes refuses at exit 2 with "stdin token exceeds 256 bytes".
+    let at_256 = vec![b'x'; 256];
+    let res_256 = run_cli_stdin_env(
+        &[
+            "renew", "task-env", "--holder", "alice", "--token", "-", "--epoch", "1", "--ttl", "60",
+        ],
+        Some(&at_256),
+        &[("DIBS_REGISTRY", Some(path_str))],
+        1,
+    );
+    assert_eq!(
+        res_256.stderr,
+        "error: the token presented for item 'task-env' does not match the lease\n"
+    );
+
+    let at_257 = vec![b'x'; 257];
+    let res_257 = run_cli_stdin_env(
+        &[
+            "renew", "task-env", "--holder", "alice", "--token", "-", "--epoch", "1", "--ttl", "60",
+        ],
+        Some(&at_257),
+        &[("DIBS_REGISTRY", Some(path_str))],
+        2,
+    );
+    assert_eq!(res_257.stderr, "error: stdin token exceeds 256 bytes\n");
+
+    // --token - valid token with trailing CRLF succeeds on renew AND on release!
+    let stdin_tok = format!("{tok}\r\n");
+    run_cli_stdin_env(
+        &[
+            "renew", "task-env", "--holder", "alice", "--token", "-", "--epoch", "1", "--ttl", "60",
+        ],
+        Some(stdin_tok.as_bytes()),
+        &[("DIBS_REGISTRY", Some(path_str))],
+        0,
+    );
+    let rel_stdin = run_cli_stdin_env(
+        &[
+            "release", "task-env", "--holder", "alice", "--token", "-", "--epoch", "1",
+        ],
+        Some(stdin_tok.as_bytes()),
+        &[("DIBS_REGISTRY", Some(path_str))],
+        0,
+    );
+    assert_eq!(rel_stdin.stdout, "released task-env\n");
+
+    // Re-claim at epoch 2, release via DIBS_TOKEN, then re-claim at epoch 3 and complete via DIBS_TOKEN.
+    let claim2_out = run_cli_stdin_env(
+        &["claim-next", "--holder", "alice", "--ttl", "600", "--json"],
+        None,
+        &[("DIBS_REGISTRY", Some(path_str))],
+        0,
+    );
+    let claim2_val: Value = serde_json::from_str(claim2_out.stdout.trim()).unwrap();
+    let Value::Str(tok2) = object_field(&claim2_val, "token").clone() else {
+        panic!("expected token");
+    };
+    let rel_env = run_cli_stdin_env(
+        &["release", "task-env", "--holder", "alice", "--epoch", "2"],
+        None,
+        &[
+            ("DIBS_REGISTRY", Some(path_str)),
+            ("DIBS_TOKEN", Some(&tok2)),
+        ],
+        0,
+    );
+    assert_eq!(rel_env.stdout, "released task-env\n");
+
+    let claim3_out = run_cli_stdin_env(
+        &["claim-next", "--holder", "alice", "--ttl", "600", "--json"],
+        None,
+        &[("DIBS_REGISTRY", Some(path_str))],
+        0,
+    );
+    let claim3_val: Value = serde_json::from_str(claim3_out.stdout.trim()).unwrap();
+    let Value::Str(tok3) = object_field(&claim3_val, "token").clone() else {
+        panic!("expected token");
+    };
+
+    // Empty DIBS_TOKEN="" refuses at exit 2, while valid DIBS_TOKEN completes cleanly.
+    let empty_env_tok = run_cli_stdin_env(
+        &["complete", "task-env", "--holder", "alice", "--epoch", "3"],
+        None,
+        &[("DIBS_REGISTRY", Some(path_str)), ("DIBS_TOKEN", Some(""))],
+        2,
+    );
+    assert_eq!(empty_env_tok.stderr, "error: DIBS_TOKEN is empty\n");
+
+    let done = run_cli_stdin_env(
+        &["complete", "task-env", "--holder", "alice", "--epoch", "3"],
+        None,
+        &[
+            ("DIBS_REGISTRY", Some(path_str)),
+            ("DIBS_TOKEN", Some(&tok3)),
+        ],
+        0,
+    );
+    assert_eq!(done.stdout, "completed task-env\n");
+
+    // Standalone -V and --version succeed without --registry; clusters and --json combos exit 2.
+    let expected_ver = format!("dibs {}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        run_cli_stdin_env(&["-V"], None, &[], 0).stdout,
+        expected_ver
+    );
+    assert_eq!(
+        run_cli_stdin_env(&["--version"], None, &[], 0).stdout,
+        expected_ver
+    );
+    for bad_ver in [
+        vec!["-jV"],
+        vec!["-Vj"],
+        vec!["-hj"],
+        vec!["--json", "--version"],
+        vec!["--version", "--json"],
+    ] {
+        run_cli_stdin_env(&bad_ver, None, &[], 2);
+    }
+
+    // Completions for bash, zsh, and fish succeed without --registry and cover
+    // all 11 subcommands and all 10 option flags.
+    for shell in ["bash", "zsh", "fish"] {
+        let comp = run_cli_stdin_env(&["completions", shell], None, &[], 0);
+        for sub in [
+            "offer",
+            "offer-batch",
+            "claim",
+            "claim-next",
+            "renew",
+            "release",
+            "complete",
+            "board",
+            "show",
+            "history",
+            "completions",
+        ] {
+            assert!(
+                comp.stdout.contains(sub),
+                "{shell} completions missing subcommand {sub}"
+            );
+        }
+        for flag in [
+            "--help",
+            "--version",
+            "--json",
+            "--registry",
+            "--note",
+            "--file",
+            "--holder",
+            "--ttl",
+            "--token",
+            "--epoch",
+        ] {
+            assert!(
+                comp.stdout.contains(flag),
+                "{shell} completions missing flag {flag}"
+            );
+        }
+        if shell == "fish" {
+            for opt in [
+                "-l help",
+                "-l version",
+                "-l json",
+                "-l registry",
+                "-l note",
+                "-l file",
+                "-l holder",
+                "-l ttl",
+                "-l token",
+                "-l epoch",
+            ] {
+                assert!(
+                    comp.stdout.contains(opt),
+                    "fish completions missing option rule {opt}"
+                );
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        for shell in ["bash", "zsh"] {
+            if let Ok(status) = Command::new(shell).arg("-c").arg("exit 0").status() {
+                if status.success() {
+                    let comp = run_cli_stdin_env(&["completions", shell], None, &[], 0);
+                    let mut check = Command::new(shell)
+                        .arg("-n")
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    use std::io::Write;
+                    check
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(comp.stdout.as_bytes())
+                        .unwrap();
+                    assert!(
+                        check.wait().unwrap().success(),
+                        "{shell} -n failed on generated completion script"
+                    );
+                }
+            }
+        }
+    }
+    for bad_comp in [
+        vec!["completions"],
+        vec!["completions", "powershell"],
+        vec!["completions", "zsh", "--json"],
+        vec!["--json", "completions", "zsh"],
+        vec!["completions", "zsh", "-j"],
+    ] {
+        run_cli_stdin_env(&bad_comp, None, &[], 2);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_post_subcommand_registry_preserves_non_unicode_os_string_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = temp_dir("cli-post-sub-non-unicode");
+    let odd_dir = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
+    let odd_path = odd_dir.join("registry.json");
+    let mut equals = std::ffi::OsString::from("--registry=");
+    equals.push(odd_path.as_os_str());
+
+    if std::fs::create_dir_all(&odd_dir).is_ok() {
+        for post_args in [
+            vec![
+                std::ffi::OsString::from("offer"),
+                std::ffi::OsString::from("task-one"),
+                std::ffi::OsString::from("--registry"),
+                odd_path.clone().into(),
+            ],
+            vec![std::ffi::OsString::from("board"), equals.clone()],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+                .env_remove("DIBS_REGISTRY")
+                .args(&post_args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(0), "{stderr}");
+            assert!(!stderr.contains("not valid Unicode text"), "{stderr}");
+        }
+    } else {
+        for post_args in [
+            vec![
+                std::ffi::OsString::from("board"),
+                std::ffi::OsString::from("--registry"),
+                odd_path.clone().into(),
+            ],
+            vec![std::ffi::OsString::from("board"), equals],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+                .env_remove("DIBS_REGISTRY")
+                .args(&post_args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(0), "{stderr}");
+            assert_eq!(output.stdout, b"");
+            assert!(!stderr.contains("not valid Unicode text"), "{stderr}");
+            assert!(!stderr.contains("panicked"), "{stderr}");
+        }
+    }
+
+    // Non-Unicode bytes on a non-path subcommand option value (--note) still
+    // refuse as a Unicode parser error at exit 2.
+    let valid_path = dir.join("valid.json");
+    let bad_note = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+    let bad_out = Command::new(env!("CARGO_BIN_EXE_dibs"))
+        .env_remove("DIBS_REGISTRY")
+        .arg("--registry")
+        .arg(&valid_path)
+        .arg("offer")
+        .arg("task-one")
+        .arg("--note")
+        .arg(&bad_note)
+        .output()
+        .unwrap();
+    let bad_stderr = String::from_utf8_lossy(&bad_out.stderr);
+    assert_eq!(bad_out.status.code(), Some(2), "{bad_stderr}");
+    assert!(
+        bad_stderr.contains("not valid Unicode text"),
+        "{bad_stderr}"
     );
 }

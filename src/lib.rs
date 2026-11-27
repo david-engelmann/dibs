@@ -512,8 +512,9 @@ impl Instant {
         })
     }
 
-    /// The instant the system clock reports now, in UTC. Only the
-    /// command line uses this, and it offers no override.
+    /// The instant the system clock reports now, in UTC. Used by
+    /// the command line and by the Python binding when now is
+    /// omitted.
     pub fn now_utc() -> Result<Instant> {
         Instant::from_clock_read(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
     }
@@ -1203,6 +1204,95 @@ pub struct ClaimGranted {
     pub expires_at: Instant,
 }
 
+/// Specification for one item offered in a batch (DB-18).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferSpec {
+    pub id: String,
+    pub note: String,
+}
+
+impl OfferSpec {
+    pub fn new(id: impl Into<String>, note: impl Into<String>) -> OfferSpec {
+        OfferSpec {
+            id: id.into(),
+            note: note.into(),
+        }
+    }
+}
+
+/// Detailed single item view with lease state and takeover count
+/// evaluated at the read instant (DB-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemDetail {
+    pub id: String,
+    pub note: String,
+    pub status: String,
+    pub effective_status: String,
+    pub priority: u8,
+    pub tags: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub holder: Option<String>,
+    pub expires_at: Option<String>,
+    pub epoch: i128,
+    pub takeover_count: u64,
+    pub max_takeovers: Option<u64>,
+}
+
+/// Parse JSON Lines input for `offer-batch` into validated item
+/// specifications before touching disk (DB-18).
+pub fn parse_offer_batch_jsonl(text: &str) -> Result<Vec<OfferSpec>> {
+    let mut specs = Vec::new();
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_no = index + 1;
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(raw_line).map_err(|err| {
+            let err_text = err.to_string();
+            if let Some(key) = duplicate_key_of(&err_text) {
+                Error::InvalidRequest(format!(
+                    "offer batch line {line_no} carries duplicate key {}",
+                    duplicate_key_display(&key)
+                ))
+            } else {
+                Error::InvalidRequest(format!(
+                    "offer batch line {line_no} is not valid JSON, {err_text}"
+                ))
+            }
+        })?;
+        let Value::Object(pairs) = value else {
+            return Err(Error::InvalidRequest(format!(
+                "offer batch line {line_no} is not a JSON object"
+            )));
+        };
+        for (key, _) in &pairs {
+            if key != "id" && key != "note" {
+                return Err(Error::InvalidRequest(format!(
+                    "offer batch line {line_no} carries unknown field {}",
+                    py_repr(key)
+                )));
+            }
+        }
+        let Some(id_val) = object_get(&pairs, "id") else {
+            return Err(Error::InvalidRequest(format!(
+                "offer batch line {line_no} is missing required field 'id'"
+            )));
+        };
+        let id = validate_name(id_val, "item")?;
+        let note = match object_get(&pairs, "note") {
+            Some(note_val) => validate_note(note_val)?,
+            None => String::new(),
+        };
+        specs.push(OfferSpec { id, note });
+    }
+    if specs.is_empty() {
+        return Err(Error::InvalidRequest(
+            "offer batch requires at least one item".to_string(),
+        ));
+    }
+    Ok(specs)
+}
+
 fn object_get<'a>(pairs: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
     pairs
         .iter()
@@ -1714,7 +1804,7 @@ fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<(
 /// for the same content: the quote, the backslash, and every
 /// character outside the printable ASCII range is escaped, with a
 /// surrogate pair for a character past the basic plane.
-fn escape_json_string(text: &str, out: &mut String) {
+pub fn escape_json_string(text: &str, out: &mut String) {
     out.push('"');
     for ch in text.chars() {
         match ch {
@@ -2570,6 +2660,117 @@ impl Registry {
         })
     }
 
+    /// Add a batch of items to the backlog all or nothing under one
+    /// exclusive lock and return the offered item ids in order (DB-18).
+    pub fn offer_many(&self, specs: &[OfferSpec], now: &Instant) -> Result<Vec<String>> {
+        if specs.is_empty() {
+            return Err(Error::InvalidRequest(
+                "offer batch requires at least one item".to_string(),
+            ));
+        }
+        let mut seen_in_batch: HashSet<&str> = HashSet::with_capacity(specs.len());
+        for spec in specs {
+            validate_name_str(&spec.id, "item")?;
+            validate_note_str(&spec.note)?;
+            if !seen_in_batch.insert(spec.id.as_str()) {
+                return Err(Error::InvalidRequest(format!(
+                    "duplicate item id {} in offer batch",
+                    py_repr(&spec.id)
+                )));
+            }
+        }
+        validate_now(now)?;
+        self.mutate(|document| {
+            let standing: HashSet<&str> =
+                document.items.iter().map(|item| item.id.as_str()).collect();
+            for spec in specs {
+                if standing.contains(spec.id.as_str()) {
+                    return Err(Error::Refusal(format!(
+                        "item {} already stands in the backlog",
+                        py_repr(&spec.id)
+                    )));
+                }
+            }
+            let mut offered = Vec::with_capacity(specs.len());
+            for spec in specs {
+                document.items.push(Item {
+                    id: spec.id.clone(),
+                    note: spec.note.clone(),
+                    status: "open".to_string(),
+                    holder: None,
+                    token_hash: None,
+                    epoch: 0,
+                    expires_at: None,
+                });
+                Self::append_event(document, "offered", &spec.id, None, now, 0, None);
+                offered.push(spec.id.clone());
+            }
+            Ok(offered)
+        })
+    }
+
+    fn grant_claim_at(
+        document: &mut Document,
+        index: usize,
+        holder: &str,
+        ttl: i64,
+        now: &Instant,
+    ) -> Result<ClaimGranted> {
+        let item_id = document.items[index].id.clone();
+        let (kind, previous) = if document.items[index].status == "claimed" {
+            ("taken_over", document.items[index].holder.clone())
+        } else {
+            ("claimed", None)
+        };
+        // The epoch this claim assigns must be an epoch the
+        // reader can take back. A stored epoch at the
+        // unsigned top is a document the reader accepts, and
+        // assigning the next epoch would write a document no
+        // reader accepts, so the claim refuses here, before
+        // any state changes.
+        if document.items[index].epoch >= u64::MAX as i128 {
+            return Err(Error::Refusal(format!(
+                "item {} stands at epoch {}, and no epoch past it can be \
+                 assigned, so the claim is refused",
+                py_repr(&item_id),
+                document.items[index].epoch
+            )));
+        }
+        let token = draw_token()?;
+        let expires = expiry_after(now, ttl)?;
+        let item = &mut document.items[index];
+        item.status = "claimed".to_string();
+        item.holder = Some(holder.to_string());
+        item.token_hash = Some(token_hash(&token));
+        item.epoch = match item.epoch.checked_add(1) {
+            Some(epoch) => epoch,
+            None => {
+                return Err(corrupt(format!(
+                    "item {} holds an invalid epoch",
+                    py_repr(&item_id)
+                )))
+            }
+        };
+        item.expires_at = Some(format_instant(&expires));
+        let epoch = item.epoch;
+        Self::append_event(
+            document,
+            kind,
+            &item_id,
+            Some(holder),
+            now,
+            epoch,
+            previous.as_deref(),
+        );
+        Ok(ClaimGranted {
+            item: item_id,
+            holder: holder.to_string(),
+            token,
+            epoch,
+            expires_at: expires,
+        })
+    }
+
     /// Lease an open or expired item and return the one
     /// ClaimGranted.
     pub fn claim(
@@ -2599,66 +2800,82 @@ impl Registry {
                     py_repr(item_id)
                 )));
             }
-            let mut kind = "claimed";
-            let mut previous: Option<String> = None;
-            if document.items[index].status == "claimed" {
-                if Self::lease_live(&document.items[index], now)? {
-                    return Err(Error::Refusal(format!(
-                        "item {} is already claimed by {}",
-                        py_repr(item_id),
-                        py_repr(document.items[index].holder.as_deref().unwrap_or_default())
-                    )));
-                }
-                kind = "taken_over";
-                previous = document.items[index].holder.clone();
-            }
-            // The epoch this claim assigns must be an epoch the
-            // reader can take back. A stored epoch at the
-            // unsigned top is a document the reader accepts, and
-            // assigning the next epoch would write a document no
-            // reader accepts, so the claim refuses here, before
-            // any state changes.
-            if document.items[index].epoch >= u64::MAX as i128 {
+            if document.items[index].status == "claimed"
+                && Self::lease_live(&document.items[index], now)?
+            {
                 return Err(Error::Refusal(format!(
-                    "item {} stands at epoch {}, and no epoch past it can be \
-                     assigned, so the claim is refused",
+                    "item {} is already claimed by {}",
                     py_repr(item_id),
-                    document.items[index].epoch
+                    py_repr(document.items[index].holder.as_deref().unwrap_or_default())
                 )));
             }
-            let token = draw_token()?;
-            let expires = expiry_after(now, ttl)?;
-            let item = &mut document.items[index];
-            item.status = "claimed".to_string();
-            item.holder = Some(holder.to_string());
-            item.token_hash = Some(token_hash(&token));
-            item.epoch = match item.epoch.checked_add(1) {
-                Some(epoch) => epoch,
-                None => {
-                    return Err(corrupt(format!(
-                        "item {} holds an invalid epoch",
-                        py_repr(item_id)
-                    )))
+            Self::grant_claim_at(document, index, holder, ttl, now)
+        })
+    }
+
+    /// Lease the first open or expired item standing in offer order
+    /// and return the issued ClaimGranted (DB-17).
+    pub fn claim_next(&self, holder: &str, ttl: i64, now: &Instant) -> Result<ClaimGranted> {
+        validate_name_str(holder, "holder")?;
+        let ttl = validate_ttl_i64(ttl)?;
+        validate_now(now)?;
+        let _ = expiry_after(now, ttl)?;
+        self.validate_registry_path()?;
+        match std::fs::metadata(&self.path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                for ancestor in self.path.ancestors().skip(1) {
+                    if ancestor.as_os_str().is_empty() {
+                        break;
+                    }
+                    match std::fs::metadata(ancestor) {
+                        Ok(meta) if meta.is_dir() => break,
+                        Ok(_) => {
+                            return Err(Error::Failure(format!(
+                                "the registry file cannot be read, {err}"
+                            )));
+                        }
+                        Err(anc_err) if anc_err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(anc_err) => {
+                            return Err(Error::Failure(format!(
+                                "the registry file cannot be read, {anc_err}"
+                            )));
+                        }
+                    }
                 }
+                if std::fs::metadata(&self.lock_path)
+                    .err()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Err(Error::Refusal(
+                        "no ready item stands in the backlog".to_string(),
+                    ));
+                }
+            }
+            Err(err) => {
+                return Err(Error::Failure(format!(
+                    "the registry file cannot be read, {err}"
+                )));
+            }
+        }
+        self.mutate(|document| {
+            let mut target_index = None;
+            for (index, item) in document.items.iter().enumerate() {
+                if item.status == "completed" {
+                    continue;
+                }
+                if item.status == "claimed" && Self::lease_live(item, now)? {
+                    continue;
+                }
+                target_index = Some(index);
+                break;
+            }
+            let Some(index) = target_index else {
+                return Err(Error::Refusal(
+                    "no ready item stands in the backlog".to_string(),
+                ));
             };
-            item.expires_at = Some(format_instant(&expires));
-            let epoch = item.epoch;
-            Self::append_event(
-                document,
-                kind,
-                item_id,
-                Some(holder),
-                now,
-                epoch,
-                previous.as_deref(),
-            );
-            Ok(ClaimGranted {
-                item: item_id.to_string(),
-                holder: holder.to_string(),
-                token,
-                epoch,
-                expires_at: expires,
-            })
+            Self::grant_claim_at(document, index, holder, ttl, now)
         })
     }
 
@@ -2805,6 +3022,77 @@ impl Registry {
                 }
             }
             Ok(rows)
+        })
+    }
+
+    fn item_detail(item: &Item, takeover_count: u64, now: &Instant) -> Result<ItemDetail> {
+        let (status, holder, expires_at) = if item.status == "completed" {
+            ("completed".to_string(), None, None)
+        } else if Self::lease_live(item, now)? {
+            (
+                "claimed".to_string(),
+                item.holder.clone(),
+                item.expires_at.clone(),
+            )
+        } else {
+            ("open".to_string(), None, None)
+        };
+        let effective_status = status.clone();
+        Ok(ItemDetail {
+            id: item.id.clone(),
+            note: item.note.clone(),
+            status,
+            effective_status,
+            priority: 2,
+            tags: Vec::new(),
+            depends_on: Vec::new(),
+            holder,
+            expires_at,
+            epoch: item.epoch,
+            takeover_count,
+            max_takeovers: None,
+        })
+    }
+
+    /// Return the full detail of one item evaluated at the instant (DB-19).
+    pub fn show(&self, item_id: &str, now: &Instant) -> Result<ItemDetail> {
+        validate_name_str(item_id, "item")?;
+        validate_now(now)?;
+        self.read(|document| {
+            let Some(item) = document.items.iter().find(|item| item.id == item_id) else {
+                return Err(Error::NotFound(format!(
+                    "item {} does not stand in the backlog",
+                    py_repr(item_id)
+                )));
+            };
+            let takeover_count = document
+                .history
+                .iter()
+                .filter(|event| event.item == item_id && event.kind == "taken_over")
+                .count() as u64;
+            Self::item_detail(item, takeover_count, now)
+        })
+    }
+
+    /// Return the full detail summaries of the non completed items
+    /// standing on the board in offer order, evaluated at the instant.
+    pub fn board_details(&self, now: &Instant) -> Result<Vec<ItemDetail>> {
+        validate_now(now)?;
+        self.read(|document| {
+            let mut takeovers: HashMap<&str, u64> = HashMap::new();
+            for event in &document.history {
+                if event.kind == "taken_over" {
+                    *takeovers.entry(event.item.as_str()).or_insert(0) += 1;
+                }
+            }
+            let mut details = Vec::new();
+            for item in &document.items {
+                if item.status != "completed" {
+                    let count = takeovers.get(item.id.as_str()).copied().unwrap_or(0);
+                    details.push(Self::item_detail(item, count, now)?);
+                }
+            }
+            Ok(details)
         })
     }
 
