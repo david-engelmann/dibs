@@ -30,7 +30,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyInt, PyString};
 
 use dibs_core::{
-    BoardRow, ClaimGranted, Error, Event, Instant, ItemDetail, OfferSpec, Registry, Value,
+    BoardRow, ClaimGranted, CompactSummary, Error, Event, Instant, ItemDetail, OfferSpec, Registry,
+    Value, PRIORITY_DEFAULT,
 };
 
 create_exception!(dibs, DibsError, pyo3::exceptions::PyException);
@@ -209,7 +210,76 @@ fn resolve_now(now: Option<&str>) -> PyResult<Instant> {
     }
 }
 
+fn priority_argument(value: &Bound<'_, PyAny>) -> PyResult<u8> {
+    refuse_boolean(value, "priority")?;
+    let wide =
+        integer_value(value).map_err(|_| PyTypeError::new_err("priority must be an integer"))?;
+    dibs_core::validate_priority(&wide).map_err(to_py_error)
+}
+
+fn max_takeovers_argument(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<u64>> {
+    let Some(val) = value else {
+        return Ok(None);
+    };
+    if val.is_none() {
+        return Ok(None);
+    }
+    refuse_boolean(val, "max_takeovers")?;
+    let wide = integer_value(val)
+        .map_err(|_| PyTypeError::new_err("max_takeovers must be an integer or None"))?;
+    dibs_core::validate_max_takeovers(&wide).map_err(to_py_error)
+}
+
+fn through_seq_argument(value: &Bound<'_, PyAny>) -> PyResult<u64> {
+    refuse_boolean(value, "through_seq")?;
+    let wide =
+        integer_value(value).map_err(|_| PyTypeError::new_err("through_seq must be an integer"))?;
+    dibs_core::validate_through_seq(&wide).map_err(to_py_error)
+}
+
+fn extract_string_list(value: &Bound<'_, PyAny>, field_name: &str) -> PyResult<Vec<String>> {
+    if value.is_instance_of::<PyString>()
+        || value.is_instance_of::<PyBytes>()
+        || value.is_instance_of::<PyByteArray>()
+        || value.is_instance_of::<PyDict>()
+    {
+        return Err(PyTypeError::new_err(format!(
+            "{field_name} must be an iterable of strings, not a single str, bytes, or dict"
+        )));
+    }
+    let mut out = Vec::new();
+    for elem_res in value.try_iter()? {
+        let elem = elem_res?;
+        if !elem.is_instance_of::<PyString>() {
+            return Err(PyTypeError::new_err(format!(
+                "each element of {field_name} must be a string"
+            )));
+        }
+        out.push(elem.extract::<String>()?);
+    }
+    Ok(out)
+}
+
+fn extract_optional_string_list(
+    value: Option<&Bound<'_, PyAny>>,
+    field_name: &str,
+) -> PyResult<Vec<String>> {
+    match value {
+        None => Ok(Vec::new()),
+        Some(val) if val.is_none() => Ok(Vec::new()),
+        Some(val) => extract_string_list(val, field_name),
+    }
+}
+
 fn extract_offer_specs(specs: &Bound<'_, PyAny>) -> PyResult<Vec<OfferSpec>> {
+    const ALLOWED_KEYS: [&str; 6] = [
+        "id",
+        "note",
+        "priority",
+        "tags",
+        "depends_on",
+        "max_takeovers",
+    ];
     if specs.is_instance_of::<PyString>()
         || specs.is_instance_of::<PyBytes>()
         || specs.is_instance_of::<PyByteArray>()
@@ -224,10 +294,7 @@ fn extract_offer_specs(specs: &Bound<'_, PyAny>) -> PyResult<Vec<OfferSpec>> {
         let entry = item_res?;
         if entry.is_instance_of::<PyString>() {
             let id: String = entry.extract()?;
-            out.push(OfferSpec {
-                id,
-                note: String::new(),
-            });
+            out.push(OfferSpec::new(id, ""));
         } else if entry.is_instance_of::<PyDict>() {
             let dict: Bound<'_, PyDict> = entry.extract()?;
             for (k, _) in dict.iter() {
@@ -236,7 +303,7 @@ fn extract_offer_specs(specs: &Bound<'_, PyAny>) -> PyResult<Vec<OfferSpec>> {
                         "offer spec dictionary keys must be strings".to_string(),
                     ))
                 })?;
-                if key != "id" && key != "note" {
+                if !ALLOWED_KEYS.contains(&key.as_str()) {
                     return Err(to_py_error(Error::InvalidRequest(format!(
                         "offer spec carries unknown field {}",
                         dibs_core::py_repr(&key)
@@ -248,17 +315,58 @@ fn extract_offer_specs(specs: &Bound<'_, PyAny>) -> PyResult<Vec<OfferSpec>> {
                     "offer spec dictionary is missing required field 'id'".to_string(),
                 )));
             };
-            let id: String = id_any
-                .extract()
-                .map_err(|_| PyTypeError::new_err("offer spec 'id' must be a string"))?;
+            if !id_any.is_instance_of::<PyString>() {
+                return Err(PyTypeError::new_err("offer spec 'id' must be a string"));
+            }
+            let id: String = id_any.extract()?;
             let note = match dict.get_item("note")? {
                 None => String::new(),
                 Some(note_any) if note_any.is_none() => String::new(),
-                Some(note_any) => note_any.extract().map_err(|_| {
-                    PyTypeError::new_err("offer spec 'note' must be a string or None")
-                })?,
+                Some(note_any) => {
+                    if !note_any.is_instance_of::<PyString>() {
+                        return Err(PyTypeError::new_err("offer spec 'note' must be a string"));
+                    }
+                    note_any.extract()?
+                }
             };
-            out.push(OfferSpec { id, note });
+            let priority = match dict.get_item("priority")? {
+                None => PRIORITY_DEFAULT,
+                Some(prio_any) if prio_any.is_none() => {
+                    return Err(to_py_error(
+                        dibs_core::validate_priority(&Value::Null).unwrap_err(),
+                    ));
+                }
+                Some(prio_any) => priority_argument(&prio_any)?,
+            };
+            let tags = match dict.get_item("tags")? {
+                None => Vec::new(),
+                Some(tags_any) if tags_any.is_none() => {
+                    return Err(to_py_error(Error::InvalidRequest(
+                        "offer spec 'tags' must be a list of tag names, not None".to_string(),
+                    )));
+                }
+                Some(tags_any) => extract_string_list(&tags_any, "tags")?,
+            };
+            let depends_on = match dict.get_item("depends_on")? {
+                None => Vec::new(),
+                Some(deps_any) if deps_any.is_none() => {
+                    return Err(to_py_error(Error::InvalidRequest(
+                        "offer spec 'depends_on' must be a list of item ids, not None".to_string(),
+                    )));
+                }
+                Some(deps_any) => extract_string_list(&deps_any, "depends_on")?,
+            };
+            let max_takeovers = match dict.get_item("max_takeovers")? {
+                None => None,
+                Some(cap_any) => max_takeovers_argument(Some(&cap_any))?,
+            };
+            out.push(
+                OfferSpec::new(id, note)
+                    .with_priority(priority)
+                    .with_tags(tags)
+                    .with_depends_on(depends_on)
+                    .with_max_takeovers(max_takeovers),
+            );
         } else {
             return Err(PyTypeError::new_err(
                 "each offer spec must be a string item id or a dictionary",
@@ -327,20 +435,44 @@ fn event_dict(py: Python<'_>, event: &Event) -> PyResult<Py<PyDict>> {
     Ok(dict.unbind())
 }
 
+fn compact_dict(py: Python<'_>, summary: &CompactSummary) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("through_seq", summary.through_seq)?;
+    dict.set_item("archived_count", summary.archived_count)?;
+    dict.set_item("remaining_count", summary.remaining_count)?;
+    dict.set_item("archived_events_sha256", &summary.archived_events_sha256)?;
+    dict.set_item("archive_path", summary.archive_path.as_os_str())?;
+    Ok(dict.unbind())
+}
+
 /// Add an item to the backlog and record the offered event.
 #[pyfunction]
-#[pyo3(signature = (registry, item, now = None, note = None))]
-fn offer(
+#[pyo3(signature = (registry, item, now = None, note = None, *, priority, tags = None, depends_on = None, max_takeovers = None))]
+#[allow(clippy::too_many_arguments)]
+fn _offer(
     py: Python<'_>,
     registry: PathBuf,
     item: &str,
     now: Option<&str>,
     note: Option<&str>,
+    priority: &Bound<'_, PyAny>,
+    tags: Option<&Bound<'_, PyAny>>,
+    depends_on: Option<&Bound<'_, PyAny>>,
+    max_takeovers: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<()> {
+    let priority = priority_argument(priority)?;
+    let tags = extract_optional_string_list(tags, "tags")?;
+    let depends_on = extract_optional_string_list(depends_on, "depends_on")?;
+    let max_takeovers = max_takeovers_argument(max_takeovers)?;
     let now = resolve_now(now)?;
     let note = note.unwrap_or_default();
+    let spec = OfferSpec::new(item, note)
+        .with_priority(priority)
+        .with_tags(tags)
+        .with_depends_on(depends_on)
+        .with_max_takeovers(max_takeovers);
     let registry = Registry::new(registry);
-    py.detach(|| registry.offer(item, note, &now))
+    py.detach(|| registry.offer_with(&spec, &now))
         .map_err(to_py_error)
 }
 
@@ -382,22 +514,29 @@ fn claim(
     claim_dict(py, &granted)
 }
 
-/// Lease the first open or expired item in offer order and return
-/// the issued token and the lease facts as a plain dictionary.
+/// Lease the highest-priority ready item matching optional tags
+/// and return the issued token and lease facts as a plain dictionary.
 #[pyfunction]
-#[pyo3(signature = (registry, holder, ttl, now = None))]
+#[pyo3(signature = (registry, holder, ttl, now = None, *, tags = None))]
 fn claim_next(
     py: Python<'_>,
     registry: PathBuf,
     holder: &str,
     ttl: &Bound<'_, PyAny>,
     now: Option<&str>,
+    tags: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Py<PyDict>> {
     let ttl = ttl_argument_holder(holder, ttl)?;
+    dibs_core::validate_name(&Value::Str(holder.to_string()), "holder").map_err(to_py_error)?;
+    dibs_core::validate_ttl(&Value::Int(ttl as i128)).map_err(to_py_error)?;
+    let tags = extract_optional_string_list(tags, "tags")?;
+    for tag in &tags {
+        dibs_core::validate_name(&Value::Str(tag.clone()), "tag").map_err(to_py_error)?;
+    }
     let now = resolve_now(now)?;
     let registry = Registry::new(registry);
     let granted = py
-        .detach(|| registry.claim_next(holder, ttl, &now))
+        .detach(|| registry.claim_next_with_tags(holder, ttl, &tags, &now))
         .map_err(to_py_error)?;
     claim_dict(py, &granted)
 }
@@ -467,6 +606,17 @@ fn complete(
         .map_err(to_py_error)
 }
 
+/// Reset an exhausted item back to open with takeover_count 0.
+#[pyfunction]
+#[pyo3(signature = (registry, item, now = None))]
+fn reset(py: Python<'_>, registry: PathBuf, item: &str, now: Option<&str>) -> PyResult<()> {
+    let now = resolve_now(now)?;
+    let registry = Registry::new(registry);
+    py.detach(|| registry.reset(item, &now))
+        .map(|_| ())
+        .map_err(to_py_error)
+}
+
 /// Return the items standing on the board in offer order as plain
 /// six key dictionaries evaluated at now.
 #[pyfunction]
@@ -476,6 +626,25 @@ fn board(py: Python<'_>, registry: PathBuf, now: Option<&str>) -> PyResult<Vec<P
     let registry = Registry::new(registry);
     let rows = py.detach(|| registry.board(&now)).map_err(to_py_error)?;
     rows.iter().map(|row| board_dict(py, row)).collect()
+}
+
+/// Return ready items matching optional tags ordered by priority
+/// and offer order as twelve key detail dictionaries.
+#[pyfunction]
+#[pyo3(signature = (registry, now = None, *, tags = None))]
+fn ready(
+    py: Python<'_>,
+    registry: PathBuf,
+    now: Option<&str>,
+    tags: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    let tags = extract_optional_string_list(tags, "tags")?;
+    let now = resolve_now(now)?;
+    let registry = Registry::new(registry);
+    let details = py
+        .detach(|| registry.ready(&tags, &now))
+        .map_err(to_py_error)?;
+    details.iter().map(|d| item_detail_dict(py, d)).collect()
 }
 
 /// Return the twelve key detail dictionary for one item evaluated
@@ -501,6 +670,26 @@ fn history(py: Python<'_>, registry: PathBuf, item: Option<&str>) -> PyResult<Ve
     events.iter().map(|event| event_dict(py, event)).collect()
 }
 
+/// Archive history events through through_seq into archive and
+/// record a dibs-registry/2 compaction baseline.
+#[pyfunction]
+#[pyo3(signature = (registry, through_seq, archive, now = None))]
+fn compact(
+    py: Python<'_>,
+    registry: PathBuf,
+    through_seq: &Bound<'_, PyAny>,
+    archive: PathBuf,
+    now: Option<&str>,
+) -> PyResult<Py<PyDict>> {
+    let through_seq = through_seq_argument(through_seq)?;
+    let now = resolve_now(now)?;
+    let registry = Registry::new(registry);
+    let summary = py
+        .detach(|| registry.compact(through_seq, &archive, &now))
+        .map_err(to_py_error)?;
+    compact_dict(py, &summary)
+}
+
 #[pymodule]
 fn _dibs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("DibsError", m.py().get_type::<DibsError>())?;
@@ -514,15 +703,18 @@ fn _dibs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("RefusalError", m.py().get_type::<RefusalError>())?;
     m.add("CorruptError", m.py().get_type::<CorruptError>())?;
     m.add("FailureError", m.py().get_type::<FailureError>())?;
-    m.add_function(wrap_pyfunction!(offer, m)?)?;
+    m.add_function(wrap_pyfunction!(_offer, m)?)?;
     m.add_function(wrap_pyfunction!(offer_many, m)?)?;
     m.add_function(wrap_pyfunction!(claim, m)?)?;
     m.add_function(wrap_pyfunction!(claim_next, m)?)?;
     m.add_function(wrap_pyfunction!(renew, m)?)?;
     m.add_function(wrap_pyfunction!(release, m)?)?;
     m.add_function(wrap_pyfunction!(complete, m)?)?;
+    m.add_function(wrap_pyfunction!(reset, m)?)?;
     m.add_function(wrap_pyfunction!(board, m)?)?;
+    m.add_function(wrap_pyfunction!(ready, m)?)?;
     m.add_function(wrap_pyfunction!(show, m)?)?;
     m.add_function(wrap_pyfunction!(history, m)?)?;
+    m.add_function(wrap_pyfunction!(compact, m)?)?;
     Ok(())
 }

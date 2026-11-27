@@ -29,26 +29,54 @@
 //! and the reshapings, and the error messages and the stored bytes
 //! reproduce the Python behaviour they name.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 pub const FORMAT_NAME: &str = "dibs-registry/1";
+pub const FORMAT_NAME_V2: &str = "dibs-registry/2";
 pub const LOCK_SUFFIX: &str = ".lock";
 pub const NAME_MAX: usize = 64;
 pub const NOTE_MAX: usize = 200;
 pub const TOKEN_BYTES: usize = 32;
 pub const TTL_MAX: i64 = 31_536_000;
+pub const PRIORITY_DEFAULT: u8 = 2;
+pub const PRIORITY_MAX: u8 = 3;
+pub const TAGS_MAX: usize = 16;
+pub const DEPENDS_ON_MAX: usize = 64;
+pub const MAX_TAKEOVERS_MAX: u64 = 1_000;
 
 const DOCUMENT_KEYS: [&str; 3] = ["format", "items", "history"];
+const DOCUMENT_KEYS_V2: [&str; 4] = ["format", "compaction", "items", "history"];
+const COMPACTION_KEYS: [&str; 4] = [
+    "through_seq",
+    "archived_events_sha256",
+    "compacted_at",
+    "baseline",
+];
+const BASELINE_KEYS: [&str; 5] = ["id", "status", "holder", "epoch", "takeover_count"];
 const ITEM_KEYS: [&str; 7] = [
     "id",
     "note",
     "status",
+    "holder",
+    "token_hash",
+    "epoch",
+    "expires_at",
+];
+const ITEM_KEYS_V2: [&str; 12] = [
+    "id",
+    "note",
+    "status",
+    "priority",
+    "tags",
+    "depends_on",
+    "max_takeovers",
+    "takeover_count",
     "holder",
     "token_hash",
     "epoch",
@@ -70,6 +98,15 @@ const EVENT_KINDS: [&str; 6] = [
     "released",
     "completed",
     "taken_over",
+];
+const EVENT_KINDS_V2: [&str; 7] = [
+    "offered",
+    "claimed",
+    "renewed",
+    "released",
+    "completed",
+    "taken_over",
+    "reset",
 ];
 const ITEM_STATUSES: [&str; 3] = ["open", "claimed", "completed"];
 
@@ -373,6 +410,79 @@ fn validate_note_str(note: &str) -> Result<()> {
             "invalid note, use a string of at most {NOTE_MAX} characters"
         )))
     }
+}
+
+/// Refuse a priority outside 0..=3 (DB-23).
+pub fn validate_priority(value: &Value) -> Result<u8> {
+    match value {
+        Value::Int(number) if *number >= 0 && *number <= PRIORITY_MAX as i128 => Ok(*number as u8),
+        _ => Err(Error::InvalidRequest(format!(
+            "invalid priority {}, use an integer from 0 to {PRIORITY_MAX}",
+            py_repr_value(value)
+        ))),
+    }
+}
+
+/// Refuse a max_takeovers value that is neither null nor an integer in 1..=1000 (DB-23).
+pub fn validate_max_takeovers(value: &Value) -> Result<Option<u64>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Int(number) if *number >= 1 && *number <= MAX_TAKEOVERS_MAX as i128 => {
+            Ok(Some(*number as u64))
+        }
+        _ => Err(Error::InvalidRequest(format!(
+            "invalid max_takeovers {}, use an integer from 1 to {MAX_TAKEOVERS_MAX}",
+            py_repr_value(value)
+        ))),
+    }
+}
+
+/// Refuse a compaction through_seq that is not a positive 64-bit integer (DB-24).
+pub fn validate_through_seq(value: &Value) -> Result<u64> {
+    match value {
+        Value::Int(number) if *number >= 1 && *number <= u64::MAX as i128 => Ok(*number as u64),
+        _ => Err(Error::InvalidRequest(format!(
+            "invalid through_seq {}, use a positive integer at most {}",
+            py_repr_value(value),
+            u64::MAX
+        ))),
+    }
+}
+
+fn normalize_tags(raw: &[String]) -> Result<Vec<String>> {
+    for tag in raw {
+        validate_name_str(tag, "tag")?;
+    }
+    let mut sorted = raw.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() > TAGS_MAX {
+        return Err(Error::InvalidRequest(format!(
+            "too many tags, use at most {TAGS_MAX} tags per item"
+        )));
+    }
+    Ok(sorted)
+}
+
+fn normalize_depends_on(item_id: &str, raw: &[String]) -> Result<Vec<String>> {
+    for dep in raw {
+        validate_name_str(dep, "item")?;
+    }
+    if raw.iter().any(|dep| dep == item_id) {
+        return Err(Error::InvalidRequest(format!(
+            "item {} cannot depend on itself",
+            py_repr(item_id)
+        )));
+    }
+    let mut sorted = raw.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    if sorted.len() > DEPENDS_ON_MAX {
+        return Err(Error::InvalidRequest(format!(
+            "too many dependencies, use at most {DEPENDS_ON_MAX} dependencies per item"
+        )));
+    }
+    Ok(sorted)
 }
 
 /// Days from the civil date, the Howard Hinnant algorithm, with
@@ -1175,8 +1285,45 @@ pub struct Document {
     pub history: Vec<Event>,
 }
 
-fn empty_document() -> Document {
-    Document {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaselineEntry {
+    id: String,
+    status: String,
+    holder: Option<String>,
+    epoch: i128,
+    takeover_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Compaction {
+    through_seq: u64,
+    archived_events_sha256: String,
+    compacted_at: String,
+    baseline: Vec<BaselineEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StoredItem {
+    core: Item,
+    priority: u8,
+    tags: Vec<String>,
+    depends_on: Vec<String>,
+    max_takeovers: Option<u64>,
+    takeover_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RegistryDoc {
+    is_v2: bool,
+    compaction: Option<Compaction>,
+    items: Vec<StoredItem>,
+    history: Vec<Event>,
+}
+
+fn empty_registry_doc() -> RegistryDoc {
+    RegistryDoc {
+        is_v2: false,
+        compaction: None,
         items: Vec::new(),
         history: Vec::new(),
     }
@@ -1204,24 +1351,64 @@ pub struct ClaimGranted {
     pub expires_at: Instant,
 }
 
-/// Specification for one item offered in a batch (DB-18).
+/// Specification for one item offered individually or in a batch (DB-18, DB-22, DB-23).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OfferSpec {
     pub id: String,
     pub note: String,
+    pub priority: u8,
+    pub tags: Vec<String>,
+    pub depends_on: Vec<String>,
+    pub max_takeovers: Option<u64>,
 }
+
+/// Alias for single-item `/2` offer options (`Registry::offer_with`).
+pub type OfferOptions = OfferSpec;
 
 impl OfferSpec {
     pub fn new(id: impl Into<String>, note: impl Into<String>) -> OfferSpec {
         OfferSpec {
             id: id.into(),
             note: note.into(),
+            priority: PRIORITY_DEFAULT,
+            tags: Vec::new(),
+            depends_on: Vec::new(),
+            max_takeovers: None,
         }
+    }
+
+    pub fn with_priority(mut self, priority: u8) -> OfferSpec {
+        self.priority = priority;
+        self
+    }
+
+    pub fn with_tags<I, S>(mut self, tags: I) -> OfferSpec
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags = tags.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_depends_on<I, S>(mut self, depends_on: I) -> OfferSpec
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.depends_on = depends_on.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_max_takeovers(mut self, max_takeovers: Option<u64>) -> OfferSpec {
+        self.max_takeovers = max_takeovers;
+        self
     }
 }
 
 /// Detailed single item view with lease state and takeover count
-/// evaluated at the read instant (DB-19).
+/// evaluated at the read instant (DB-19, DB-22, DB-23).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemDetail {
     pub id: String,
@@ -1238,9 +1425,27 @@ pub struct ItemDetail {
     pub max_takeovers: Option<u64>,
 }
 
+/// Summary of a history compaction run (DB-24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactSummary {
+    pub through_seq: u64,
+    pub archived_count: u64,
+    pub remaining_count: u64,
+    pub archived_events_sha256: String,
+    pub archive_path: PathBuf,
+}
+
 /// Parse JSON Lines input for `offer-batch` into validated item
-/// specifications before touching disk (DB-18).
+/// specifications before touching disk (DB-18, DB-22, DB-23).
 pub fn parse_offer_batch_jsonl(text: &str) -> Result<Vec<OfferSpec>> {
+    const BATCH_KEYS: [&str; 6] = [
+        "id",
+        "note",
+        "priority",
+        "tags",
+        "depends_on",
+        "max_takeovers",
+    ];
     let mut specs = Vec::new();
     for (index, raw_line) in text.lines().enumerate() {
         let line_no = index + 1;
@@ -1266,7 +1471,7 @@ pub fn parse_offer_batch_jsonl(text: &str) -> Result<Vec<OfferSpec>> {
             )));
         };
         for (key, _) in &pairs {
-            if key != "id" && key != "note" {
+            if !BATCH_KEYS.contains(&key.as_str()) {
                 return Err(Error::InvalidRequest(format!(
                     "offer batch line {line_no} carries unknown field {}",
                     py_repr(key)
@@ -1283,7 +1488,54 @@ pub fn parse_offer_batch_jsonl(text: &str) -> Result<Vec<OfferSpec>> {
             Some(note_val) => validate_note(note_val)?,
             None => String::new(),
         };
-        specs.push(OfferSpec { id, note });
+        let priority = match object_get(&pairs, "priority") {
+            Some(prio_val) => validate_priority(prio_val)?,
+            None => PRIORITY_DEFAULT,
+        };
+        let tags = match object_get(&pairs, "tags") {
+            None => Vec::new(),
+            Some(Value::Array(arr)) => {
+                let mut raw_tags = Vec::with_capacity(arr.len());
+                for elem in arr {
+                    raw_tags.push(validate_name(elem, "tag")?);
+                }
+                normalize_tags(&raw_tags)?
+            }
+            Some(other) => {
+                return Err(Error::InvalidRequest(format!(
+                    "offer batch line {line_no} field 'tags' holds {}, use an array of tag names",
+                    py_repr_value(other)
+                )));
+            }
+        };
+        let depends_on = match object_get(&pairs, "depends_on") {
+            None => Vec::new(),
+            Some(Value::Array(arr)) => {
+                let mut raw_deps = Vec::with_capacity(arr.len());
+                for elem in arr {
+                    raw_deps.push(validate_name(elem, "item")?);
+                }
+                normalize_depends_on(&id, &raw_deps)?
+            }
+            Some(other) => {
+                return Err(Error::InvalidRequest(format!(
+                    "offer batch line {line_no} field 'depends_on' holds {}, use an array of item ids",
+                    py_repr_value(other)
+                )));
+            }
+        };
+        let max_takeovers = match object_get(&pairs, "max_takeovers") {
+            None => None,
+            Some(cap_val) => validate_max_takeovers(cap_val)?,
+        };
+        specs.push(OfferSpec {
+            id,
+            note,
+            priority,
+            tags,
+            depends_on,
+            max_takeovers,
+        });
     }
     if specs.is_empty() {
         return Err(Error::InvalidRequest(
@@ -1333,15 +1585,7 @@ fn stored_string(value: &Value) -> String {
     }
 }
 
-fn validate_item(value: &Value) -> Result<Item> {
-    let pairs = match value {
-        Value::Object(pairs) if keys_exact(pairs, &ITEM_KEYS) => pairs,
-        _ => {
-            return Err(corrupt(
-                "an item does not carry exactly the recorded fields".to_string(),
-            ))
-        }
-    };
+fn validate_item_core_fields(pairs: &[(String, Value)]) -> Result<Item> {
     let id_value = object_get(pairs, "id").unwrap();
     validate_stored_name(id_value, "item id", "an item")?;
     let id = stored_string(id_value);
@@ -1430,6 +1674,146 @@ fn validate_item(value: &Value) -> Result<Item> {
     })
 }
 
+fn validate_item(value: &Value) -> Result<Item> {
+    let pairs = match value {
+        Value::Object(pairs) if keys_exact(pairs, &ITEM_KEYS) => pairs,
+        _ => {
+            return Err(corrupt(
+                "an item does not carry exactly the recorded fields".to_string(),
+            ))
+        }
+    };
+    validate_item_core_fields(pairs)
+}
+
+fn validate_item_v2(value: &Value) -> Result<StoredItem> {
+    let pairs = match value {
+        Value::Object(pairs) if keys_exact(pairs, &ITEM_KEYS_V2) => pairs,
+        _ => {
+            return Err(corrupt(
+                "an item does not carry exactly the recorded fields".to_string(),
+            ))
+        }
+    };
+    let core = validate_item_core_fields(pairs)?;
+    let id = &core.id;
+    let priority = match object_get(pairs, "priority").unwrap() {
+        Value::Int(number) if *number >= 0 && *number <= PRIORITY_MAX as i128 => *number as u8,
+        _ => {
+            return Err(corrupt(format!(
+                "item {} holds an invalid priority",
+                py_repr(id)
+            )))
+        }
+    };
+    let tags = match object_get(pairs, "tags").unwrap() {
+        Value::Array(arr) if arr.len() <= TAGS_MAX => {
+            let mut tags: Vec<String> = Vec::with_capacity(arr.len());
+            for elem in arr {
+                validate_stored_name(elem, "tag id", "an item")?;
+                let tag = stored_string(elem);
+                if let Some(prev) = tags.last() {
+                    if prev.as_str() >= tag.as_str() {
+                        return Err(corrupt(format!(
+                            "item {} holds unsorted or duplicate tags",
+                            py_repr(id)
+                        )));
+                    }
+                }
+                tags.push(tag);
+            }
+            tags
+        }
+        _ => {
+            return Err(corrupt(format!(
+                "item {} holds an invalid tags list",
+                py_repr(id)
+            )))
+        }
+    };
+    let depends_on = match object_get(pairs, "depends_on").unwrap() {
+        Value::Array(arr) if arr.len() <= DEPENDS_ON_MAX => {
+            let mut deps: Vec<String> = Vec::with_capacity(arr.len());
+            for elem in arr {
+                validate_stored_name(elem, "dependency id", "an item")?;
+                let dep = stored_string(elem);
+                if &dep == id {
+                    return Err(corrupt(format!("item {} depends on itself", py_repr(id))));
+                }
+                if let Some(prev) = deps.last() {
+                    if prev.as_str() >= dep.as_str() {
+                        return Err(corrupt(format!(
+                            "item {} holds unsorted or duplicate dependencies",
+                            py_repr(id)
+                        )));
+                    }
+                }
+                deps.push(dep);
+            }
+            deps
+        }
+        _ => {
+            return Err(corrupt(format!(
+                "item {} holds an invalid depends_on list",
+                py_repr(id)
+            )))
+        }
+    };
+    let max_takeovers = match object_get(pairs, "max_takeovers").unwrap() {
+        Value::Null => None,
+        Value::Int(number) if *number >= 1 && *number <= MAX_TAKEOVERS_MAX as i128 => {
+            Some(*number as u64)
+        }
+        _ => {
+            return Err(corrupt(format!(
+                "item {} holds an invalid max_takeovers",
+                py_repr(id)
+            )))
+        }
+    };
+    let takeover_count = match object_get(pairs, "takeover_count").unwrap() {
+        Value::Int(number) if *number >= 0 && *number <= u64::MAX as i128 => *number as u64,
+        _ => {
+            return Err(corrupt(format!(
+                "item {} holds an invalid takeover_count",
+                py_repr(id)
+            )))
+        }
+    };
+    if core.epoch == 0 && takeover_count != 0 {
+        return Err(corrupt(format!(
+            "item {} holds takeover_count {} at epoch 0",
+            py_repr(id),
+            takeover_count
+        )));
+    }
+    if core.epoch >= 1 && (takeover_count as i128) >= core.epoch {
+        return Err(corrupt(format!(
+            "item {} holds takeover_count {} at epoch {}",
+            py_repr(id),
+            takeover_count,
+            core.epoch
+        )));
+    }
+    if let Some(cap) = max_takeovers {
+        if takeover_count > cap {
+            return Err(corrupt(format!(
+                "item {} holds takeover_count {} past max_takeovers {cap}",
+                py_repr(id),
+                takeover_count
+            )));
+        }
+    }
+    Ok(StoredItem {
+        core,
+        priority,
+        tags,
+        depends_on,
+        max_takeovers,
+        takeover_count,
+    })
+}
+
 fn is_token_hash(text: &str) -> bool {
     text.len() == 64
         && text
@@ -1437,7 +1821,153 @@ fn is_token_hash(text: &str) -> bool {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-fn validate_event(value: &Value, position: usize) -> Result<Event> {
+fn validate_compaction(value: &Value) -> Result<Option<Compaction>> {
+    if value == &Value::Null {
+        return Ok(None);
+    }
+    let pairs = match value {
+        Value::Object(pairs) if keys_exact(pairs, &COMPACTION_KEYS) => pairs,
+        _ => {
+            return Err(corrupt(
+                "the compaction field does not carry exactly the recorded fields".to_string(),
+            ))
+        }
+    };
+    let through_seq = match object_get(pairs, "through_seq").unwrap() {
+        Value::Int(number) if *number >= 1 && *number <= u64::MAX as i128 => *number as u64,
+        _ => {
+            return Err(corrupt(
+                "compaction holds an invalid through_seq".to_string(),
+            ))
+        }
+    };
+    let archived_events_sha256 = match object_get(pairs, "archived_events_sha256").unwrap() {
+        Value::Str(text) if is_token_hash(text) => text.clone(),
+        _ => {
+            return Err(corrupt(
+                "compaction holds an invalid archived_events_sha256".to_string(),
+            ))
+        }
+    };
+    let compacted_raw = object_get(pairs, "compacted_at").unwrap();
+    parse_stored_instant(compacted_raw)?;
+    let compacted_at = stored_string(compacted_raw);
+    let baseline_values = match object_get(pairs, "baseline").unwrap() {
+        Value::Array(entries) => entries,
+        _ => {
+            return Err(corrupt(
+                "compaction baseline field is not a list".to_string(),
+            ))
+        }
+    };
+    let mut baseline: Vec<BaselineEntry> = Vec::with_capacity(baseline_values.len());
+    for entry_val in baseline_values {
+        let entry_pairs = match entry_val {
+            Value::Object(pairs) if keys_exact(pairs, &BASELINE_KEYS) => pairs,
+            _ => {
+                return Err(corrupt(
+                    "a compaction baseline entry does not carry exactly the recorded fields"
+                        .to_string(),
+                ))
+            }
+        };
+        let id_val = object_get(entry_pairs, "id").unwrap();
+        validate_stored_name(id_val, "item id", "a compaction baseline entry")?;
+        let id = stored_string(id_val);
+        if let Some(prev) = baseline.last() {
+            if prev.id.as_str() >= id.as_str() {
+                return Err(corrupt(
+                    "the compaction baseline is not sorted without duplicates".to_string(),
+                ));
+            }
+        }
+        let status = match object_get(entry_pairs, "status").unwrap() {
+            Value::Str(text) if ITEM_STATUSES.contains(&text.as_str()) => text.clone(),
+            other => {
+                return Err(corrupt(format!(
+                    "compaction baseline entry {} holds an unknown status {}",
+                    py_repr(&id),
+                    py_repr_value(other)
+                )))
+            }
+        };
+        let holder = match object_get(entry_pairs, "holder").unwrap() {
+            Value::Null => None,
+            other => {
+                validate_stored_name(other, "holder id", "a compaction baseline entry")?;
+                Some(stored_string(other))
+            }
+        };
+        let epoch = match object_get(entry_pairs, "epoch").unwrap() {
+            Value::Int(number) if *number >= 0 && *number <= u64::MAX as i128 => *number,
+            _ => {
+                return Err(corrupt(format!(
+                    "compaction baseline entry {} holds an invalid epoch",
+                    py_repr(&id)
+                )))
+            }
+        };
+        let takeover_count = match object_get(entry_pairs, "takeover_count").unwrap() {
+            Value::Int(number) if *number >= 0 && *number <= u64::MAX as i128 => *number as u64,
+            _ => {
+                return Err(corrupt(format!(
+                    "compaction baseline entry {} holds an invalid takeover_count",
+                    py_repr(&id)
+                )))
+            }
+        };
+        if status == "claimed" {
+            if holder.is_none() {
+                return Err(corrupt(format!(
+                    "compaction baseline entry {} stands claimed without a holder",
+                    py_repr(&id)
+                )));
+            }
+            if epoch < 1 {
+                return Err(corrupt(format!(
+                    "compaction baseline entry {} stands claimed with epoch 0",
+                    py_repr(&id)
+                )));
+            }
+        } else if holder.is_some() {
+            return Err(corrupt(format!(
+                "compaction baseline entry {} stands {} while naming a holder",
+                py_repr(&id),
+                status
+            )));
+        }
+        if epoch == 0 && takeover_count != 0 {
+            return Err(corrupt(format!(
+                "compaction baseline entry {} holds takeover_count {} at epoch 0",
+                py_repr(&id),
+                takeover_count
+            )));
+        }
+        if epoch >= 1 && (takeover_count as i128) >= epoch {
+            return Err(corrupt(format!(
+                "compaction baseline entry {} holds takeover_count {} at epoch {}",
+                py_repr(&id),
+                takeover_count,
+                epoch
+            )));
+        }
+        baseline.push(BaselineEntry {
+            id,
+            status,
+            holder,
+            epoch,
+            takeover_count,
+        });
+    }
+    Ok(Some(Compaction {
+        through_seq,
+        archived_events_sha256,
+        compacted_at,
+        baseline,
+    }))
+}
+
+fn validate_event_with(value: &Value, expected_seq: i128, allow_v2: bool) -> Result<Event> {
     let pairs = match value {
         Value::Object(pairs) if keys_exact(pairs, &EVENT_KEYS) => pairs,
         _ => {
@@ -1447,15 +1977,20 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
         }
     };
     let seq = match object_get(pairs, "seq").unwrap() {
-        Value::Int(number) if *number == position as i128 + 1 => *number,
+        Value::Int(number) if *number == expected_seq && *number <= u64::MAX as i128 => *number,
         _ => {
             return Err(corrupt(
                 "the history sequence does not grow by 1 from 1 without gaps".to_string(),
             ))
         }
     };
+    let allowed_kinds: &[&str] = if allow_v2 {
+        &EVENT_KINDS_V2
+    } else {
+        &EVENT_KINDS
+    };
     let kind = match object_get(pairs, "kind").unwrap() {
-        Value::Str(text) if EVENT_KINDS.contains(&text.as_str()) => text.clone(),
+        Value::Str(text) if allowed_kinds.contains(&text.as_str()) => text.clone(),
         other => {
             return Err(corrupt(format!(
                 "a history event holds an unknown kind {}",
@@ -1467,9 +2002,9 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
     validate_stored_name(item_value, "item id", "a history event")?;
     let item = stored_string(item_value);
     let holder_value = object_get(pairs, "holder").unwrap();
-    let holder = if kind == "offered" {
+    let holder = if kind == "offered" || kind == "reset" {
         if holder_value != &Value::Null {
-            return Err(corrupt("an offered event names a holder".to_string()));
+            return Err(corrupt(format!("a {kind} event names a holder")));
         }
         None
     } else {
@@ -1488,6 +2023,14 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
         }
         validate_stored_name(previous_value, "holder id", "a history event")?;
         Some(stored_string(previous_value))
+    } else if kind == "reset" {
+        match previous_value {
+            Value::Null => None,
+            other => {
+                validate_stored_name(other, "holder id", "a history event")?;
+                Some(stored_string(other))
+            }
+        }
     } else {
         if previous_value != &Value::Null {
             return Err(corrupt(
@@ -1515,6 +2058,11 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
     if kind != "offered" && epoch < 1 {
         return Err(corrupt(format!("a {kind} event carries epoch 0")));
     }
+    if kind == "reset" && epoch < 2 {
+        return Err(corrupt(
+            "a reset event carries an epoch below 2".to_string(),
+        ));
+    }
     Ok(Event {
         seq,
         kind,
@@ -1526,61 +2074,197 @@ fn validate_event(value: &Value, position: usize) -> Result<Event> {
     })
 }
 
-fn validate_document(value: &Value) -> Result<Document> {
-    let pairs = match value {
-        Value::Object(pairs) if keys_exact(pairs, &DOCUMENT_KEYS) => pairs,
-        _ => {
+fn validate_event(value: &Value, position: usize) -> Result<Event> {
+    validate_event_with(value, position as i128 + 1, false)
+}
+
+/// Iterative heap-stack three-color DFS cycle check (DB-22).
+fn has_dependency_cycle(adj: &[Vec<usize>]) -> bool {
+    let n = adj.len();
+    // 0 = unvisited, 1 = visiting (on active DFS stack), 2 = visited (acyclic)
+    let mut color = vec![0u8; n];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for start in 0..n {
+        if color[start] != 0 {
+            continue;
+        }
+        color[start] = 1;
+        stack.push((start, 0));
+        while let Some((node, edge_idx)) = stack.last_mut() {
+            let u = *node;
+            if *edge_idx < adj[u].len() {
+                let v = adj[u][*edge_idx];
+                *edge_idx += 1;
+                match color[v] {
+                    1 => return true,
+                    0 => {
+                        color[v] = 1;
+                        stack.push((v, 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                color[u] = 2;
+                stack.pop();
+            }
+        }
+    }
+    false
+}
+
+fn validate_stored_dag(items: &[StoredItem]) -> Result<()> {
+    let mut index_by_id: HashMap<&str, usize> = HashMap::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        index_by_id.insert(item.core.id.as_str(), idx);
+    }
+    let mut adj: Vec<Vec<usize>> = Vec::with_capacity(items.len());
+    for item in items {
+        let mut edges = Vec::with_capacity(item.depends_on.len());
+        for dep in &item.depends_on {
+            let Some(&dep_idx) = index_by_id.get(dep.as_str()) else {
+                return Err(corrupt(format!(
+                    "item {} depends on {}, which does not stand in the backlog",
+                    py_repr(&item.core.id),
+                    py_repr(dep)
+                )));
+            };
+            edges.push(dep_idx);
+        }
+        adj.push(edges);
+    }
+    if has_dependency_cycle(&adj) {
+        return Err(corrupt(
+            "the item dependency graph contains a cycle".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registry_doc(value: &Value) -> Result<RegistryDoc> {
+    let Value::Object(pairs) = value else {
+        return Err(corrupt(
+            "the document does not carry exactly the recorded fields".to_string(),
+        ));
+    };
+    let Some(format_value) = object_get(pairs, "format") else {
+        return Err(corrupt(
+            "the document does not carry exactly the recorded fields".to_string(),
+        ));
+    };
+    if format_value == &Value::Str(FORMAT_NAME.to_string()) {
+        if !keys_exact(pairs, &DOCUMENT_KEYS) {
             return Err(corrupt(
                 "the document does not carry exactly the recorded fields".to_string(),
-            ))
+            ));
         }
-    };
-    let format_value = object_get(pairs, "format").unwrap();
-    if format_value != &Value::Str(FORMAT_NAME.to_string()) {
-        return Err(corrupt(format!(
-            "the format name is {}, not {}",
-            py_repr_value(format_value),
-            py_repr(FORMAT_NAME)
-        )));
-    }
-    let item_values = match object_get(pairs, "items").unwrap() {
-        Value::Array(items) => items,
-        _ => return Err(corrupt("the items field is not a list".to_string())),
-    };
-    let event_values = match object_get(pairs, "history").unwrap() {
-        Value::Array(events) => events,
-        _ => return Err(corrupt("the history field is not a list".to_string())),
-    };
-    let mut items = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for item_value in item_values {
-        let item = validate_item(item_value)?;
-        if !seen.insert(item.id.clone()) {
-            return Err(corrupt(format!(
-                "item {} stands in the backlog twice",
-                py_repr(&item.id)
-            )));
+        let item_values = match object_get(pairs, "items").unwrap() {
+            Value::Array(items) => items,
+            _ => return Err(corrupt("the items field is not a list".to_string())),
+        };
+        let event_values = match object_get(pairs, "history").unwrap() {
+            Value::Array(events) => events,
+            _ => return Err(corrupt("the history field is not a list".to_string())),
+        };
+        let mut core_items = Vec::with_capacity(item_values.len());
+        let mut seen: HashSet<String> = HashSet::with_capacity(item_values.len());
+        for item_value in item_values {
+            let item = validate_item(item_value)?;
+            if !seen.insert(item.id.clone()) {
+                return Err(corrupt(format!(
+                    "item {} stands in the backlog twice",
+                    py_repr(&item.id)
+                )));
+            }
+            core_items.push(item);
         }
-        items.push(item);
+        let mut history = Vec::with_capacity(event_values.len());
+        for (position, event_value) in event_values.iter().enumerate() {
+            history.push(validate_event(event_value, position)?);
+        }
+        validate_history_against_items(&core_items, &history)?;
+        let mut takeovers: HashMap<&str, u64> = HashMap::new();
+        for event in &history {
+            if event.kind == "taken_over" {
+                *takeovers.entry(event.item.as_str()).or_insert(0) += 1;
+            }
+        }
+        let items = core_items
+            .into_iter()
+            .map(|core| {
+                let takeover_count = if takeovers.is_empty() {
+                    0
+                } else {
+                    takeovers.get(core.id.as_str()).copied().unwrap_or(0)
+                };
+                StoredItem {
+                    core,
+                    priority: PRIORITY_DEFAULT,
+                    tags: Vec::new(),
+                    depends_on: Vec::new(),
+                    max_takeovers: None,
+                    takeover_count,
+                }
+            })
+            .collect();
+        return Ok(RegistryDoc {
+            is_v2: false,
+            compaction: None,
+            items,
+            history,
+        });
     }
-    let mut history = Vec::new();
-    for (position, event_value) in event_values.iter().enumerate() {
-        history.push(validate_event(event_value, position)?);
+    if format_value == &Value::Str(FORMAT_NAME_V2.to_string()) {
+        if !keys_exact(pairs, &DOCUMENT_KEYS_V2) {
+            return Err(corrupt(
+                "the document does not carry exactly the recorded fields".to_string(),
+            ));
+        }
+        let compaction = validate_compaction(object_get(pairs, "compaction").unwrap())?;
+        let item_values = match object_get(pairs, "items").unwrap() {
+            Value::Array(items) => items,
+            _ => return Err(corrupt("the items field is not a list".to_string())),
+        };
+        let event_values = match object_get(pairs, "history").unwrap() {
+            Value::Array(events) => events,
+            _ => return Err(corrupt("the history field is not a list".to_string())),
+        };
+        let mut items = Vec::with_capacity(item_values.len());
+        let mut seen: HashSet<String> = HashSet::with_capacity(item_values.len());
+        for item_value in item_values {
+            let item = validate_item_v2(item_value)?;
+            if !seen.insert(item.core.id.clone()) {
+                return Err(corrupt(format!(
+                    "item {} stands in the backlog twice",
+                    py_repr(&item.core.id)
+                )));
+            }
+            items.push(item);
+        }
+        validate_stored_dag(&items)?;
+        let seq_base = compaction.as_ref().map_or(0i128, |c| c.through_seq as i128);
+        let mut history = Vec::with_capacity(event_values.len());
+        for (position, event_value) in event_values.iter().enumerate() {
+            let expected_seq = seq_base + position as i128 + 1;
+            history.push(validate_event_with(event_value, expected_seq, true)?);
+        }
+        validate_history_against_items_v2(&items, compaction.as_ref(), &history)?;
+        return Ok(RegistryDoc {
+            is_v2: true,
+            compaction,
+            items,
+            history,
+        });
     }
-    validate_history_against_items(&items, &history)?;
-    Ok(Document { items, history })
+    Err(corrupt(format!(
+        "the format name is {}, not {} or {}",
+        py_repr_value(format_value),
+        py_repr(FORMAT_NAME),
+        py_repr(FORMAT_NAME_V2)
+    )))
 }
 
 /// The standing of one item history as the cross validation
-/// replays it. The phase names the state the chain stands in,
-/// in the status words of the format, and the holder and the
-/// epoch are the standing facts the chain has reached. The
-/// saw offer flag records whether an offer stands at the
-/// head of the recorded events, so an offer that arrives
-/// later is refused for the reason that fits its case, as a
-/// second offer where one already stands or as an offer out
-/// of its place where the chain opened in the middle of a
-/// life and holds no offer at all.
+/// replays it.
 struct Chain {
     phase: &'static str,
     holder: Option<String>,
@@ -1588,25 +2272,30 @@ struct Chain {
     saw_offer: bool,
 }
 
-/// Join the two halves of the document the per field
-/// validators checked separately, as the Round 2 amendment
-/// under DB-7 states. Every event must name an item that
-/// stands in the document, the events of one item must replay
-/// a passage of a life the writers write, and the end of each
-/// replay must agree with the standing item, in status and
-/// in epoch and, where the chain ends claimed, in holder. An
-/// item that stands with no events is not refused, and a
-/// chain may open in the middle of a life, because the
-/// reader has always taken a standing item on its own fields
-/// and the writers append single events onto the history
-/// that stands, so the first recorded event opens the chain
-/// wherever it stands and every later event is checked
-/// whole. The pass walks the history once with one chain
-/// standing per item, so its cost grows with the size of the
-/// document and never with its square.
+struct ChainV2 {
+    phase: &'static str,
+    holder: Option<String>,
+    epoch: i128,
+    min_takeovers: u64,
+    max_takeovers: u64,
+    saw_offer: bool,
+}
+
+fn phase_str(status: &str) -> &'static str {
+    match status {
+        "open" => "open",
+        "claimed" => "claimed",
+        _ => "completed",
+    }
+}
+
+/// Join the two halves of a dibs-registry/1 document (DB-7).
 fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<()> {
-    let standing: HashSet<&str> = items.iter().map(|item| item.id.as_str()).collect();
-    let mut chains: HashMap<&str, Chain> = HashMap::new();
+    let mut standing: HashSet<&str> = HashSet::with_capacity(items.len());
+    for item in items {
+        standing.insert(item.id.as_str());
+    }
+    let mut chains: HashMap<&str, Chain> = HashMap::with_capacity(items.len());
     for event in history {
         if !standing.contains(event.item.as_str()) {
             return Err(corrupt(format!(
@@ -1617,20 +2306,6 @@ fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<(
         let chain = match chains.get_mut(event.item.as_str()) {
             Some(chain) => chain,
             None => {
-                // The first recorded event opens the chain
-                // wherever it stands. The per field validation
-                // has already fixed the shape of the opening,
-                // an offer with no holder at epoch 0, a lease
-                // event with its holder and an epoch of at
-                // least 1, so the chain takes its standing
-                // from the event itself. A takeover opening a
-                // chain names a previous holder from before
-                // the recorded history, and nothing recorded
-                // stands against that name, so it is taken as
-                // it stands. One floor still binds it, because
-                // a takeover replaces a claim and a first claim
-                // carries epoch 1, so no takeover in any life
-                // the writers write carries an epoch below 2.
                 if event.kind == "taken_over" && event.epoch < 2 {
                     return Err(corrupt(format!(
                         "a taken over event on item {} carries epoch {}, and no \
@@ -1646,7 +2321,7 @@ fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<(
                         epoch: event.epoch,
                         saw_offer: true,
                     },
-                    "claimed" | "taken_over" | "renewed" => Chain {
+                    "claimed" | "renewed" | "taken_over" => Chain {
                         phase: "claimed",
                         holder: event.holder.clone(),
                         epoch: event.epoch,
@@ -1798,6 +2473,448 @@ fn validate_history_against_items(items: &[Item], history: &[Event]) -> Result<(
     Ok(())
 }
 
+/// Join items, optional compaction baseline, and post-compaction
+/// history of a dibs-registry/2 document (DB-7, DB-23, DB-24).
+fn validate_history_against_items_v2(
+    items: &[StoredItem],
+    compaction: Option<&Compaction>,
+    history: &[Event],
+) -> Result<()> {
+    let mut item_by_id: HashMap<&str, &StoredItem> = HashMap::with_capacity(items.len());
+    for item in items {
+        item_by_id.insert(item.core.id.as_str(), item);
+    }
+    let mut chains: HashMap<&str, ChainV2> = HashMap::with_capacity(items.len());
+    if let Some(comp) = compaction {
+        for base in &comp.baseline {
+            let Some(&standing_item) = item_by_id.get(base.id.as_str()) else {
+                return Err(corrupt(format!(
+                    "the compaction baseline names item {}, which does not stand in the backlog",
+                    py_repr(&base.id)
+                )));
+            };
+            if let Some(cap) = standing_item.max_takeovers {
+                if base.takeover_count > cap {
+                    return Err(corrupt(format!(
+                        "compaction baseline entry {} holds takeover_count {} past max_takeovers {cap}",
+                        py_repr(&base.id),
+                        base.takeover_count
+                    )));
+                }
+            }
+            chains.insert(
+                base.id.as_str(),
+                ChainV2 {
+                    phase: phase_str(&base.status),
+                    holder: base.holder.clone(),
+                    epoch: base.epoch,
+                    min_takeovers: base.takeover_count,
+                    max_takeovers: base.takeover_count,
+                    saw_offer: true,
+                },
+            );
+        }
+    } else {
+        let mut items_with_events: HashSet<&str> = HashSet::with_capacity(items.len());
+        for ev in history {
+            items_with_events.insert(ev.item.as_str());
+        }
+        for item in items {
+            if !items_with_events.contains(item.core.id.as_str()) {
+                chains.insert(
+                    item.core.id.as_str(),
+                    ChainV2 {
+                        phase: phase_str(&item.core.status),
+                        holder: item.core.holder.clone(),
+                        epoch: item.core.epoch,
+                        min_takeovers: item.takeover_count,
+                        max_takeovers: item.takeover_count,
+                        saw_offer: false,
+                    },
+                );
+            }
+        }
+    }
+
+    for event in history {
+        let Some(&standing_item) = item_by_id.get(event.item.as_str()) else {
+            return Err(corrupt(format!(
+                "a history event names item {}, which does not stand in the backlog",
+                py_repr(&event.item)
+            )));
+        };
+        if matches!(event.kind.as_str(), "claimed" | "taken_over") {
+            for dep in &standing_item.depends_on {
+                if !matches!(chains.get(dep.as_str()), Some(c) if c.phase == "completed") {
+                    return Err(corrupt(format!(
+                        "the history of item {} claims while dependency {} is not completed",
+                        py_repr(&event.item),
+                        py_repr(dep)
+                    )));
+                }
+            }
+        }
+        let chain = match chains.get_mut(event.item.as_str()) {
+            Some(chain) => chain,
+            None => {
+                if compaction.is_some() && event.kind != "offered" {
+                    return Err(corrupt(format!(
+                        "item {} is absent from the compaction baseline and does not open its post-compaction history with offered",
+                        py_repr(&event.item)
+                    )));
+                }
+                if event.kind == "taken_over" && event.epoch < 2 {
+                    return Err(corrupt(format!(
+                        "a taken over event on item {} carries epoch {}, and no \
+                         takeover stands below epoch 2",
+                        py_repr(&event.item),
+                        event.epoch
+                    )));
+                }
+                if event.kind == "reset" {
+                    let Some(cap) = standing_item.max_takeovers else {
+                        return Err(corrupt(format!(
+                            "a reset event stands on item {}, which carries no max_takeovers",
+                            py_repr(&event.item)
+                        )));
+                    };
+                    if event.epoch < (cap as i128) + 1 {
+                        return Err(corrupt(format!(
+                            "a reset event on item {} carries epoch {}, below the minimum epoch {} for max_takeovers {cap}",
+                            py_repr(&event.item),
+                            event.epoch,
+                            (cap as i128) + 1
+                        )));
+                    }
+                }
+                let chain = match event.kind.as_str() {
+                    "offered" => ChainV2 {
+                        phase: "open",
+                        holder: None,
+                        epoch: event.epoch,
+                        min_takeovers: 0,
+                        max_takeovers: 0,
+                        saw_offer: true,
+                    },
+                    "claimed" => {
+                        let epoch_before = event.epoch - 1;
+                        let mut prev_max = if epoch_before <= 1 {
+                            0
+                        } else {
+                            u64::try_from(epoch_before - 1).unwrap_or(u64::MAX)
+                        };
+                        if let Some(cap) = standing_item.max_takeovers {
+                            prev_max = prev_max.min(cap - 1);
+                        }
+                        ChainV2 {
+                            phase: "claimed",
+                            holder: event.holder.clone(),
+                            epoch: event.epoch,
+                            min_takeovers: 0,
+                            max_takeovers: prev_max,
+                            saw_offer: false,
+                        }
+                    }
+                    "taken_over" => {
+                        let epoch_before = event.epoch - 1;
+                        let mut prev_max = u64::try_from(epoch_before - 1).unwrap_or(u64::MAX);
+                        if let Some(cap) = standing_item.max_takeovers {
+                            prev_max = prev_max.min(cap - 1);
+                        }
+                        ChainV2 {
+                            phase: "claimed",
+                            holder: event.holder.clone(),
+                            epoch: event.epoch,
+                            min_takeovers: 1,
+                            max_takeovers: prev_max.saturating_add(1),
+                            saw_offer: false,
+                        }
+                    }
+                    "renewed" => {
+                        let mut prev_max = u64::try_from(event.epoch - 1).unwrap_or(u64::MAX);
+                        if let Some(cap) = standing_item.max_takeovers {
+                            prev_max = prev_max.min(cap);
+                        }
+                        ChainV2 {
+                            phase: "claimed",
+                            holder: event.holder.clone(),
+                            epoch: event.epoch,
+                            min_takeovers: 0,
+                            max_takeovers: prev_max,
+                            saw_offer: false,
+                        }
+                    }
+                    "released" => {
+                        let mut prev_max = u64::try_from(event.epoch - 1).unwrap_or(u64::MAX);
+                        if let Some(cap) = standing_item.max_takeovers {
+                            prev_max = prev_max.min(cap);
+                        }
+                        ChainV2 {
+                            phase: "open",
+                            holder: None,
+                            epoch: event.epoch,
+                            min_takeovers: 0,
+                            max_takeovers: prev_max,
+                            saw_offer: false,
+                        }
+                    }
+                    "reset" => ChainV2 {
+                        phase: "open",
+                        holder: None,
+                        epoch: event.epoch,
+                        min_takeovers: 0,
+                        max_takeovers: 0,
+                        saw_offer: false,
+                    },
+                    _ => {
+                        let mut prev_max = u64::try_from(event.epoch - 1).unwrap_or(u64::MAX);
+                        if let Some(cap) = standing_item.max_takeovers {
+                            prev_max = prev_max.min(cap);
+                        }
+                        ChainV2 {
+                            phase: "completed",
+                            holder: None,
+                            epoch: event.epoch,
+                            min_takeovers: 0,
+                            max_takeovers: prev_max,
+                            saw_offer: false,
+                        }
+                    }
+                };
+                chains.insert(event.item.as_str(), chain);
+                continue;
+            }
+        };
+        if chain.phase == "completed" {
+            return Err(corrupt(format!(
+                "the history of item {} continues past its completion",
+                py_repr(&event.item)
+            )));
+        }
+        match event.kind.as_str() {
+            "offered" => {
+                if chain.saw_offer {
+                    return Err(corrupt(format!(
+                        "item {} is offered twice in its history",
+                        py_repr(&event.item)
+                    )));
+                }
+                return Err(corrupt(format!(
+                    "an offered event on item {} does not stand first in its history",
+                    py_repr(&event.item)
+                )));
+            }
+            "claimed" | "taken_over" => {
+                if event.kind == "claimed" && chain.phase != "open" {
+                    return Err(corrupt(format!(
+                        "the history of item {} claims a lease that already stands",
+                        py_repr(&event.item)
+                    )));
+                }
+                if event.kind == "taken_over" {
+                    if chain.phase != "claimed" {
+                        return Err(corrupt(format!(
+                            "the history of item {} takes over a lease that does not stand",
+                            py_repr(&event.item)
+                        )));
+                    }
+                    if event.previous_holder.as_deref() != chain.holder.as_deref() {
+                        return Err(corrupt(format!(
+                            "a taken over event on item {} names {} as the previous \
+                             holder, not the standing holder {}",
+                            py_repr(&event.item),
+                            py_repr(event.previous_holder.as_deref().unwrap_or_default()),
+                            py_repr(chain.holder.as_deref().unwrap_or_default())
+                        )));
+                    }
+                }
+                if let Some(cap) = standing_item.max_takeovers {
+                    if chain.min_takeovers >= cap {
+                        let label = if event.kind == "taken_over" {
+                            "taken over"
+                        } else {
+                            "claimed"
+                        };
+                        return Err(corrupt(format!(
+                            "a {label} event on item {} exceeds max_takeovers {cap}",
+                            py_repr(&event.item)
+                        )));
+                    }
+                    chain.max_takeovers = chain.max_takeovers.min(cap - 1);
+                }
+                if chain.epoch.checked_add(1) != Some(event.epoch) {
+                    return Err(corrupt(format!(
+                        "a claim event on item {} carries epoch {}, not one past \
+                         the standing epoch {}",
+                        py_repr(&event.item),
+                        event.epoch,
+                        chain.epoch
+                    )));
+                }
+                chain.phase = "claimed";
+                chain.holder = event.holder.clone();
+                chain.epoch = event.epoch;
+                if event.kind == "taken_over" {
+                    chain.min_takeovers = chain.min_takeovers.checked_add(1).ok_or_else(|| {
+                        corrupt(format!(
+                            "item {} overflows takeover_count",
+                            py_repr(&event.item)
+                        ))
+                    })?;
+                    chain.max_takeovers = chain.max_takeovers.checked_add(1).ok_or_else(|| {
+                        corrupt(format!(
+                            "item {} overflows takeover_count",
+                            py_repr(&event.item)
+                        ))
+                    })?;
+                }
+            }
+            "reset" => {
+                let Some(cap) = standing_item.max_takeovers else {
+                    return Err(corrupt(format!(
+                        "a reset event stands on item {}, which carries no max_takeovers",
+                        py_repr(&event.item)
+                    )));
+                };
+                if event.epoch < (cap as i128) + 1 {
+                    return Err(corrupt(format!(
+                        "a reset event on item {} carries epoch {}, below the minimum epoch {} for max_takeovers {cap}",
+                        py_repr(&event.item),
+                        event.epoch,
+                        (cap as i128) + 1
+                    )));
+                }
+                if chain.max_takeovers < cap {
+                    return Err(corrupt(format!(
+                        "a reset event on item {} fires at takeover_count {}, below max_takeovers {cap}",
+                        py_repr(&event.item),
+                        chain.max_takeovers
+                    )));
+                }
+                if event.previous_holder.as_deref() != chain.holder.as_deref() {
+                    return Err(corrupt(format!(
+                        "a reset event on item {} names {} as the previous holder, not {}",
+                        py_repr(&event.item),
+                        py_repr_value(
+                            &event
+                                .previous_holder
+                                .as_ref()
+                                .map(|s| Value::Str(s.clone()))
+                                .unwrap_or(Value::Null)
+                        ),
+                        py_repr_value(
+                            &chain
+                                .holder
+                                .as_ref()
+                                .map(|s| Value::Str(s.clone()))
+                                .unwrap_or(Value::Null)
+                        )
+                    )));
+                }
+                if event.epoch != chain.epoch {
+                    return Err(corrupt(format!(
+                        "a reset event on item {} carries epoch {}, not the standing epoch {}",
+                        py_repr(&event.item),
+                        event.epoch,
+                        chain.epoch
+                    )));
+                }
+                chain.phase = "open";
+                chain.holder = None;
+                chain.min_takeovers = 0;
+                chain.max_takeovers = 0;
+            }
+            kind => {
+                if chain.phase != "claimed" {
+                    let verb = match kind {
+                        "renewed" => "renews",
+                        "released" => "releases",
+                        _ => "completes",
+                    };
+                    return Err(corrupt(format!(
+                        "the history of item {} {verb} a lease that does not stand",
+                        py_repr(&event.item)
+                    )));
+                }
+                if event.holder.as_deref() != chain.holder.as_deref() {
+                    return Err(corrupt(format!(
+                        "a {kind} event on item {} names holder {}, not the \
+                         standing holder {}",
+                        py_repr(&event.item),
+                        py_repr(event.holder.as_deref().unwrap_or_default()),
+                        py_repr(chain.holder.as_deref().unwrap_or_default())
+                    )));
+                }
+                if event.epoch != chain.epoch {
+                    return Err(corrupt(format!(
+                        "a {kind} event on item {} carries epoch {}, not the \
+                         standing epoch {}",
+                        py_repr(&event.item),
+                        event.epoch,
+                        chain.epoch
+                    )));
+                }
+                if kind == "released" {
+                    chain.phase = "open";
+                    chain.holder = None;
+                } else if kind == "completed" {
+                    chain.phase = "completed";
+                    chain.holder = None;
+                }
+            }
+        }
+    }
+
+    for item in items {
+        let Some(chain) = chains.get(item.core.id.as_str()) else {
+            if compaction.is_some() {
+                return Err(corrupt(format!(
+                    "item {} is absent from the compaction baseline and has no post-compaction history",
+                    py_repr(&item.core.id)
+                )));
+            }
+            continue;
+        };
+        if item.core.status != chain.phase {
+            return Err(corrupt(format!(
+                "item {} stands {} where its history ends {}",
+                py_repr(&item.core.id),
+                item.core.status,
+                chain.phase
+            )));
+        }
+        if item.core.epoch != chain.epoch {
+            return Err(corrupt(format!(
+                "item {} stands at epoch {} where its history ends at epoch {}",
+                py_repr(&item.core.id),
+                item.core.epoch,
+                chain.epoch
+            )));
+        }
+        if chain.phase == "claimed" && item.core.holder != chain.holder {
+            return Err(corrupt(format!(
+                "item {} stands held by {}, not by {} as its history ends",
+                py_repr(&item.core.id),
+                py_repr(item.core.holder.as_deref().unwrap_or_default()),
+                py_repr(chain.holder.as_deref().unwrap_or_default())
+            )));
+        }
+        if item.takeover_count < chain.min_takeovers || item.takeover_count > chain.max_takeovers {
+            let expected = if item.takeover_count < chain.min_takeovers {
+                chain.min_takeovers
+            } else {
+                chain.max_takeovers
+            };
+            return Err(corrupt(format!(
+                "item {} stands at takeover_count {} where its history ends at takeover_count {expected}",
+                py_repr(&item.core.id),
+                item.takeover_count
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Escape a string the way Python's json module escapes it with
 /// its default ensure_ascii, so a registry the port writes is
 /// byte identical to the registry the Python implementation wrote
@@ -1845,17 +2962,30 @@ fn render_opt_string(value: &Option<String>, out: &mut String) {
     }
 }
 
+fn render_string_array(values: &[String], level: usize, out: &mut String) {
+    if values.is_empty() {
+        out.push_str("[]");
+        return;
+    }
+    out.push_str("[\n");
+    let count = values.len();
+    for (index, val) in values.iter().enumerate() {
+        write_indent(out, level + 1);
+        escape_json_string(val, out);
+        if index + 1 < count {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    write_indent(out, level);
+    out.push(']');
+}
+
 /// One field of a rendered object, its key and the closure
 /// that writes its value.
 type FieldRenderer<'a> = (&'a str, &'a dyn Fn(&mut String));
 
-/// Render one object from its field table, the opening
-/// brace, one line per field at the next indent with the
-/// key escaped and a comma after every field but the last,
-/// and the closing brace at the level. render_item and
-/// render_event share this one rendering, so the
-/// mechanics stand in one place and a repair cannot land
-/// in one shape and miss the other.
+/// Render one object from its field table.
 fn render_fields(fields: &[FieldRenderer], level: usize, out: &mut String) {
     out.push_str("{\n");
     let count = fields.len();
@@ -1890,6 +3020,83 @@ fn render_item(item: &Item, level: usize, out: &mut String) {
     render_fields(&fields, level, out);
 }
 
+fn render_item_v2(item: &StoredItem, level: usize, out: &mut String) {
+    let fields: [FieldRenderer; 12] = [
+        ("id", &|out| escape_json_string(&item.core.id, out)),
+        ("note", &|out| escape_json_string(&item.core.note, out)),
+        ("status", &|out| escape_json_string(&item.core.status, out)),
+        ("priority", &|out| out.push_str(&item.priority.to_string())),
+        ("tags", &|out| {
+            render_string_array(&item.tags, level + 1, out)
+        }),
+        ("depends_on", &|out| {
+            render_string_array(&item.depends_on, level + 1, out)
+        }),
+        ("max_takeovers", &|out| match item.max_takeovers {
+            Some(cap) => out.push_str(&cap.to_string()),
+            None => out.push_str("null"),
+        }),
+        ("takeover_count", &|out| {
+            out.push_str(&item.takeover_count.to_string())
+        }),
+        ("holder", &|out| render_opt_string(&item.core.holder, out)),
+        ("token_hash", &|out| {
+            render_opt_string(&item.core.token_hash, out)
+        }),
+        ("epoch", &|out| out.push_str(&item.core.epoch.to_string())),
+        ("expires_at", &|out| {
+            render_opt_string(&item.core.expires_at, out)
+        }),
+    ];
+    render_fields(&fields, level, out);
+}
+
+fn render_baseline_entry(entry: &BaselineEntry, level: usize, out: &mut String) {
+    let fields: [FieldRenderer; 5] = [
+        ("id", &|out| escape_json_string(&entry.id, out)),
+        ("status", &|out| escape_json_string(&entry.status, out)),
+        ("holder", &|out| render_opt_string(&entry.holder, out)),
+        ("epoch", &|out| out.push_str(&entry.epoch.to_string())),
+        ("takeover_count", &|out| {
+            out.push_str(&entry.takeover_count.to_string())
+        }),
+    ];
+    render_fields(&fields, level, out);
+}
+
+fn render_compaction(compaction: &Compaction, level: usize, out: &mut String) {
+    let fields: [FieldRenderer; 4] = [
+        ("through_seq", &|out| {
+            out.push_str(&compaction.through_seq.to_string())
+        }),
+        ("archived_events_sha256", &|out| {
+            escape_json_string(&compaction.archived_events_sha256, out)
+        }),
+        ("compacted_at", &|out| {
+            escape_json_string(&compaction.compacted_at, out)
+        }),
+        ("baseline", &|out| {
+            if compaction.baseline.is_empty() {
+                out.push_str("[]");
+            } else {
+                out.push_str("[\n");
+                let count = compaction.baseline.len();
+                for (index, entry) in compaction.baseline.iter().enumerate() {
+                    write_indent(out, level + 2);
+                    render_baseline_entry(entry, level + 2, out);
+                    if index + 1 < count {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                write_indent(out, level + 1);
+                out.push(']');
+            }
+        }),
+    ];
+    render_fields(&fields, level, out);
+}
+
 fn render_event(event: &Event, level: usize, out: &mut String) {
     let fields: [FieldRenderer; 7] = [
         ("seq", &|out| out.push_str(&event.seq.to_string())),
@@ -1905,29 +3112,61 @@ fn render_event(event: &Event, level: usize, out: &mut String) {
     render_fields(&fields, level, out);
 }
 
-/// Render a document exactly as the Python implementation's two
-/// space indented json rendering renders it, without the
-/// trailing newline the stored file adds.
-fn render_document(document: &Document) -> String {
-    // The output starts near its final size instead of growing
-    // from empty by doublings. The contract's measured growth
-    // constants stand at about 392 bytes per offered item, with
-    // the item's offered event counted inside that figure, and
-    // 201.5 bytes per history event, so the reserve transcribes
-    // the measured law with the event constant rounded up and a
-    // small fixed allowance for the document frame. A reserve is
-    // a capacity hint only. The item constant counting each
-    // item's offered event means the sum over-reserves by about
-    // one event per item, a transient overallocation that costs
-    // no reallocation copies on the growth path.
+fn render_event_jsonl_line(event: &Event) -> String {
+    let mut out = format!("{{\"seq\": {}, \"kind\": ", event.seq);
+    escape_json_string(&event.kind, &mut out);
+    out.push_str(", \"item\": ");
+    escape_json_string(&event.item, &mut out);
+    out.push_str(", \"holder\": ");
+    render_opt_string(&event.holder, &mut out);
+    out.push_str(", \"at\": ");
+    escape_json_string(&event.at, &mut out);
+    out.push_str(&format!(
+        ", \"epoch\": {}, \"previous_holder\": ",
+        event.epoch
+    ));
+    render_opt_string(&event.previous_holder, &mut out);
+    out.push('}');
+    out
+}
+
+fn should_render_v2(document: &RegistryDoc) -> bool {
+    if document.is_v2 || document.compaction.is_some() {
+        return true;
+    }
+    if document.items.iter().any(|item| {
+        !item.depends_on.is_empty()
+            || item.priority != PRIORITY_DEFAULT
+            || !item.tags.is_empty()
+            || item.max_takeovers.is_some()
+    }) {
+        return true;
+    }
+    document.history.iter().any(|event| event.kind == "reset")
+}
+
+/// Render a document in dibs-registry/1 when only /1 features
+/// stand, or dibs-registry/2 once promoted (DB-14, DB-21).
+fn render_registry_doc(document: &RegistryDoc) -> String {
+    let v2 = should_render_v2(document);
     let mut out =
-        String::with_capacity(64 + document.items.len() * 392 + document.history.len() * 202);
+        String::with_capacity(64 + document.items.len() * 480 + document.history.len() * 202);
     out.push_str("{\n");
     write_indent(&mut out, 1);
     escape_json_string("format", &mut out);
     out.push_str(": ");
-    escape_json_string(FORMAT_NAME, &mut out);
+    escape_json_string(if v2 { FORMAT_NAME_V2 } else { FORMAT_NAME }, &mut out);
     out.push_str(",\n");
+    if v2 {
+        write_indent(&mut out, 1);
+        escape_json_string("compaction", &mut out);
+        out.push_str(": ");
+        match &document.compaction {
+            Some(compaction) => render_compaction(compaction, 1, &mut out),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\n");
+    }
     write_indent(&mut out, 1);
     escape_json_string("items", &mut out);
     out.push_str(": ");
@@ -1938,7 +3177,11 @@ fn render_document(document: &Document) -> String {
         let count = document.items.len();
         for (index, item) in document.items.iter().enumerate() {
             write_indent(&mut out, 2);
-            render_item(item, 2, &mut out);
+            if v2 {
+                render_item_v2(item, 2, &mut out);
+            } else {
+                render_item(&item.core, 2, &mut out);
+            }
             if index + 1 < count {
                 out.push(',');
             }
@@ -2303,32 +3546,307 @@ fn rename_temp_over_registry(temp: &Path, target: &Path) -> std::io::Result<()> 
     retry_transient_rename(|| std::fs::rename(temp, target))
 }
 
+fn validate_file_path(path: &Path, label: &str) -> Result<()> {
+    let raw = path.as_os_str();
+    if raw.is_empty() || path.file_name().is_none() || has_trailing_dir_syntax(raw) {
+        let rendered = py_repr(&path.to_string_lossy());
+        return Err(Error::InvalidRequest(format!(
+            "invalid {label} path {rendered}, the path must name a file"
+        )));
+    }
+    Ok(())
+}
+
+fn count_missing_tail(path: &Path) -> usize {
+    let mut missing = 0usize;
+    let mut cur = path;
+    while std::fs::symlink_metadata(cur).is_err() {
+        if cur.file_name().is_none() {
+            break;
+        }
+        missing += 1;
+        match cur.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cur = parent,
+            _ => break,
+        }
+    }
+    missing
+}
+
+fn resolve_physical_path_bounded(path: &Path, depth: usize) -> PathBuf {
+    if depth >= 16 {
+        return path.to_path_buf();
+    }
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let base = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut acc = PathBuf::new();
+    let mut unresolved_depth = 0usize;
+    for comp in base.components() {
+        match comp {
+            Component::Prefix(prefix) => {
+                acc.push(prefix.as_os_str());
+            }
+            Component::RootDir => {
+                acc.push(comp.as_os_str());
+                if let Ok(canon) = std::fs::canonicalize(&acc) {
+                    acc = canon;
+                }
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if unresolved_depth > 0 {
+                    acc.pop();
+                    unresolved_depth -= 1;
+                } else {
+                    if let Ok(canon) = std::fs::canonicalize(&acc) {
+                        acc = canon;
+                    }
+                    acc.pop();
+                }
+            }
+            Component::Normal(name) => {
+                acc.push(name);
+                if unresolved_depth == 0 {
+                    if let Ok(canon) = std::fs::canonicalize(&acc) {
+                        acc = canon;
+                    } else if let Ok(meta) = std::fs::symlink_metadata(&acc) {
+                        if meta.file_type().is_symlink() {
+                            if let Ok(target) = std::fs::read_link(&acc) {
+                                let next = if target.is_absolute() {
+                                    target
+                                } else {
+                                    let mut joined = acc.clone();
+                                    joined.pop();
+                                    joined.push(target);
+                                    joined
+                                };
+                                acc = resolve_physical_path_bounded(&next, depth + 1);
+                                unresolved_depth = count_missing_tail(&acc);
+                            }
+                        }
+                    } else {
+                        unresolved_depth = 1;
+                    }
+                } else {
+                    unresolved_depth += 1;
+                }
+            }
+        }
+    }
+    acc
+}
+
+fn resolve_physical_path(path: &Path) -> PathBuf {
+    resolve_physical_path_bounded(path, 0)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if let (Ok(ml), Ok(mr)) = (std::fs::metadata(left), std::fs::metadata(right)) {
+        ml.dev() == mr.dev() && ml.ino() == mr.ino()
+    } else {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &Path, right: &Path) -> bool {
+    fn windows_file_id(path: &Path) -> Option<(u32, u64)> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        #[repr(C)]
+        struct ByHandleFileInformation {
+            file_attributes: u32,
+            creation_time: FileTime,
+            last_access_time: FileTime,
+            last_write_time: FileTime,
+            volume_serial_number: u32,
+            file_size_high: u32,
+            file_size_low: u32,
+            number_of_links: u32,
+            file_index_high: u32,
+            file_index_low: u32,
+        }
+        extern "system" {
+            fn GetFileInformationByHandle(
+                file: std::os::windows::io::RawHandle,
+                info: *mut ByHandleFileInformation,
+            ) -> i32;
+        }
+
+        let file = OpenOptions::new()
+            .access_mode(0)
+            .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+            .open(path)
+            .ok()?;
+        let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::zeroed();
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+        if ok == 0 {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        let index = ((info.file_index_high as u64) << 32) | (info.file_index_low as u64);
+        Some((info.volume_serial_number, index))
+    }
+
+    match (windows_file_id(left), windows_file_id(right)) {
+        (Some(id_l), Some(id_r)) => id_l == id_r,
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn is_dir_case_insensitive(dir: &Path) -> bool {
+    let mut existing = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    while std::fs::metadata(existing).is_err() {
+        match existing.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => existing = parent,
+            _ => return false,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::{c_char, c_int, c_long, CString};
+        use std::os::unix::ffi::OsStrExt;
+        extern "C" {
+            fn pathconf(path: *const c_char, name: c_int) -> c_long;
+        }
+        const PC_CASE_SENSITIVE: c_int = 11;
+        if let Ok(c_path) = CString::new(existing.as_os_str().as_bytes()) {
+            let res = unsafe { pathconf(c_path.as_ptr(), PC_CASE_SENSITIVE) };
+            if res == 0 {
+                return true;
+            }
+            if res > 0 {
+                return false;
+            }
+        }
+    }
+    if let Some(dir_name) = existing.file_name().and_then(|n| n.to_str()) {
+        if let Some(pos) = dir_name.bytes().position(|b| b.is_ascii_alphabetic()) {
+            let mut bytes = dir_name.as_bytes().to_vec();
+            bytes[pos] = if bytes[pos].is_ascii_lowercase() {
+                bytes[pos].to_ascii_uppercase()
+            } else {
+                bytes[pos].to_ascii_lowercase()
+            };
+            if let Ok(toggled) = String::from_utf8(bytes) {
+                let candidate = existing.with_file_name(toggled);
+                return same_file_identity(existing, &candidate);
+            }
+        }
+    }
+    false
+}
+
+fn paths_eq_platform(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        if left == right {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            if left.parent() == right.parent() {
+                if let (Some(parent), Some(nl), Some(nr)) = (
+                    left.parent(),
+                    left.file_name().and_then(|s| s.to_str()),
+                    right.file_name().and_then(|s| s.to_str()),
+                ) {
+                    if nl.eq_ignore_ascii_case(nr) && is_dir_case_insensitive(parent) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+fn paths_alias(left: &Path, right: &Path) -> bool {
+    if left == right || same_file_identity(left, right) {
+        return true;
+    }
+    paths_eq_platform(&resolve_physical_path(left), &resolve_physical_path(right))
+}
+
+fn sha256_hex_slices(first: &[u8], second: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(first);
+    hasher.update(second);
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn lock_path_for(path: &Path) -> PathBuf {
+    match path.file_name() {
+        Some(name) => {
+            let mut lock_name = name.to_os_string();
+            lock_name.push(LOCK_SUFFIX);
+            path.with_file_name(lock_name)
+        }
+        None => {
+            let mut raw = path.to_path_buf().into_os_string();
+            raw.push(LOCK_SUFFIX);
+            PathBuf::from(raw)
+        }
+    }
+}
+
 impl Registry {
     pub fn new(path: PathBuf) -> Registry {
-        let lock_path = match path.file_name() {
-            Some(name) => {
-                let mut lock_name = name.to_os_string();
-                lock_name.push(LOCK_SUFFIX);
-                path.with_file_name(lock_name)
-            }
-            None => {
-                let mut raw = path.clone().into_os_string();
-                raw.push(LOCK_SUFFIX);
-                PathBuf::from(raw)
-            }
-        };
+        let lock_path = lock_path_for(&path);
         Registry { path, lock_path }
     }
 
     /// Validate that the registry path names a file component and
     /// carries no trailing directory syntax (DB-15).
     pub fn validate_registry_path(&self) -> Result<()> {
-        let raw = self.path.as_os_str();
-        if raw.is_empty() || self.path.file_name().is_none() || has_trailing_dir_syntax(raw) {
-            let rendered = py_repr(&self.path.to_string_lossy());
-            return Err(Error::InvalidRequest(format!(
-                "invalid registry path {rendered}, the path must name a file"
-            )));
+        validate_file_path(&self.path, "registry")
+    }
+
+    /// Validate an archive path under DB-15 and verify neither it nor
+    /// its sibling lock file can overwrite or alias the registry file
+    /// or its lock file (DB-24).
+    pub fn validate_archive_path(&self, archive_path: &Path) -> Result<()> {
+        validate_file_path(archive_path, "archive")?;
+        let archive_lock = lock_path_for(archive_path);
+        if paths_alias(archive_path, &self.path)
+            || paths_alias(archive_path, &self.lock_path)
+            || paths_alias(&archive_lock, &self.path)
+            || paths_alias(&archive_lock, &self.lock_path)
+        {
+            return Err(Error::InvalidRequest(
+                "the archive path must not point to the registry file or its lock file".to_string(),
+            ));
         }
         Ok(())
     }
@@ -2388,10 +3906,7 @@ impl Registry {
         unreachable!()
     }
 
-    /// Take an exclusive lock on the sibling lock file, creating
-    /// it under the process umask with no hardcoded mode override
-    /// so shared group directories stay writable by peers (DB-16).
-    fn lock_exclusive_mut(&self) -> Result<LockGuard> {
+    fn lock_exclusive_at(lock_path: &Path, target_label: &str) -> Result<LockGuard> {
         for attempt in 1..=5 {
             let mut options = OpenOptions::new();
             options.read(true).write(true).create(true).truncate(false);
@@ -2400,20 +3915,20 @@ impl Registry {
                 use std::os::windows::fs::OpenOptionsExt;
                 options.share_mode(0x0000_0001 | 0x0000_0002);
             }
-            let file = options.open(&self.lock_path).map_err(|err| {
+            let file = options.open(lock_path).map_err(|err| {
                 Error::Failure(format!(
-                    "the lock file beside the registry cannot be opened, {err}"
+                    "the lock file beside the {target_label} cannot be opened, {err}"
                 ))
             })?;
             file.lock().map_err(|err| {
                 Error::Failure(format!(
-                    "the lock file beside the registry cannot be locked, {err}"
+                    "the lock file beside the {target_label} cannot be locked, {err}"
                 ))
             })?;
             let guard = LockGuard {
                 file,
                 #[cfg(unix)]
-                lock_path: self.lock_path.clone(),
+                lock_path: lock_path.to_path_buf(),
             };
             if guard.identity_holds() {
                 return Ok(guard);
@@ -2421,23 +3936,28 @@ impl Registry {
             if attempt == 5 {
                 return Err(Error::Failure(format!(
                     "the lock file at {} is not the file this command locked, \
-                     so the registry was left unchanged",
-                    self.lock_path.display()
+                     so the {target_label} was left unchanged",
+                    lock_path.display()
                 )));
             }
         }
         unreachable!()
     }
 
+    /// Take an exclusive lock on the sibling lock file, creating
+    /// it under the process umask with no hardcoded mode override
+    /// so shared group directories stay writable by peers (DB-16).
+    fn lock_exclusive_mut(&self) -> Result<LockGuard> {
+        Self::lock_exclusive_at(&self.lock_path, "registry")
+    }
+
     /// Read and strictly validate the registry, or start empty.
-    ///
-    /// A missing file reads as the empty document. A file that
-    /// stands but cannot be read as recorded raises the corrupt
-    /// error and is never reset and never written over by a read.
-    fn read_document(&self) -> Result<Document> {
+    fn read_document(&self) -> Result<RegistryDoc> {
         let raw = match std::fs::read(&self.path) {
             Ok(raw) => raw,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(empty_document()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(empty_registry_doc())
+            }
             Err(err) => {
                 return Err(Error::Failure(format!(
                     "the registry file cannot be read, {err}"
@@ -2457,14 +3977,12 @@ impl Registry {
                 corrupt(format!("the document does not parse, {text}"))
             }
         })?;
-        validate_document(&value)
+        validate_registry_doc(&value)
     }
 
     /// The directory the registry file stands in, with a
     /// path carrying no directory part naming the current
-    /// directory. The mutation path creates it and the publish
-    /// path syncs it, and both take it from here so the rule
-    /// stands stated once.
+    /// directory.
     fn parent_dir(&self) -> Option<PathBuf> {
         self.path.parent().map(|parent| {
             if parent.as_os_str().is_empty() {
@@ -2475,8 +3993,8 @@ impl Registry {
         })
     }
 
-    fn publish(&self, document: &Document) -> Result<()> {
-        let text = render_document(document) + "\n";
+    fn publish(&self, document: &RegistryDoc) -> Result<()> {
+        let text = render_registry_doc(document) + "\n";
         let name = self
             .path
             .file_name()
@@ -2491,9 +4009,6 @@ impl Registry {
             Ok(())
         })();
         if let Err(err) = staged {
-            // Only the temporary file this publish created is
-            // removed. create_publish_temp returns only a file
-            // this publish created, never a plant at the name.
             let _ = std::fs::remove_file(&temp);
             return Err(Error::Failure(format!(
                 "the registry could not be published, {err}"
@@ -2508,7 +4023,7 @@ impl Registry {
         Ok(())
     }
 
-    fn mutate<T>(&self, action: impl FnOnce(&mut Document) -> Result<T>) -> Result<T> {
+    fn mutate<T>(&self, action: impl FnOnce(&mut RegistryDoc) -> Result<T>) -> Result<T> {
         self.validate_registry_path()?;
         if let Some(parent) = self.parent_dir() {
             std::fs::create_dir_all(&parent).map_err(|err| {
@@ -2518,24 +4033,49 @@ impl Registry {
         let guard = self.lock_exclusive_mut()?;
         let mut document = self.read_document()?;
         let result = action(&mut document)?;
-        // The publish is the one state change, and it happens
-        // only while the lock this command holds is still the
-        // file at the lock path.
         guard.verify()?;
         self.publish(&document)?;
         Ok(result)
     }
 
-    fn read<T>(&self, action: impl FnOnce(&Document) -> Result<T>) -> Result<T> {
+    /// Check whether neither the registry file nor its lock file
+    /// stands on disk, while still reporting ancestor non-directory
+    /// or permission errors as Error::Failure.
+    fn both_registry_and_lock_absent(&self) -> Result<bool> {
+        match std::fs::metadata(&self.path) {
+            Ok(_) => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                for ancestor in self.path.ancestors().skip(1) {
+                    if ancestor.as_os_str().is_empty() {
+                        break;
+                    }
+                    match std::fs::metadata(ancestor) {
+                        Ok(meta) if meta.is_dir() => break,
+                        Ok(_) => {
+                            return Err(Error::Failure(format!(
+                                "the registry file cannot be read, {err}"
+                            )));
+                        }
+                        Err(anc_err) if anc_err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(anc_err) => {
+                            return Err(Error::Failure(format!(
+                                "the registry file cannot be read, {anc_err}"
+                            )));
+                        }
+                    }
+                }
+                Ok(std::fs::metadata(&self.lock_path)
+                    .err()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+            }
+            Err(err) => Err(Error::Failure(format!(
+                "the registry file cannot be read, {err}"
+            ))),
+        }
+    }
+
+    fn read<T>(&self, action: impl FnOnce(&RegistryDoc) -> Result<T>) -> Result<T> {
         self.validate_registry_path()?;
-        // A missing registry reads as the empty document and
-        // the read creates nothing, so absence is established
-        // from the metadata before any lock is taken (DB-12).
-        // A metadata failure of any other kind is not absence.
-        // The registry may stand and be unreadable, and reading
-        // it as empty would report a backlog that is not there
-        // (DB-A7), so it refuses with the failure the document
-        // read itself raises for an unreadable registry.
         match std::fs::metadata(&self.path) {
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -2558,7 +4098,7 @@ impl Registry {
                         }
                     }
                 }
-                return action(&empty_document());
+                return action(&empty_registry_doc());
             }
             Err(err) => {
                 return Err(Error::Failure(format!(
@@ -2571,8 +4111,33 @@ impl Registry {
         action(&document)
     }
 
+    fn last_seq(document: &RegistryDoc) -> i128 {
+        let base = document
+            .compaction
+            .as_ref()
+            .map_or(0i128, |c| c.through_seq as i128);
+        base + document.history.len() as i128
+    }
+
+    fn ensure_seq_capacity(document: &RegistryDoc, count: usize) -> Result<()> {
+        let last = Self::last_seq(document);
+        if last
+            .checked_add(count as i128)
+            .is_none_or(|final_seq| final_seq > u64::MAX as i128)
+        {
+            return Err(Error::Refusal(
+                "history sequence has reached the 64-bit limit".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn next_seq(document: &RegistryDoc) -> i128 {
+        Self::last_seq(document) + 1
+    }
+
     fn append_event(
-        document: &mut Document,
+        document: &mut RegistryDoc,
         kind: &str,
         item: &str,
         holder: Option<&str>,
@@ -2580,8 +4145,9 @@ impl Registry {
         epoch: i128,
         previous: Option<&str>,
     ) {
+        let seq = Self::next_seq(document);
         document.history.push(Event {
-            seq: document.history.len() as i128 + 1,
+            seq,
             kind: kind.to_string(),
             item: item.to_string(),
             holder: holder.map(str::to_string),
@@ -2602,8 +4168,83 @@ impl Registry {
         Ok(*now < expires)
     }
 
-    fn standing_lease_index(document: &Document, item_id: &str, now: &Instant) -> Result<usize> {
-        let index = match document.items.iter().position(|item| item.id == item_id) {
+    fn completed_set(document: &RegistryDoc) -> HashSet<&str> {
+        document
+            .items
+            .iter()
+            .filter(|item| item.core.status == "completed")
+            .map(|item| item.core.id.as_str())
+            .collect()
+    }
+
+    fn is_item_blocked(item: &StoredItem, completed: &HashSet<&str>) -> bool {
+        item.depends_on
+            .iter()
+            .any(|dep| !completed.contains(dep.as_str()))
+    }
+
+    fn item_effective_status(
+        item: &StoredItem,
+        live_claimed: bool,
+        completed: &HashSet<&str>,
+    ) -> &'static str {
+        if item.core.status == "completed" {
+            "completed"
+        } else if live_claimed {
+            "claimed"
+        } else if Self::is_item_blocked(item, completed) {
+            "blocked"
+        } else if item
+            .max_takeovers
+            .is_some_and(|cap| item.takeover_count >= cap)
+        {
+            "exhausted"
+        } else {
+            "open"
+        }
+    }
+
+    fn evaluate_item(
+        item: &StoredItem,
+        completed: &HashSet<&str>,
+        now: &Instant,
+    ) -> Result<ItemDetail> {
+        let (status, holder, expires_at, live_claimed) = if item.core.status == "completed" {
+            ("completed".to_string(), None, None, false)
+        } else if Self::lease_live(&item.core, now)? {
+            (
+                "claimed".to_string(),
+                item.core.holder.clone(),
+                item.core.expires_at.clone(),
+                true,
+            )
+        } else {
+            ("open".to_string(), None, None, false)
+        };
+        let effective_status =
+            Self::item_effective_status(item, live_claimed, completed).to_string();
+        Ok(ItemDetail {
+            id: item.core.id.clone(),
+            note: item.core.note.clone(),
+            status,
+            effective_status,
+            priority: item.priority,
+            tags: item.tags.clone(),
+            depends_on: item.depends_on.clone(),
+            holder,
+            expires_at,
+            epoch: item.core.epoch,
+            takeover_count: item.takeover_count,
+            max_takeovers: item.max_takeovers,
+        })
+    }
+
+    fn standing_lease_index(document: &RegistryDoc, item_id: &str, now: &Instant) -> Result<usize> {
+        let index = match document
+            .items
+            .iter()
+            .position(|item| item.core.id == item_id)
+        {
             Some(index) => index,
             None => {
                 return Err(Error::NotFound(format!(
@@ -2612,7 +4253,7 @@ impl Registry {
                 )))
             }
         };
-        let item = &document.items[index];
+        let item = &document.items[index].core;
         if item.status == "completed" {
             return Err(Error::Refusal(format!(
                 "item {} is completed and accepts no lease",
@@ -2634,34 +4275,113 @@ impl Registry {
         Ok(index)
     }
 
-    /// Add an item to the backlog and record the offered event.
-    pub fn offer(&self, item_id: &str, note: &str, now: &Instant) -> Result<()> {
-        validate_name_str(item_id, "item")?;
-        validate_note_str(note)?;
-        validate_now(now)?;
-        self.mutate(|document| {
-            if document.items.iter().any(|item| item.id == item_id) {
+    fn validate_and_normalize_spec(spec: &OfferSpec) -> Result<OfferSpec> {
+        validate_name_str(&spec.id, "item")?;
+        validate_note_str(&spec.note)?;
+        let priority = validate_priority(&Value::Int(spec.priority as i128))?;
+        let tags = normalize_tags(&spec.tags)?;
+        let depends_on = normalize_depends_on(&spec.id, &spec.depends_on)?;
+        let max_takeovers = match spec.max_takeovers {
+            Some(cap) => validate_max_takeovers(&Value::Int(cap as i128))?,
+            None => None,
+        };
+        Ok(OfferSpec {
+            id: spec.id.clone(),
+            note: spec.note.clone(),
+            priority,
+            tags,
+            depends_on,
+            max_takeovers,
+        })
+    }
+
+    fn verify_offer_batch_dag(
+        standing_items: &[StoredItem],
+        normalized_specs: &[OfferSpec],
+    ) -> Result<()> {
+        let total = standing_items.len() + normalized_specs.len();
+        let mut index_by_id: HashMap<&str, usize> = HashMap::with_capacity(total);
+        for (idx, item) in standing_items.iter().enumerate() {
+            index_by_id.insert(item.core.id.as_str(), idx);
+        }
+        for (offset, spec) in normalized_specs.iter().enumerate() {
+            if index_by_id.contains_key(spec.id.as_str()) {
                 return Err(Error::Refusal(format!(
                     "item {} already stands in the backlog",
-                    py_repr(item_id)
+                    py_repr(&spec.id)
                 )));
             }
-            document.items.push(Item {
-                id: item_id.to_string(),
-                note: note.to_string(),
-                status: "open".to_string(),
-                holder: None,
-                token_hash: None,
-                epoch: 0,
-                expires_at: None,
+            index_by_id.insert(spec.id.as_str(), standing_items.len() + offset);
+        }
+        let mut adj: Vec<Vec<usize>> = Vec::with_capacity(total);
+        for item in standing_items {
+            let mut edges = Vec::with_capacity(item.depends_on.len());
+            for dep in &item.depends_on {
+                if let Some(&dep_idx) = index_by_id.get(dep.as_str()) {
+                    edges.push(dep_idx);
+                }
+            }
+            adj.push(edges);
+        }
+        for spec in normalized_specs {
+            let mut edges = Vec::with_capacity(spec.depends_on.len());
+            for dep in &spec.depends_on {
+                let Some(&dep_idx) = index_by_id.get(dep.as_str()) else {
+                    return Err(Error::Refusal(format!(
+                        "item {} depends on unknown item {}",
+                        py_repr(&spec.id),
+                        py_repr(dep)
+                    )));
+                };
+                edges.push(dep_idx);
+            }
+            adj.push(edges);
+        }
+        if has_dependency_cycle(&adj) {
+            return Err(Error::Refusal(
+                "item dependencies contain a cycle".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Add an item to the backlog and record the offered event.
+    pub fn offer(&self, item_id: &str, note: &str, now: &Instant) -> Result<()> {
+        self.offer_with(&OfferSpec::new(item_id, note), now)
+    }
+
+    /// Add an item with optional dibs-registry/2 priority, tags,
+    /// dependencies, and max_takeovers (DB-21, DB-22, DB-23).
+    pub fn offer_with(&self, spec: &OfferSpec, now: &Instant) -> Result<()> {
+        let normalized = Self::validate_and_normalize_spec(spec)?;
+        validate_now(now)?;
+        self.mutate(|document| {
+            Self::verify_offer_batch_dag(&document.items, std::slice::from_ref(&normalized))?;
+            Self::ensure_seq_capacity(document, 1)?;
+            let id = normalized.id.clone();
+            document.items.push(StoredItem {
+                core: Item {
+                    id: normalized.id,
+                    note: normalized.note,
+                    status: "open".to_string(),
+                    holder: None,
+                    token_hash: None,
+                    epoch: 0,
+                    expires_at: None,
+                },
+                priority: normalized.priority,
+                tags: normalized.tags,
+                depends_on: normalized.depends_on,
+                max_takeovers: normalized.max_takeovers,
+                takeover_count: 0,
             });
-            Self::append_event(document, "offered", item_id, None, now, 0, None);
+            Self::append_event(document, "offered", &id, None, now, 0, None);
             Ok(())
         })
     }
 
     /// Add a batch of items to the backlog all or nothing under one
-    /// exclusive lock and return the offered item ids in order (DB-18).
+    /// exclusive lock and return the offered item ids in order (DB-18, DB-22, DB-23).
     pub fn offer_many(&self, specs: &[OfferSpec], now: &Instant) -> Result<Vec<String>> {
         if specs.is_empty() {
             return Err(Error::InvalidRequest(
@@ -2669,80 +4389,77 @@ impl Registry {
             ));
         }
         let mut seen_in_batch: HashSet<&str> = HashSet::with_capacity(specs.len());
+        let mut normalized_specs = Vec::with_capacity(specs.len());
         for spec in specs {
-            validate_name_str(&spec.id, "item")?;
-            validate_note_str(&spec.note)?;
+            let normalized = Self::validate_and_normalize_spec(spec)?;
             if !seen_in_batch.insert(spec.id.as_str()) {
                 return Err(Error::InvalidRequest(format!(
                     "duplicate item id {} in offer batch",
                     py_repr(&spec.id)
                 )));
             }
+            normalized_specs.push(normalized);
         }
         validate_now(now)?;
         self.mutate(|document| {
-            let standing: HashSet<&str> =
-                document.items.iter().map(|item| item.id.as_str()).collect();
-            for spec in specs {
-                if standing.contains(spec.id.as_str()) {
-                    return Err(Error::Refusal(format!(
-                        "item {} already stands in the backlog",
-                        py_repr(&spec.id)
-                    )));
-                }
-            }
-            let mut offered = Vec::with_capacity(specs.len());
-            for spec in specs {
-                document.items.push(Item {
-                    id: spec.id.clone(),
-                    note: spec.note.clone(),
-                    status: "open".to_string(),
-                    holder: None,
-                    token_hash: None,
-                    epoch: 0,
-                    expires_at: None,
+            Self::verify_offer_batch_dag(&document.items, &normalized_specs)?;
+            Self::ensure_seq_capacity(document, normalized_specs.len())?;
+            let mut offered = Vec::with_capacity(normalized_specs.len());
+            for spec in normalized_specs {
+                let id = spec.id.clone();
+                document.items.push(StoredItem {
+                    core: Item {
+                        id: spec.id,
+                        note: spec.note,
+                        status: "open".to_string(),
+                        holder: None,
+                        token_hash: None,
+                        epoch: 0,
+                        expires_at: None,
+                    },
+                    priority: spec.priority,
+                    tags: spec.tags,
+                    depends_on: spec.depends_on,
+                    max_takeovers: spec.max_takeovers,
+                    takeover_count: 0,
                 });
-                Self::append_event(document, "offered", &spec.id, None, now, 0, None);
-                offered.push(spec.id.clone());
+                Self::append_event(document, "offered", &id, None, now, 0, None);
+                offered.push(id);
             }
             Ok(offered)
         })
     }
 
     fn grant_claim_at(
-        document: &mut Document,
+        document: &mut RegistryDoc,
         index: usize,
         holder: &str,
         ttl: i64,
         now: &Instant,
     ) -> Result<ClaimGranted> {
-        let item_id = document.items[index].id.clone();
-        let (kind, previous) = if document.items[index].status == "claimed" {
-            ("taken_over", document.items[index].holder.clone())
+        let item_id = document.items[index].core.id.clone();
+        let is_takeover = document.items[index].core.status == "claimed";
+        let (kind, previous) = if is_takeover {
+            ("taken_over", document.items[index].core.holder.clone())
         } else {
             ("claimed", None)
         };
-        // The epoch this claim assigns must be an epoch the
-        // reader can take back. A stored epoch at the
-        // unsigned top is a document the reader accepts, and
-        // assigning the next epoch would write a document no
-        // reader accepts, so the claim refuses here, before
-        // any state changes.
-        if document.items[index].epoch >= u64::MAX as i128 {
+        if document.items[index].core.epoch >= u64::MAX as i128 {
             return Err(Error::Refusal(format!(
                 "item {} stands at epoch {}, and no epoch past it can be \
                  assigned, so the claim is refused",
                 py_repr(&item_id),
-                document.items[index].epoch
+                document.items[index].core.epoch
             )));
         }
+        Self::ensure_seq_capacity(document, 1)?;
         let token = draw_token()?;
         let expires = expiry_after(now, ttl)?;
-        let item = &mut document.items[index];
-        item.status = "claimed".to_string();
-        item.holder = Some(holder.to_string());
-        item.token_hash = Some(token_hash(&token));
-        item.epoch = match item.epoch.checked_add(1) {
+        let stored = &mut document.items[index];
+        stored.core.status = "claimed".to_string();
+        stored.core.holder = Some(holder.to_string());
+        stored.core.token_hash = Some(token_hash(&token));
+        stored.core.epoch = match stored.core.epoch.checked_add(1) {
             Some(epoch) => epoch,
             None => {
                 return Err(corrupt(format!(
@@ -2751,8 +4468,11 @@ impl Registry {
                 )))
             }
         };
-        item.expires_at = Some(format_instant(&expires));
-        let epoch = item.epoch;
+        if is_takeover {
+            stored.takeover_count += 1;
+        }
+        stored.core.expires_at = Some(format_instant(&expires));
+        let epoch = stored.core.epoch;
         Self::append_event(
             document,
             kind,
@@ -2771,8 +4491,8 @@ impl Registry {
         })
     }
 
-    /// Lease an open or expired item and return the one
-    /// ClaimGranted.
+    /// Lease an open or expired ready item and return the one
+    /// ClaimGranted (DB-1, DB-22, DB-23).
     pub fn claim(
         &self,
         item_id: &str,
@@ -2785,7 +4505,11 @@ impl Registry {
         let ttl = validate_ttl_i64(ttl)?;
         validate_now(now)?;
         self.mutate(|document| {
-            let index = match document.items.iter().position(|item| item.id == item_id) {
+            let index = match document
+                .items
+                .iter()
+                .position(|item| item.core.id == item_id)
+            {
                 Some(index) => index,
                 None => {
                     return Err(Error::NotFound(format!(
@@ -2794,83 +4518,96 @@ impl Registry {
                     )))
                 }
             };
-            if document.items[index].status == "completed" {
+            if document.items[index].core.status == "completed" {
                 return Err(Error::Refusal(format!(
                     "item {} is completed and accepts no claim",
                     py_repr(item_id)
                 )));
             }
-            if document.items[index].status == "claimed"
-                && Self::lease_live(&document.items[index], now)?
+            if document.items[index].core.status == "claimed"
+                && Self::lease_live(&document.items[index].core, now)?
             {
                 return Err(Error::Refusal(format!(
                     "item {} is already claimed by {}",
                     py_repr(item_id),
-                    py_repr(document.items[index].holder.as_deref().unwrap_or_default())
+                    py_repr(
+                        document.items[index]
+                            .core
+                            .holder
+                            .as_deref()
+                            .unwrap_or_default()
+                    )
+                )));
+            }
+            let completed = Self::completed_set(document);
+            if Self::is_item_blocked(&document.items[index], &completed) {
+                return Err(Error::Refusal(format!(
+                    "item {} is blocked by incomplete dependencies",
+                    py_repr(item_id)
+                )));
+            }
+            if document.items[index]
+                .max_takeovers
+                .is_some_and(|cap| document.items[index].takeover_count >= cap)
+            {
+                return Err(Error::Refusal(format!(
+                    "item {} has reached max_takeovers and must be reset",
+                    py_repr(item_id)
                 )));
             }
             Self::grant_claim_at(document, index, holder, ttl, now)
         })
     }
 
-    /// Lease the first open or expired item standing in offer order
-    /// and return the issued ClaimGranted (DB-17).
+    /// Lease the highest-priority ready item in offer order and
+    /// return the issued ClaimGranted (DB-17, DB-23).
     pub fn claim_next(&self, holder: &str, ttl: i64, now: &Instant) -> Result<ClaimGranted> {
+        self.claim_next_with_tags(holder, ttl, &[], now)
+    }
+
+    /// Lease the highest-priority ready item matching every tag in
+    /// `tags` (with ties broken by offer order) and return the
+    /// issued ClaimGranted (DB-17, DB-22, DB-23).
+    pub fn claim_next_with_tags(
+        &self,
+        holder: &str,
+        ttl: i64,
+        tags: &[String],
+        now: &Instant,
+    ) -> Result<ClaimGranted> {
         validate_name_str(holder, "holder")?;
         let ttl = validate_ttl_i64(ttl)?;
+        for tag in tags {
+            validate_name_str(tag, "tag")?;
+        }
         validate_now(now)?;
         let _ = expiry_after(now, ttl)?;
         self.validate_registry_path()?;
-        match std::fs::metadata(&self.path) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                for ancestor in self.path.ancestors().skip(1) {
-                    if ancestor.as_os_str().is_empty() {
-                        break;
-                    }
-                    match std::fs::metadata(ancestor) {
-                        Ok(meta) if meta.is_dir() => break,
-                        Ok(_) => {
-                            return Err(Error::Failure(format!(
-                                "the registry file cannot be read, {err}"
-                            )));
-                        }
-                        Err(anc_err) if anc_err.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(anc_err) => {
-                            return Err(Error::Failure(format!(
-                                "the registry file cannot be read, {anc_err}"
-                            )));
-                        }
-                    }
-                }
-                if std::fs::metadata(&self.lock_path)
-                    .err()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                {
-                    return Err(Error::Refusal(
-                        "no ready item stands in the backlog".to_string(),
-                    ));
-                }
-            }
-            Err(err) => {
-                return Err(Error::Failure(format!(
-                    "the registry file cannot be read, {err}"
-                )));
-            }
+        if self.both_registry_and_lock_absent()? {
+            return Err(Error::Refusal(
+                "no ready item stands in the backlog".to_string(),
+            ));
         }
         self.mutate(|document| {
-            let mut target_index = None;
+            let completed = Self::completed_set(document);
+            let mut best: Option<(u8, usize)> = None;
             for (index, item) in document.items.iter().enumerate() {
-                if item.status == "completed" {
+                if item.core.status == "completed" {
                     continue;
                 }
-                if item.status == "claimed" && Self::lease_live(item, now)? {
+                let live = Self::lease_live(&item.core, now)?;
+                if Self::item_effective_status(item, live, &completed) != "open" {
                     continue;
                 }
-                target_index = Some(index);
-                break;
+                if !tags.iter().all(|req| item.tags.binary_search(req).is_ok()) {
+                    continue;
+                }
+                let candidate = (item.priority, index);
+                if best.is_none_or(|current| candidate < current) {
+                    best = Some(candidate);
+                }
             }
-            let Some(index) = target_index else {
+            let Some((_, index)) = best else {
                 return Err(Error::Refusal(
                     "no ready item stands in the backlog".to_string(),
                 ));
@@ -2896,14 +4633,15 @@ impl Registry {
         validate_now(now)?;
         self.mutate(|document| {
             let index = Self::standing_lease_index(document, item_id, now)?;
-            let item = &document.items[index];
+            let item = &document.items[index].core;
             check_possession(item, holder, token, &Value::Int(epoch))?;
             let standing =
                 parse_stored_instant(&Value::Str(item.expires_at.clone().unwrap_or_default()))?;
             let expires = expiry_after(&standing, ttl)?;
+            Self::ensure_seq_capacity(document, 1)?;
             let rendered = format_instant(&expires);
             let standing_epoch = item.epoch;
-            document.items[index].expires_at = Some(rendered);
+            document.items[index].core.expires_at = Some(rendered);
             Self::append_event(
                 document,
                 "renewed",
@@ -2938,10 +4676,11 @@ impl Registry {
         validate_now(now)?;
         self.mutate(|document| {
             let index = Self::standing_lease_index(document, item_id, now)?;
-            let item = &document.items[index];
+            let item = &document.items[index].core;
             check_possession(item, holder, token, &Value::Int(epoch))?;
+            Self::ensure_seq_capacity(document, 1)?;
             let standing_epoch = item.epoch;
-            Self::end_lease(&mut document.items[index], "open");
+            Self::end_lease(&mut document.items[index].core, "open");
             Self::append_event(
                 document,
                 "released",
@@ -2970,10 +4709,11 @@ impl Registry {
         validate_now(now)?;
         self.mutate(|document| {
             let index = Self::standing_lease_index(document, item_id, now)?;
-            let item = &document.items[index];
+            let item = &document.items[index].core;
             check_possession(item, holder, token, &Value::Int(epoch))?;
+            Self::ensure_seq_capacity(document, 1)?;
             let standing_epoch = item.epoch;
-            Self::end_lease(&mut document.items[index], "completed");
+            Self::end_lease(&mut document.items[index].core, "completed");
             Self::append_event(
                 document,
                 "completed",
@@ -2987,70 +4727,145 @@ impl Registry {
         })
     }
 
-    fn board_row(item: &Item, now: &Instant) -> Result<BoardRow> {
-        if Self::lease_live(item, now)? {
-            Ok(BoardRow {
-                id: item.id.clone(),
-                note: item.note.clone(),
-                status: "claimed".to_string(),
-                holder: item.holder.clone(),
-                expires_at: item.expires_at.clone(),
-                epoch: item.epoch,
-            })
-        } else {
-            Ok(BoardRow {
-                id: item.id.clone(),
-                note: item.note.clone(),
-                status: "open".to_string(),
-                holder: None,
-                expires_at: None,
-                epoch: item.epoch,
-            })
+    /// Reset an exhausted item back to open with takeover_count 0
+    /// while preserving its monotonic epoch (DB-23).
+    pub fn reset(&self, item_id: &str, now: &Instant) -> Result<ItemDetail> {
+        validate_name_str(item_id, "item")?;
+        validate_now(now)?;
+        self.validate_registry_path()?;
+        if self.both_registry_and_lock_absent()? {
+            return Err(Error::NotFound(format!(
+                "item {} does not stand in the backlog",
+                py_repr(item_id)
+            )));
         }
+        self.mutate(|document| {
+            let index = match document
+                .items
+                .iter()
+                .position(|item| item.core.id == item_id)
+            {
+                Some(index) => index,
+                None => {
+                    return Err(Error::NotFound(format!(
+                        "item {} does not stand in the backlog",
+                        py_repr(item_id)
+                    )))
+                }
+            };
+            let live = Self::lease_live(&document.items[index].core, now)?;
+            let completed = Self::completed_set(document);
+            match Self::item_effective_status(&document.items[index], live, &completed) {
+                "exhausted" => {}
+                "completed" => {
+                    return Err(Error::Refusal(format!(
+                        "item {} is completed and cannot be reset",
+                        py_repr(item_id)
+                    )));
+                }
+                "claimed" => {
+                    return Err(Error::Refusal(format!(
+                        "item {} holds a live lease by {} and cannot be reset",
+                        py_repr(item_id),
+                        py_repr(
+                            document.items[index]
+                                .core
+                                .holder
+                                .as_deref()
+                                .unwrap_or_default()
+                        )
+                    )));
+                }
+                "blocked" => {
+                    return Err(Error::Refusal(format!(
+                        "item {} is blocked by incomplete dependencies and is not exhausted",
+                        py_repr(item_id)
+                    )));
+                }
+                _ => {
+                    return Err(Error::Refusal(format!(
+                        "item {} is not exhausted and needs no reset",
+                        py_repr(item_id)
+                    )));
+                }
+            }
+            Self::ensure_seq_capacity(document, 1)?;
+            let previous_holder = document.items[index].core.holder.clone();
+            let standing_epoch = document.items[index].core.epoch;
+            Self::end_lease(&mut document.items[index].core, "open");
+            document.items[index].takeover_count = 0;
+            document.is_v2 = true;
+            Self::append_event(
+                document,
+                "reset",
+                item_id,
+                None,
+                now,
+                standing_epoch,
+                previous_holder.as_deref(),
+            );
+            let completed_after = Self::completed_set(document);
+            Self::evaluate_item(&document.items[index], &completed_after, now)
+        })
     }
 
-    /// Return the items standing on the board in offer order,
-    /// the open items and the live claimed items, evaluated at
-    /// the instant.
+    /// Return the non-completed items standing on the board in offer
+    /// order, reporting effective status at the instant (DB-10, DB-22, DB-23).
     pub fn board(&self, now: &Instant) -> Result<Vec<BoardRow>> {
         validate_now(now)?;
         self.read(|document| {
-            let mut rows = Vec::new();
+            let completed = Self::completed_set(document);
+            let mut rows = Vec::with_capacity(document.items.len());
             for item in &document.items {
-                if item.status != "completed" {
-                    rows.push(Self::board_row(item, now)?);
+                if item.core.status != "completed" {
+                    let live = Self::lease_live(&item.core, now)?;
+                    let eff = Self::item_effective_status(item, live, &completed);
+                    let (holder, expires_at) = if live {
+                        (item.core.holder.clone(), item.core.expires_at.clone())
+                    } else {
+                        (None, None)
+                    };
+                    rows.push(BoardRow {
+                        id: item.core.id.clone(),
+                        note: item.core.note.clone(),
+                        status: eff.to_string(),
+                        holder,
+                        expires_at,
+                        epoch: item.core.epoch,
+                    });
                 }
             }
             Ok(rows)
         })
     }
 
-    fn item_detail(item: &Item, takeover_count: u64, now: &Instant) -> Result<ItemDetail> {
-        let (status, holder, expires_at) = if item.status == "completed" {
-            ("completed".to_string(), None, None)
-        } else if Self::lease_live(item, now)? {
-            (
-                "claimed".to_string(),
-                item.holder.clone(),
-                item.expires_at.clone(),
-            )
-        } else {
-            ("open".to_string(), None, None)
-        };
-        let effective_status = status.clone();
-        Ok(ItemDetail {
-            id: item.id.clone(),
-            note: item.note.clone(),
-            status,
-            effective_status,
-            priority: 2,
-            tags: Vec::new(),
-            depends_on: Vec::new(),
-            holder,
-            expires_at,
-            epoch: item.epoch,
-            takeover_count,
-            max_takeovers: None,
+    /// Return all ready items matching every tag in `tags`, sorted by
+    /// `(priority ASC, offer_order ASC)` without creating a lock file (DB-22, DB-23).
+    pub fn ready(&self, tags: &[String], now: &Instant) -> Result<Vec<ItemDetail>> {
+        for tag in tags {
+            validate_name_str(tag, "tag")?;
+        }
+        validate_now(now)?;
+        self.read(|document| {
+            let completed = Self::completed_set(document);
+            let mut candidates: Vec<(u8, usize, ItemDetail)> = Vec::new();
+            for (index, item) in document.items.iter().enumerate() {
+                if item.core.status == "completed" {
+                    continue;
+                }
+                if !tags.iter().all(|req| item.tags.binary_search(req).is_ok()) {
+                    continue;
+                }
+                let detail = Self::evaluate_item(item, &completed, now)?;
+                if detail.effective_status == "open" {
+                    candidates.push((item.priority, index, detail));
+                }
+            }
+            candidates.sort_by_key(|(prio, idx, _)| (*prio, *idx));
+            Ok(candidates
+                .into_iter()
+                .map(|(_, _, detail)| detail)
+                .collect())
         })
     }
 
@@ -3059,18 +4874,14 @@ impl Registry {
         validate_name_str(item_id, "item")?;
         validate_now(now)?;
         self.read(|document| {
-            let Some(item) = document.items.iter().find(|item| item.id == item_id) else {
+            let Some(item) = document.items.iter().find(|item| item.core.id == item_id) else {
                 return Err(Error::NotFound(format!(
                     "item {} does not stand in the backlog",
                     py_repr(item_id)
                 )));
             };
-            let takeover_count = document
-                .history
-                .iter()
-                .filter(|event| event.item == item_id && event.kind == "taken_over")
-                .count() as u64;
-            Self::item_detail(item, takeover_count, now)
+            let completed = Self::completed_set(document);
+            Self::evaluate_item(item, &completed, now)
         })
     }
 
@@ -3079,17 +4890,11 @@ impl Registry {
     pub fn board_details(&self, now: &Instant) -> Result<Vec<ItemDetail>> {
         validate_now(now)?;
         self.read(|document| {
-            let mut takeovers: HashMap<&str, u64> = HashMap::new();
-            for event in &document.history {
-                if event.kind == "taken_over" {
-                    *takeovers.entry(event.item.as_str()).or_insert(0) += 1;
-                }
-            }
+            let completed = Self::completed_set(document);
             let mut details = Vec::new();
             for item in &document.items {
-                if item.status != "completed" {
-                    let count = takeovers.get(item.id.as_str()).copied().unwrap_or(0);
-                    details.push(Self::item_detail(item, count, now)?);
+                if item.core.status != "completed" {
+                    details.push(Self::evaluate_item(item, &completed, now)?);
                 }
             }
             Ok(details)
@@ -3103,7 +4908,7 @@ impl Registry {
         }
         self.read(|document| {
             if let Some(item_id) = item_id {
-                if !document.items.iter().any(|item| item.id == item_id) {
+                if !document.items.iter().any(|item| item.core.id == item_id) {
                     return Err(Error::NotFound(format!(
                         "item {} does not stand in the backlog",
                         py_repr(item_id)
@@ -3116,6 +4921,403 @@ impl Registry {
                 .filter(|event| item_id.is_none() || event.item == item_id.unwrap())
                 .cloned()
                 .collect())
+        })
+    }
+
+    /// Crash-idempotently archive history events through `through_seq`
+    /// into `archive_path` and publish a dibs-registry/2 compaction
+    /// baseline (DB-24).
+    pub fn compact(
+        &self,
+        through_seq: u64,
+        archive_path: &Path,
+        now: &Instant,
+    ) -> Result<CompactSummary> {
+        let through_seq = validate_through_seq(&Value::Int(through_seq as i128))?;
+        validate_now(now)?;
+        self.validate_registry_path()?;
+        self.validate_archive_path(archive_path)?;
+        if self.both_registry_and_lock_absent()? {
+            return Err(Error::Refusal(format!(
+                "requested through_seq {through_seq} exceeds the last recorded seq 0"
+            )));
+        }
+
+        let archive_parent = archive_path.parent().map(|parent| {
+            if parent.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            }
+        });
+        if let Some(ref parent) = archive_parent {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                Error::Failure(format!("the archive directory cannot be created, {err}"))
+            })?;
+        }
+        self.validate_archive_path(archive_path)?;
+
+        let archive_lock_path = lock_path_for(archive_path);
+        let reg_phys = resolve_physical_path(&self.lock_path);
+        let arch_phys = resolve_physical_path(&archive_lock_path);
+        let (reg_guard, arch_guard) = if reg_phys <= arch_phys {
+            let rg = self.lock_exclusive_mut()?;
+            let ag = Self::lock_exclusive_at(&archive_lock_path, "archive")?;
+            (rg, ag)
+        } else {
+            let ag = Self::lock_exclusive_at(&archive_lock_path, "archive")?;
+            let rg = self.lock_exclusive_mut()?;
+            (rg, ag)
+        };
+        // Re-verify archive path and lock non-aliasing now that both `.lock` files stand on disk.
+        self.validate_archive_path(archive_path)?;
+        let mut document = self.read_document()?;
+
+        let prev_through_seq = document.compaction.as_ref().map_or(0u64, |c| c.through_seq);
+        if prev_through_seq >= through_seq {
+            return Err(Error::Refusal(format!(
+                "the registry is already compacted through seq {prev_through_seq}"
+            )));
+        }
+        let last_seq = document
+            .history
+            .last()
+            .map_or(prev_through_seq, |ev| ev.seq as u64);
+        if through_seq > last_seq {
+            return Err(Error::Refusal(format!(
+                "requested through_seq {through_seq} exceeds the last recorded seq {last_seq}"
+            )));
+        }
+
+        let existing_bytes = match std::fs::read(archive_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if prev_through_seq > 0 {
+                    return Err(Error::Refusal(format!(
+                        "the archive file is missing events 1 through {prev_through_seq} from the standing compaction"
+                    )));
+                }
+                Vec::new()
+            }
+            Err(err) => {
+                return Err(Error::Failure(format!(
+                    "the archive file cannot be read, {err}"
+                )));
+            }
+        };
+
+        if existing_bytes.contains(&b'\r') {
+            return Err(Error::Refusal(
+                "the archive file is not canonical JSON Lines".to_string(),
+            ));
+        }
+        let (complete_bytes, trailing_partial): (&[u8], &[u8]) = if existing_bytes.is_empty() {
+            (&[], &[])
+        } else if existing_bytes.ends_with(b"\n") {
+            (&existing_bytes, &[])
+        } else {
+            match existing_bytes.iter().rposition(|&b| b == b'\n') {
+                Some(last_nl) => (&existing_bytes[..=last_nl], &existing_bytes[last_nl + 1..]),
+                None => (&[], &existing_bytes),
+            }
+        };
+
+        let complete_text = std::str::from_utf8(complete_bytes)
+            .map_err(|_| Error::Refusal("the archive file is not valid UTF-8".to_string()))?;
+        let mut existing_lines: Vec<&str> = Vec::new();
+        let mut parsed_archive_events: Vec<Event> = Vec::new();
+        if !complete_text.is_empty() {
+            existing_lines = complete_text[..complete_text.len() - 1]
+                .split('\n')
+                .collect();
+            parsed_archive_events.reserve(existing_lines.len());
+            for (idx, line) in existing_lines.iter().enumerate() {
+                let line_no = idx + 1;
+                let expected_seq = line_no as i128;
+                let val: Value = serde_json::from_str(line).map_err(|err| {
+                    let err_text = err.to_string();
+                    if let Some(key) = duplicate_key_of(&err_text) {
+                        Error::Refusal(format!(
+                            "archive line {line_no} carries duplicate key {}",
+                            duplicate_key_display(&key)
+                        ))
+                    } else {
+                        Error::Refusal(format!("archive line {line_no} is not valid JSON"))
+                    }
+                })?;
+                let ev = validate_event_with(&val, expected_seq, true).map_err(|err| {
+                    Error::Refusal(format!(
+                        "archive line {line_no} is invalid, {}",
+                        err.message()
+                    ))
+                })?;
+                if render_event_jsonl_line(&ev) != *line {
+                    return Err(Error::Refusal(format!(
+                        "archive line {line_no} is not in canonical JSON Lines form"
+                    )));
+                }
+                parsed_archive_events.push(ev);
+            }
+        }
+
+        let k = parsed_archive_events.len() as u64;
+        if k < prev_through_seq {
+            return Err(Error::Refusal(format!(
+                "the archive file holds {k} events, fewer than the standing compaction through seq {prev_through_seq}"
+            )));
+        }
+        if let Some(prev) = &document.compaction {
+            let prefix_byte_len: usize = existing_lines[..prev.through_seq as usize]
+                .iter()
+                .map(|line| line.len() + 1)
+                .sum();
+            let prefix_sha = sha256_hex_slices(&complete_bytes[..prefix_byte_len], &[]);
+            if prefix_sha != prev.archived_events_sha256 {
+                return Err(Error::Refusal(
+                    "the archive file digest does not match the standing compaction".to_string(),
+                ));
+            }
+        }
+        if k > through_seq {
+            return Err(Error::Refusal(format!(
+                "the archive file already holds {k} events, beyond requested through_seq {through_seq}"
+            )));
+        }
+        for seq_num in (prev_through_seq + 1)..=k {
+            let archive_ev = &parsed_archive_events[(seq_num - 1) as usize];
+            let standing_ev = &document.history[(seq_num - prev_through_seq - 1) as usize];
+            if archive_ev != standing_ev {
+                return Err(Error::Refusal(format!(
+                    "archive event at seq {seq_num} disagrees with the standing registry history"
+                )));
+            }
+        }
+
+        let mut tail_bytes = Vec::new();
+        let tail_start_seq = if !trailing_partial.is_empty() {
+            if k >= through_seq {
+                return Err(Error::Refusal(format!(
+                    "the archive file holds unterminated bytes past requested through_seq {through_seq}"
+                )));
+            }
+            let next_ev = &document.history[(k + 1 - prev_through_seq - 1) as usize];
+            let expected_line = render_event_jsonl_line(next_ev);
+            if !expected_line.as_bytes().starts_with(trailing_partial) {
+                return Err(Error::Refusal(
+                    "the archive file is not canonical JSON Lines".to_string(),
+                ));
+            }
+            tail_bytes.extend_from_slice(&expected_line.as_bytes()[trailing_partial.len()..]);
+            tail_bytes.push(b'\n');
+            k + 2
+        } else {
+            k + 1
+        };
+        for seq_num in tail_start_seq..=through_seq {
+            let ev = &document.history[(seq_num - prev_through_seq - 1) as usize];
+            let line = render_event_jsonl_line(ev);
+            tail_bytes.extend_from_slice(line.as_bytes());
+            tail_bytes.push(b'\n');
+        }
+
+        let split_count = (through_seq - prev_through_seq) as usize;
+        let events_to_archive = &document.history[..split_count];
+        let remaining_events = document.history[split_count..].to_vec();
+
+        let mut baseline_map: BTreeMap<String, BaselineEntry> = BTreeMap::new();
+        if let Some(prev) = &document.compaction {
+            for entry in &prev.baseline {
+                baseline_map.insert(entry.id.clone(), entry.clone());
+            }
+        } else {
+            let mut events_by_item: BTreeMap<&str, Vec<&Event>> = BTreeMap::new();
+            for ev in &document.history {
+                events_by_item.entry(ev.item.as_str()).or_default().push(ev);
+            }
+            // Seed pre-history state for any uncompacted item whose recorded
+            // history is empty or begins mid-life (without an initial offered event).
+            for item in &document.items {
+                let item_events = events_by_item
+                    .get(item.core.id.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                match item_events.first().copied() {
+                    None => {
+                        baseline_map.insert(
+                            item.core.id.clone(),
+                            BaselineEntry {
+                                id: item.core.id.clone(),
+                                status: item.core.status.clone(),
+                                holder: item.core.holder.clone(),
+                                epoch: item.core.epoch,
+                                takeover_count: item.takeover_count,
+                            },
+                        );
+                    }
+                    Some(ev0) if ev0.kind == "offered" => {}
+                    Some(ev0) => {
+                        let initial_takeover_count = if let Some(reset_pos) =
+                            item_events.iter().position(|ev| ev.kind == "reset")
+                        {
+                            let cap = item.max_takeovers.unwrap_or(0);
+                            let takeovers_before_reset = item_events[..reset_pos]
+                                .iter()
+                                .filter(|ev| ev.kind == "taken_over")
+                                .count()
+                                as u64;
+                            cap.saturating_sub(takeovers_before_reset)
+                        } else {
+                            let total_takeovers = item_events
+                                .iter()
+                                .filter(|ev| ev.kind == "taken_over")
+                                .count() as u64;
+                            item.takeover_count.saturating_sub(total_takeovers)
+                        };
+                        let (status, holder, epoch) = match ev0.kind.as_str() {
+                            "claimed" => ("open".to_string(), None, ev0.epoch.saturating_sub(1)),
+                            "taken_over" => (
+                                "claimed".to_string(),
+                                ev0.previous_holder.clone(),
+                                ev0.epoch.saturating_sub(1),
+                            ),
+                            "reset" => {
+                                if ev0.previous_holder.is_some() {
+                                    (
+                                        "claimed".to_string(),
+                                        ev0.previous_holder.clone(),
+                                        ev0.epoch,
+                                    )
+                                } else {
+                                    ("open".to_string(), None, ev0.epoch)
+                                }
+                            }
+                            _ => ("claimed".to_string(), ev0.holder.clone(), ev0.epoch),
+                        };
+                        baseline_map.insert(
+                            item.core.id.clone(),
+                            BaselineEntry {
+                                id: item.core.id.clone(),
+                                status,
+                                holder,
+                                epoch,
+                                takeover_count: initial_takeover_count,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        for ev in events_to_archive {
+            match baseline_map.get_mut(&ev.item) {
+                None => {
+                    let entry = BaselineEntry {
+                        id: ev.item.clone(),
+                        status: "open".to_string(),
+                        holder: None,
+                        epoch: 0,
+                        takeover_count: 0,
+                    };
+                    baseline_map.insert(ev.item.clone(), entry);
+                }
+                Some(entry) => match ev.kind.as_str() {
+                    "claimed" => {
+                        entry.status = "claimed".to_string();
+                        entry.holder = ev.holder.clone();
+                        entry.epoch = ev.epoch;
+                    }
+                    "taken_over" => {
+                        entry.status = "claimed".to_string();
+                        entry.holder = ev.holder.clone();
+                        entry.epoch = ev.epoch;
+                        entry.takeover_count += 1;
+                    }
+                    "renewed" => {
+                        entry.status = "claimed".to_string();
+                        entry.holder = ev.holder.clone();
+                        entry.epoch = ev.epoch;
+                    }
+                    "released" => {
+                        entry.status = "open".to_string();
+                        entry.holder = None;
+                        entry.epoch = ev.epoch;
+                    }
+                    "completed" => {
+                        entry.status = "completed".to_string();
+                        entry.holder = None;
+                        entry.epoch = ev.epoch;
+                    }
+                    "reset" => {
+                        entry.status = "open".to_string();
+                        entry.holder = None;
+                        entry.epoch = ev.epoch;
+                        entry.takeover_count = 0;
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        let archived_events_sha256 = sha256_hex_slices(&existing_bytes, &tail_bytes);
+        let new_compaction = Compaction {
+            through_seq,
+            archived_events_sha256: archived_events_sha256.clone(),
+            compacted_at: format_instant(now),
+            baseline: baseline_map.into_values().collect(),
+        };
+        let mut rendered_comp = String::new();
+        render_compaction(&new_compaction, 0, &mut rendered_comp);
+        let comp_val: Value = serde_json::from_str(&rendered_comp).map_err(|_| {
+            corrupt("the synthesized compaction baseline could not be parsed".to_string())
+        })?;
+        validate_compaction(&comp_val)?;
+        validate_history_against_items_v2(
+            &document.items,
+            Some(&new_compaction),
+            &remaining_events,
+        )?;
+
+        let mut archive_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(archive_path)
+            .map_err(|err| Error::Failure(format!("the archive file cannot be written, {err}")))?;
+        if !tail_bytes.is_empty() {
+            archive_file.write_all(&tail_bytes).map_err(|err| {
+                Error::Failure(format!("the archive file cannot be written, {err}"))
+            })?;
+        }
+        archive_file
+            .sync_all()
+            .map_err(|err| Error::Failure(format!("the archive file cannot be synced, {err}")))?;
+        drop(archive_file);
+        #[cfg(unix)]
+        if let Some(dir) = archive_parent {
+            let handle = File::open(&dir).map_err(|err| {
+                Error::Failure(format!(
+                    "the archive directory cannot be opened for sync, {err}"
+                ))
+            })?;
+            handle.sync_all().map_err(|err| {
+                Error::Failure(format!("the archive directory cannot be synced, {err}"))
+            })?;
+        }
+
+        let archived_count = through_seq - prev_through_seq;
+        let remaining_count = remaining_events.len() as u64;
+        document.is_v2 = true;
+        document.compaction = Some(new_compaction);
+        document.history = remaining_events;
+
+        reg_guard.verify()?;
+        arch_guard.verify()?;
+        self.publish(&document)?;
+
+        Ok(CompactSummary {
+            through_seq,
+            archived_count,
+            remaining_count,
+            archived_events_sha256,
+            archive_path: archive_path.to_path_buf(),
         })
     }
 }
