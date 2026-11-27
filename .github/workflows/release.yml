@@ -1,0 +1,469 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to publish or re-run"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.verify_meta.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.91.1"
+          components: rustfmt, clippy
+      - name: Verify manifest version parity and git tag commit match
+        id: verify_meta
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, re, subprocess, tomllib
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          bind_cargo = tomllib.loads(pathlib.Path("bindings/Cargo.toml").read_text(encoding="utf-8"))
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          init_py = pathlib.Path("python/dibs/__init__.py").read_text(encoding="utf-8")
+          m = re.search(r'^__version__\s*=\s*"([^"]+)"', init_py, re.M)
+          assert m is not None, "missing __version__ in python/dibs/__init__.py"
+          ver = cargo["package"]["version"]
+          assert bind_cargo["package"]["version"] == ver, "bindings/Cargo.toml version mismatch"
+          assert pyproject["project"]["version"] == ver, "pyproject.toml version mismatch"
+          assert m.group(1) == ver, "__init__.py __version__ mismatch"
+          expected = f"v{ver}"
+          dispatch_tag = os.environ.get("INPUT_TAG", "").strip()
+          target_tag = ""
+          if dispatch_tag:
+              assert dispatch_tag == expected, f"dispatch tag {dispatch_tag} does not match Cargo.toml {expected}"
+              target_tag = dispatch_tag
+          elif os.environ.get("REF_TYPE") == "tag":
+              actual = os.environ.get("REF_NAME", "")
+              assert actual == expected, f"tag {actual} does not match Cargo.toml {expected}"
+              target_tag = actual
+          head_sha = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"], text=True).strip()
+          if target_tag:
+              tag_sha = subprocess.check_output(
+                  ["git", "rev-parse", "--verify", f"refs/tags/{target_tag}^{{commit}}"],
+                  text=True,
+              ).strip()
+              assert head_sha == tag_sha, f"HEAD {head_sha} does not match tag commit {tag_sha} for {target_tag}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as out:
+              out.write(f"commit_sha={head_sha}\n")
+          PY
+      - name: Run the local gate
+        run: cargo test
+      - name: Run the codepoint scan
+        run: cargo run -p codepoint_scan
+      - name: Check the formatting
+        run: cargo fmt --check
+      - name: Run the linter
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Verify crate packaging
+        run: cargo package --locked -p dibs-ai
+      - name: Build the Python binding, run smoke tests, and typecheck stubs
+        env:
+          VIRTUAL_ENV: ${{ github.workspace }}/.venv-binding
+        run: |
+          python -m venv .venv-binding
+          .venv-binding/bin/python -m pip install "maturin==1.16.0" "pytest==9.2.0" "mypy>=1.12.0,<2" "pyright>=1.1.400,<2"
+          .venv-binding/bin/maturin develop --manifest-path bindings/Cargo.toml
+          .venv-binding/bin/python -m pytest tests/test_binding_smoke.py
+          .venv-binding/bin/mypy --strict python/dibs tests/typecheck_dibs.py
+          .venv-binding/bin/pyright python/dibs tests/typecheck_dibs.py
+
+  binaries:
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+      - name: Verify checked-out HEAD matches verified commit SHA
+        env:
+          EXPECTED_SHA: ${{ needs.verify.outputs.commit_sha }}
+        shell: bash
+        run: test "$(git rev-parse --verify HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.91.1"
+          targets: ${{ matrix.target }}
+      - name: Build release binary and package archive
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+          ARCHIVE_KIND: ${{ matrix.archive }}
+        shell: bash
+        run: |
+          cargo build --release --locked --bin dibs --target "$TARGET_TRIPLE"
+          python - <<'PY'
+          import hashlib, os, pathlib, tarfile, tomllib, zipfile
+          ver = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+          target = os.environ["TARGET_TRIPLE"]
+          kind = os.environ["ARCHIVE_KIND"]
+          exe = "dibs.exe" if "windows" in target else "dibs"
+          bin_path = pathlib.Path("target") / target / "release" / exe
+          out_dir = pathlib.Path("release-staging")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          stem = f"dibs-v{ver}-{target}"
+          if kind == "zip":
+              archive_path = out_dir / f"{stem}.zip"
+              with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  zf.write(bin_path, arcname=exe)
+                  zf.write("LICENSE", arcname="LICENSE")
+                  zf.write("README.md", arcname="README.md")
+                  zf.write("CHANGELOG.md", arcname="CHANGELOG.md")
+          else:
+              archive_path = out_dir / f"{stem}.tar.gz"
+              with tarfile.open(archive_path, "w:gz") as tf:
+                  tf.add(bin_path, arcname=exe)
+                  tf.add("LICENSE", arcname="LICENSE")
+                  tf.add("README.md", arcname="README.md")
+                  tf.add("CHANGELOG.md", arcname="CHANGELOG.md")
+          digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          (out_dir / f"{archive_path.name}.sha256").write_text(
+              f"{digest}  {archive_path.name}\n",
+              encoding="utf-8",
+              newline="\n",
+          )
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: release-staging/*
+
+  wheels:
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64
+          - os: macos-latest
+            target: aarch64
+          - os: macos-latest
+            target: x86_64
+          - os: windows-latest
+            target: x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+      - name: Verify checked-out HEAD matches verified commit SHA
+        env:
+          EXPECTED_SHA: ${{ needs.verify.outputs.commit_sha }}
+        shell: bash
+        run: test "$(git rev-parse --verify HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.91.1"
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          rust-toolchain: "1.91.1"
+          args: --release --locked --out dist --manifest-path bindings/Cargo.toml
+      - name: Verify wheel PEP 561 entries
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib, tomllib, zipfile
+          ver = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          wheels = list(pathlib.Path("dist").glob(f"dibs_ai-{ver}-*.whl"))
+          assert len(wheels) == 1, f"expected 1 wheel, found {wheels}"
+          with zipfile.ZipFile(wheels[0]) as zf:
+              names = set(zf.namelist())
+              for req in ("dibs/__init__.py", "dibs/py.typed", "dibs/__init__.pyi"):
+                  assert req in names, f"missing {req} in {wheels[0]}: {sorted(names)}"
+              assert any(n.endswith("/LICENSE") or n == "LICENSE" for n in names), f"missing LICENSE in {wheels[0]}"
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*
+
+  sdist:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+      - name: Verify checked-out HEAD matches verified commit SHA
+        env:
+          EXPECTED_SHA: ${{ needs.verify.outputs.commit_sha }}
+        shell: bash
+        run: test "$(git rev-parse --verify HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.91.1"
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path bindings/Cargo.toml
+      - name: Verify sdist archive entries
+        run: |
+          python - <<'PY'
+          import pathlib, tarfile, tomllib
+          ver = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          sdists = list(pathlib.Path("dist").glob(f"dibs_ai-{ver}.tar.gz"))
+          assert len(sdists) == 1, f"expected 1 sdist, found {sdists}"
+          prefix = f"dibs_ai-{ver}/"
+          with tarfile.open(sdists[0], "r:gz") as tf:
+              names = set(tf.getnames())
+          for rel in (
+              "LICENSE",
+              "Cargo.toml",
+              "bindings/Cargo.toml",
+              "pyproject.toml",
+              "python/dibs/__init__.py",
+              "python/dibs/py.typed",
+              "python/dibs/__init__.pyi",
+          ):
+              assert f"{prefix}{rel}" in names, f"missing {prefix}{rel} in {sdists[0]}"
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/*
+
+  publish-docker:
+    needs: [verify]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+      - name: Verify checked-out HEAD matches verified commit SHA
+        env:
+          EXPECTED_SHA: ${{ needs.verify.outputs.commit_sha }}
+        shell: bash
+        run: test "$(git rev-parse --verify HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Resolve container image tags
+        id: meta
+        run: |
+          python - <<'PY'
+          import os, pathlib, tomllib
+          ver = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+          tags = [f"ghcr.io/david-engelmann/dibs:{ver}"]
+          if "-" not in ver:
+              tags.append("ghcr.io/david-engelmann/dibs:latest")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as out:
+              out.write("tags<<EOF\n" + "\n".join(tags) + "\nEOF\n")
+          PY
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+
+  github-release:
+    needs: [verify, binaries, wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-sdist
+          path: release-assets
+      - name: Generate consolidated SHA256SUMS.txt and release flags
+        id: sums
+        env:
+          TARGET_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import hashlib, os, pathlib
+          assets_dir = pathlib.Path("release-assets")
+          lines = []
+          for path in sorted(assets_dir.iterdir(), key=lambda p: p.name):
+              if not path.is_file() or path.name.endswith(".sha256") or path.name == "SHA256SUMS.txt":
+                  continue
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {path.name}\n")
+          assert lines, "no release assets found for SHA256SUMS.txt"
+          (assets_dir / "SHA256SUMS.txt").write_text("".join(lines), encoding="utf-8", newline="\n")
+          tag_name = os.environ.get("TARGET_TAG", "").strip()
+          is_prerelease = "true" if "-" in tag_name else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as out:
+              out.write(f"prerelease={is_prerelease}\n")
+          PY
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release-assets/*
+          prerelease: ${{ steps.sums.outputs.prerelease }}
+          generate_release_notes: true
+
+  publish-crates:
+    needs: [verify, binaries, wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+      - name: Verify checked-out HEAD matches verified commit SHA
+        env:
+          EXPECTED_SHA: ${{ needs.verify.outputs.commit_sha }}
+        shell: bash
+        run: test "$(git rev-parse --verify HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.91.1"
+      - name: Check crates.io sparse index on workflow_dispatch
+        id: crate_check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, tomllib, urllib.error, urllib.request
+          ver = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+          already = False
+          if os.environ.get("EVENT_NAME") == "workflow_dispatch":
+              req = urllib.request.Request(
+                  "https://index.crates.io/di/bs/dibs-ai",
+                  headers={"User-Agent": "dibs-release-workflow/1.0"},
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+                      body = resp.read().decode("utf-8")
+                  for line in body.splitlines():
+                      line = line.strip()
+                      if line and json.loads(line).get("vers") == ver:
+                          already = True
+                          break
+              except urllib.error.HTTPError as err:
+                  if err.code != 404:
+                      raise
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8", newline="\n") as out:
+              out.write(f"already_published={'true' if already else 'false'}\n")
+          PY
+      - name: Publish dibs-ai crate to crates.io
+        if: steps.crate_check.outputs.already_published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p dibs-ai
+
+  publish-pypi:
+    needs: [verify, binaries, wheels, sdist]
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && startsWith(inputs.tag, 'v'))
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-sdist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
+        with:
+          skip-existing: true

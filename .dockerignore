@@ -1,0 +1,12 @@
+target
+.git
+.venv*
+venv
+dist
+build
+__pycache__
+.pytest_cache
+.mypy_cache
+*.egg-info
+release-staging
+release-assets

@@ -21,11 +21,13 @@ jobs:
       - name: Run the local gate
         run: cargo test
       - name: Run the codepoint scan
-        run: cargo run --bin codepoint_scan
+        run: cargo run -p codepoint_scan
       - name: Check the formatting
         run: cargo fmt --check
       - name: Run the linter
         run: cargo clippy --all-targets -- -D warnings
+      - name: Verify crate packaging
+        run: cargo package --locked -p dibs-ai
 
   cross-platform:
     strategy:
@@ -44,11 +46,23 @@ jobs:
       - name: Run the cross-platform gate
         run: cargo test
       - name: Run the codepoint scan
-        run: cargo run --bin codepoint_scan
+        run: cargo run -p codepoint_scan
       - name: Check the formatting
         run: cargo fmt --check
       - name: Run the linter
         run: cargo clippy --all-targets -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.89.0"
+      - name: Verify MSRV 1.89 workspace check
+        run: cargo check --workspace --locked --all-targets
 
   binding:
     runs-on: ubuntu-latest
@@ -62,10 +76,64 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: "1.91.1"
-      - name: Build the binding and run the smoke test
+      - name: Build the binding, run smoke tests, typecheck stubs, and verify wheel and sdist
         run: |
           python -m venv .venv-binding
           . .venv-binding/bin/activate
-          python -m pip install maturin==1.16.0 pytest==9.2.0
+          python -m pip install "maturin==1.16.0" "pytest==9.2.0" "mypy>=1.12.0,<2" "pyright>=1.1.400,<2"
+          maturin develop --manifest-path bindings/Cargo.toml
+          python -m pytest tests/test_binding_smoke.py
+          mypy --strict python/dibs tests/typecheck_dibs.py
+          pyright python/dibs tests/typecheck_dibs.py
+          maturin build --release --locked --out dist --manifest-path bindings/Cargo.toml
+          maturin sdist --out dist --manifest-path bindings/Cargo.toml
+          python - <<'PY'
+          import pathlib, tarfile, tomllib, zipfile
+          ver = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          wheels = list(pathlib.Path("dist").glob(f"dibs_ai-{ver}-*.whl"))
+          assert len(wheels) == 1, f"expected 1 wheel, found {wheels}"
+          with zipfile.ZipFile(wheels[0]) as zf:
+              names = set(zf.namelist())
+              for req in ("dibs/__init__.py", "dibs/py.typed", "dibs/__init__.pyi"):
+                  assert req in names, f"missing {req} in {wheels[0]}: {sorted(names)}"
+              assert any(n.endswith("/LICENSE") or n == "LICENSE" for n in names), f"missing LICENSE in {wheels[0]}"
+          sdists = list(pathlib.Path("dist").glob(f"dibs_ai-{ver}.tar.gz"))
+          assert len(sdists) == 1, f"expected 1 sdist, found {sdists}"
+          prefix = f"dibs_ai-{ver}/"
+          with tarfile.open(sdists[0], "r:gz") as tf:
+              sdist_names = set(tf.getnames())
+          for rel in (
+              "LICENSE",
+              "Cargo.toml",
+              "bindings/Cargo.toml",
+              "pyproject.toml",
+              "python/dibs/__init__.py",
+              "python/dibs/py.typed",
+              "python/dibs/__init__.pyi",
+          ):
+              assert f"{prefix}{rel}" in sdist_names, f"missing {prefix}{rel} in {sdists[0]}"
+          PY
+
+  binding-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.13"]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.91.1"
+      - name: Build the binding and run smoke tests across Python matrix
+        run: |
+          python -m venv .venv-binding
+          . .venv-binding/bin/activate
+          python -m pip install "maturin>=1.8.0,<2.0" "pytest>=8.0.0,<10"
           maturin develop --manifest-path bindings/Cargo.toml
           python -m pytest tests/test_binding_smoke.py

@@ -1,14 +1,36 @@
 [workspace]
-members = [".", "bindings"]
-default-members = ["."]
+members = [".", "crates/codepoint_scan", "bindings"]
+default-members = [".", "crates/codepoint_scan"]
 resolver = "2"
 
 [package]
-name = "dibs"
-version = "0.1.0"
+name = "dibs-ai"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.89"
+default-run = "dibs"
 description = "Agents call dibs on tasks with expiring leases, so parallel agents can share one backlog without a central boss handing out work, measured on one shared registry of ten thousand tasks, with every claim accounted for."
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/david-engelmann/dibs"
+homepage = "https://github.com/david-engelmann/dibs"
+documentation = "https://docs.rs/dibs-ai"
+keywords = ["agents", "leases", "claims", "coordination", "backlog"]
+categories = ["command-line-utilities", "concurrency", "development-tools"]
+exclude = [
+    "AGENTS.md",
+    "CONTRACT.md",
+    "ROADMAP.md",
+    "CHANGELOG.md",
+    "Dockerfile",
+    ".dockerignore",
+    "pyproject.toml",
+    "bindings/**",
+    "crates/**",
+    "python/**",
+    "tests/**",
+    ".github/**",
+]
 
 [lib]
 name = "dibs"
@@ -18,12 +40,19 @@ path = "src/lib.rs"
 name = "dibs"
 path = "src/bin/dibs.rs"
 
-[[bin]]
-name = "codepoint_scan"
-path = "src/bin/codepoint_scan.rs"
-
 [dependencies]
 serde = "1"
 serde_json = "1"
 sha2 = "0.10"
 getrandom = "0.3"
+
+[profile.release]
+strip = "symbols"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/dibs-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

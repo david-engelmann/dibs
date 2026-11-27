@@ -2,9 +2,11 @@
 
 Agents call dibs on tasks with expiring leases, so parallel agents can share one backlog without a central boss handing out work, measured on one shared registry of ten thousand tasks, with every claim accounted for.
 
-Dibs is a claim lease protocol for shared agent backlogs, carried by a Rust library with a command line and a thin Python binding. Work is offered to a backlog that lives in one registry file. An agent claims an item under a lease that expires unless the holder renews it, and the claim prints a token once. The token proves possession for as long as the lease stands, and the registry keeps the standing state and the full claim history in the same document.
+Dibs is a zero-daemon claim lease protocol for shared AI agent backlogs, carried by a Rust library (`dibs-ai`), the `dibs` command line, and a typed `abi3` Python package (`dibs-ai`, imported as `dibs`). Work is offered to a backlog that lives in one registry file on a shared filesystem, with optional directed acyclic task dependencies (`depends_on`), priorities (`0` critical to `3` low), capability `tags`, and takeover caps (`max_takeovers`). An agent claims a task under a lease that expires lazily unless the holder renews it, receiving a one-time cryptographic bearer token while the registry stores only its SHA-256 digest alongside monotonic fencing epochs and verifiable history.
 
 [![CI](https://github.com/david-engelmann/dibs/actions/workflows/ci.yml/badge.svg)](https://github.com/david-engelmann/dibs/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/dibs-ai.svg)](https://crates.io/crates/dibs-ai)
+[![PyPI](https://img.shields.io/pypi/v/dibs-ai.svg)](https://pypi.org/project/dibs-ai/)
 
 ```
 token MISnF1ZYy9dX7wp2qkbYofnvxVDtoLjGFufy-cjMLSI
@@ -14,21 +16,41 @@ expires_at 2026-11-07T15:19:21.298104+00:00
 
 ## Install
 
-Dibs builds from source with Cargo. Clone the repo and install the binary onto your path.
+Install the `dibs` command line from crates.io with Cargo or from prebuilt release archives with `cargo-binstall`.
 
+```sh
+cargo install dibs-ai
 ```
+
+```sh
+cargo binstall dibs-ai
+```
+
+Install the typed Python package (`import dibs`) from PyPI. Prebuilt `abi3` wheels cover Python 3.9 and newer across Linux, macOS, and Windows.
+
+```sh
+pip install dibs-ai
+```
+
+Run the non-root container image directly against a mounted working directory.
+
+```sh
+docker run --rm -v "$PWD:/work" ghcr.io/david-engelmann/dibs --help
+```
+
+To build and install from a local checkout, run Cargo from the repository root. Because the workspace isolates the internal `codepoint_scan` helper under `crates/codepoint_scan` with `publish = false`, installing the root crate places only `dibs` in `~/.cargo/bin`.
+
+```sh
 git clone https://github.com/david-engelmann/dibs.git
 cd dibs
-cargo install --path . --bin dibs
+cargo install --path .
 ```
-
-The install puts the dibs binary in the Cargo bin directory. On a default install that directory is ~/.cargo/bin, and it must stand on your PATH for the dibs command to resolve. The command names the dibs binary on purpose. The repo also builds a codepoint_scan helper, and a machine that already carries that helper from a sibling repo refuses a plain install, so the named form installs dibs alone.
 
 ## Quickstart
 
-Offer one task to a fresh backlog and claim it. The registry file is created by the first command that changes it.
+Offer one task to a fresh backlog and claim it. The registry file is created by the first command that mutates it, and you can pass `--registry` before or after the subcommand or set `DIBS_REGISTRY`.
 
-```
+```sh
 dibs --registry backlog.json offer write-docs --note "draft the user guide"
 ```
 
@@ -36,7 +58,7 @@ dibs --registry backlog.json offer write-docs --note "draft the user guide"
 offered write-docs
 ```
 
-```
+```sh
 dibs --registry backlog.json claim --holder alice --ttl 3600 write-docs
 ```
 
@@ -46,9 +68,9 @@ epoch 1
 expires_at 2026-11-07T15:19:21.298104+00:00
 ```
 
-The token prints once, at the claim that issues it. Nothing else in dibs ever prints it, and the registry stores only its hash. The board shows the standing lease.
+The bearer token prints once, at the claim that issues it. Nothing else in dibs ever prints it, and the registry stores only its lowercase hexadecimal SHA-256 digest. The board shows the standing lease.
 
-```
+```sh
 dibs --registry backlog.json board
 ```
 
@@ -60,9 +82,11 @@ write-docs claimed holder=alice expires_at=2026-11-07T15:19:21.298104+00:00 epoc
 
 The examples below run in a new directory with a fresh registry, so every line of output follows from the commands as written.
 
-Two items are offered and one is claimed, and the board shows the claim standing next to the open item.
+### Atomic claims, renewals, releases, and lazy takeovers
 
-```
+Two items are offered and one is claimed, and the board shows the standing claim beside the open item. Whenever a registry uses only `dibs-registry/1` fields, dibs writes `dibs-registry/1` byte for byte.
+
+```sh
 dibs --registry backlog.json offer write-docs --note "draft the user guide"
 dibs --registry backlog.json offer fix-parser --note "repair the date grammar"
 dibs --registry backlog.json claim --holder alice --ttl 3600 write-docs
@@ -76,20 +100,13 @@ epoch 1
 expires_at 2026-11-07T15:17:32.193891+00:00
 ```
 
-```
-dibs --registry backlog.json board
-```
+The holder renews the lease and then releases it. A renew extends the standing lease from its current expiry by the time to live, never from the instant of the renew. Credentials can be passed with `--token`, piped safely over bounded standard input with `--token -`, or read from `DIBS_TOKEN`.
 
-```
-write-docs claimed holder=alice expires_at=2026-11-07T15:17:32.193891+00:00 epoch=1
-fix-parser open epoch=0
-```
-
-The holder renews the lease and then releases it. A renew extends the standing lease from its current expiry by the time to live, never from the instant of the renew. Presenting the token and the epoch is what proves the lease is the holder's to move, and the epoch shown is the one the claim printed.
-
-```
-dibs --registry backlog.json renew --holder alice --token GLzH-0Q7SzjISfdBeJcjGa0LXhyVF9DG-Av3B-w6gDA --epoch 1 --ttl 1800 write-docs
-dibs --registry backlog.json release --holder alice --token GLzH-0Q7SzjISfdBeJcjGa0LXhyVF9DG-Av3B-w6gDA --epoch 1 write-docs
+```sh
+printf '%s\n' "GLzH-0Q7SzjISfdBeJcjGa0LXhyVF9DG-Av3B-w6gDA" | \
+  dibs --registry backlog.json renew --holder alice --token - --epoch 1 --ttl 1800 write-docs
+DIBS_TOKEN="GLzH-0Q7SzjISfdBeJcjGa0LXhyVF9DG-Av3B-w6gDA" \
+  dibs --registry backlog.json release --holder alice --epoch 1 write-docs
 ```
 
 ```
@@ -97,18 +114,9 @@ expires_at 2026-11-07T15:47:32.193891+00:00
 released write-docs
 ```
 
-```
-dibs --registry backlog.json board
-```
-
-```
-write-docs open epoch=1
-fix-parser open epoch=0
-```
-
 History returns the recorded events in order, one line per event, and an item name narrows the read to that item alone.
 
-```
+```sh
 dibs --registry backlog.json history
 ```
 
@@ -120,9 +128,9 @@ dibs --registry backlog.json history
 5 released item=write-docs holder=alice at=2026-11-07T14:17:32.371482+00:00 epoch=1
 ```
 
-A lease that lapses frees its item on its own. The next claim takes the item over, the epoch rises, and the history records the takeover and names the previous holder. This run claims with a two second lease and waits three seconds before the second claim.
+A lease that lapses frees its item on its own with zero background timers. The next claim takes the item over, increments the monotonic fencing `epoch`, and records `taken_over` naming `previous_holder`. This run claims with a two second lease and waits three seconds before the second claim.
 
-```
+```sh
 dibs --registry backlog.json offer water-plants --note "twice a week"
 dibs --registry backlog.json claim --holder bob --ttl 2 water-plants
 sleep 3
@@ -139,7 +147,7 @@ epoch 2
 expires_at 2026-11-07T15:17:35.682217+00:00
 ```
 
-```
+```sh
 dibs --registry backlog.json history water-plants
 ```
 
@@ -149,9 +157,52 @@ dibs --registry backlog.json history water-plants
 8 taken_over item=water-plants holder=carol at=2026-11-07T14:17:35.682217+00:00 epoch=2 previous_holder=bob
 ```
 
-The registry is read strictly. A document whose format name is wrong refuses every operation as corrupt, reads included, and the file is left exactly as it stands. Here the registry is written to a copy with the copy's format name changed to dibs-registry/99, and the board read against the copy prints one line on stderr and exits 1.
+### Swarm DAGs, priorities, capability tags, dead-letter reset, and compaction
 
+Under `dibs-registry/2`, `offer-batch` ingests JSON Lines batches all or nothing under one exclusive lock, allowing forward and backward intra-batch `depends_on` edges while rejecting cycles through iterative depth-first search. Downstream tasks remain `blocked` until every prerequisite completes, `ready` and `claim-next` route work in deterministic `(priority, offer_order)` order filtered by repeatable `--tag` flags, and `-j` or `--json` emits deterministic single-line JSON on every data subcommand.
+
+```sh
+cat <<'EOF' | dibs --registry swarm.json offer-batch --json
+{"id": "deploy-api", "priority": 0, "tags": ["linux", "prod"], "depends_on": ["run-tests"], "max_takeovers": 2}
+{"id": "run-tests", "priority": 1, "tags": ["linux", "gpu"], "depends_on": ["build-core"]}
+{"id": "build-core", "priority": 0, "tags": ["linux", "gpu"]}
+EOF
 ```
+
+```json
+{"count": 3, "offered": ["deploy-api", "run-tests", "build-core"]}
+```
+
+Parallel workers call `claim-next` to claim the highest-priority unblocked task matching their capability tags under one atomic lock cycle without thundering-herd retries, inspect items with `show`, and compact historical prefixes crash-idempotently to canonical JSON Lines archives with `compact`.
+
+```sh
+dibs --registry swarm.json claim-next --holder worker-1 --ttl 900 --tag linux --tag gpu --json
+dibs --registry swarm.json ready --tag linux
+dibs --registry swarm.json show deploy-api --json
+dibs --registry swarm.json compact --through-seq 3 --archive swarm-archive.jsonl --json
+dibs completions zsh > _dibs
+```
+
+When a task configured with `--max-takeovers` expires after reaching its takeover cap, its effective status becomes `exhausted` so workers skip it until an operator clears `takeover_count` back to `0` with `reset`.
+
+```sh
+dibs --registry swarm.json offer flaky-step --max-takeovers 1
+dibs --registry swarm.json claim --holder bob --ttl 1 flaky-step
+sleep 2
+dibs --registry swarm.json claim --holder carol --ttl 1 flaky-step
+sleep 2
+dibs --registry swarm.json reset flaky-step --json
+```
+
+```json
+{"item": "flaky-step", "status": "open", "epoch": 2, "takeover_count": 0}
+```
+
+### Strict corruption refusal
+
+The registry is read strictly. Duplicate JSON keys, unknown or missing fields, history-and-state disagreements, or an unsupported format string refuse every operation as corrupt at exit `1` and leave the file untouched on disk.
+
+```sh
 sed 's/dibs-registry\/1/dibs-registry\/99/' backlog.json > corrupt.json
 dibs --registry corrupt.json board
 ```
@@ -160,43 +211,44 @@ dibs --registry corrupt.json board
 error: the registry is corrupt, the format name is 'dibs-registry/99', not 'dibs-registry/1' or 'dibs-registry/2'
 ```
 
-The Python binding drives the same lifecycle from Python. Build it inside a virtual environment with maturin, and every lease evaluating operation accepts an optional current instant as ISO 8601 text and defaults to the UTC wall clock when omitted. History takes no instant.
+### Typed Python API
 
-```
-python3 -m venv .venv
-.venv/bin/pip install maturin
-.venv/bin/maturin develop --manifest-path bindings/Cargo.toml
-```
+The `dibs-ai` Python package ships PEP 561 `py.typed` markers and complete `python/dibs/__init__.pyi` stubs checked under `mypy --strict` and `pyright`. Every lease-evaluating call accepts an optional ISO 8601 `now` string for deterministic testing and defaults to the UTC wall clock when omitted or `None`.
 
 ```python
 import dibs
 
-registry = "binding-backlog.json"
-dibs.offer(registry, "write-docs", "2031-05-04T12:00:00+00:00", note="draft the user guide")
-granted = dibs.claim(registry, "write-docs", "alice", 3600, "2031-05-04T12:00:00+00:00")
-print(granted["epoch"])
-print(granted["expires_at"])
-for row in dibs.board(registry, "2031-05-04T12:00:00+00:00"):
-    print(row["id"], row["status"], row["holder"], row["epoch"])
+registry = "swarm-python.json"
+dibs.offer_many(
+    registry,
+    [
+        {"id": "compile", "priority": 0, "tags": ["linux"]},
+        {"id": "verify", "priority": 1, "tags": ["linux"], "depends_on": ["compile"]},
+    ],
+)
+
+lease = dibs.claim_next(registry, "agent-1", 1800, tags=["linux"])
+dibs.complete(registry, lease["item"], lease["holder"], lease["token"], lease["epoch"])
+
+for task in dibs.ready(registry, tags=["linux"]):
+    print(task["id"], task["effective_status"], task["priority"])
 ```
 
 ```
-1
-2031-05-04T13:00:00+00:00
-write-docs claimed alice 1
+verify open 1
 ```
 
-A refusal raises a subclass of DibsError carrying the same message text the command line prints, and the smoke test in tests/test_binding_smoke.py drives the full lifecycle through the binding, including a refusal it must raise.
+A refusal raises a typed subclass of `dibs.DibsError` (`InvalidNameError`, `InvalidTtlError`, `InvalidRequestError`, `NotFoundError`, `RefusalError`, `CorruptError`, or `FailureError`) carrying the exact message text the command line prints.
 
 ## Status
 
-What works. Every operation in the contract runs against the registry file. Claims are atomic, so two processes racing one item produce exactly one winner, a lost race changes nothing on disk, and parallel workers calling claim-next claim distinct ready tasks under the exclusive lock without retries. Batch ingestion through offer-batch validates and publishes an entire task batch all or nothing, and show and ready inspect standing task state without creating a lock file. Task dependency graphs declared with depends_on refuse cycles through iterative depth-first traversal, hold dependents blocked until every prerequisite completes, and unblock downstream work as soon as the final prerequisite finishes. Task priorities from 0 critical to 3 low and capability tags route ready and claim-next in deterministic priority and offer order, bounded max_takeovers moves repeatedly abandoned tasks into exhausted status until an operator runs reset, and compact crash-idempotently archives prefix events to canonical JSON Lines with digest verification and compaction baseline cross-validation under dibs-registry/2 while preserving dibs-registry/1 byte for byte whenever dibs-registry/2 features stand unused. Every data subcommand supports deterministic single line JSON output with zero token hash leakage, lease credentials can be supplied safely through bounded standard input or DIBS_TOKEN, and the registry path can come from --registry or DIBS_REGISTRY. A lease is judged lazily at the instant the caller names, so no daemon, timer, or background process ever runs. A token prints once at the claim and only its SHA-256 hash is stored, so the registry itself never carries a usable credential. Every claim and every takeover raises the item's epoch. A completed item is terminal for all time, and its id can never be offered again. The registry is read strictly, so a damaged document refuses every operation as corrupt and its bytes stay exactly as they stand. Updates publish by rename, so an interrupted run leaves the previous complete document or the new one, never a blend.
+What works. Every operation in the contract runs against the registry file across Rust, the command line, and Python. Claims are atomic under standard library `File` exclusive `lock`, so concurrent processes racing one item produce one winner, read-only queries (`board`, `ready`, `show`, and `history`) coordinate through `File` `lock_shared` without creating lock files on disk, and parallel workers calling `claim-next` claim distinct ready tasks in one lock cycle without retries. Batch ingestion through `offer-batch` and `offer_many` validates and publishes task batches all or nothing. Directed acyclic dependency graphs (`depends_on`) refuse cycles via iterative three-colour traversal, hold dependents `blocked` until prerequisites complete, and unblock downstream tasks immediately upon prerequisite completion. Priorities from `0` critical to `3` low and capability `tags` order `ready` and `claim-next` deterministically, `max_takeovers` transitions repeatedly abandoned tasks into `exhausted` until an operator runs `reset`, and `compact` crash-idempotently archives prefix events to canonical JSON Lines with SHA-256 digest and baseline cross-validation under `dibs-registry/2` while preserving `dibs-registry/1` byte for byte whenever `dibs-registry/2` features stand unused. Every data subcommand supports deterministic single-line `--json` output with zero token hash leakage, credentials can arrive through bounded standard input or `DIBS_TOKEN`, and PEP 561 stubs cover the entire Python surface at 100 percent type completeness.
 
-What does not. The command line reads the wall clock on every call and takes no clock override, so a caller that needs a fixed or virtual time drives the library or passes an explicit instant string to the Python binding, never the command line. The binding is thin and covers the same thirteen backlog operations, defaulting to the UTC wall clock when no instant is given, and a refusal there raises instead of printing.
+What does not. The command line reads the UTC wall clock on every call and takes no clock override flag, so callers needing fixed or virtual instants drive the Rust `Registry` API or pass an explicit instant string to Python `dibs` functions.
 
-What is not built. Expiry is access-only, with no notifications and no watchers. One registry lives in one file on one machine, serving callers that share its filesystem, and there is no network service and no federation between registries. A lost token has no recovery path before its lease expires.
+What is not built. Expiry is evaluated strictly on access, with no daemons, timers, notifications, or watchers. One registry lives in one file on one shared filesystem, with no network service and no cross-file federation. A lost live token has no recovery path before its lease expires.
 
-The registry formats, dibs-registry/1 and dibs-registry/2, are protocol surfaces that other programs pin, so their document shapes and error texts are load-bearing beyond this repo. The Rust test suite carries 200 root tests across every operation, running 199 on Unix and 188 on Windows, and the Python binding smoke test carries 11, and both suites pass on the current head with the binding built the way CI builds it.
+The registry formats, `dibs-registry/1` and `dibs-registry/2`, are protocol surfaces that other programs pin, so their document shapes and error texts are load-bearing beyond this repo. The Rust workspace suite carries 204 tests across 189 root `dibs-ai` tests and 15 `codepoint_scan` tests, running 203 on Unix (188 root and 15 scanner) and 192 on Windows (180 root and 12 scanner), and the Python binding smoke test carries 12, and all suites alongside `mypy --strict` and `pyright` pass on the current head.
 
 Closed perfection rounds are 100 of 100. The program began as a seed commit whose state is independently verifiable against c1533bbc5fcfb803c1511d677d36c3c3925f075d.
 

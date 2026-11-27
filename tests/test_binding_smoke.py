@@ -709,3 +709,168 @@ def test_v2_max_takeovers_reset_and_idempotent_compact(tmp_path):
             assert os.fsencode(c_raw["archive_path"]) == raw_arch_bytes
 
 
+
+def test_v1_0_0_version_exports_and_pep561_stub_parity(tmp_path):
+    import ast
+    import inspect
+    import os
+    import pathlib
+    import re
+    import typing
+
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+
+    def extract_toml_version_fallback(text: str, section: str) -> str:
+        in_sec = False
+        header = f"[{section}]"
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                in_sec = stripped == header
+                continue
+            if in_sec:
+                m = re.match(r'^version\s*=\s*"([^"]+)"$', stripped)
+                if m is not None:
+                    return m.group(1)
+        raise AssertionError(f"missing [{section}] version")
+
+    def extract_toml_version(path: pathlib.Path, section: str) -> str:
+        text = path.read_text(encoding="utf-8")
+        fallback_ver = extract_toml_version_fallback(text, section)
+        if tomllib is not None:
+            parsed_ver = tomllib.loads(text)[section]["version"]
+            assert parsed_ver == fallback_ver
+            return parsed_ver
+        return fallback_ver
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    cargo_ver = extract_toml_version(repo_root / "Cargo.toml", "package")
+    bind_ver = extract_toml_version(repo_root / "bindings" / "Cargo.toml", "package")
+    pyproj_ver = extract_toml_version(repo_root / "pyproject.toml", "project")
+    assert dibs.__version__ == "1.0.0"
+    assert cargo_ver == bind_ver == pyproj_ver == dibs.__version__
+
+    # Verify StrPath resolves cleanly under typing.get_type_hints without os in globalns.
+    ns = {"StrPath": dibs.StrPath}
+    exec("def _strpath_consumer(p: StrPath) -> None:\n    pass\n", ns)
+    hints = typing.get_type_hints(
+        ns["_strpath_consumer"],
+        globalns={"StrPath": dibs.StrPath},
+    )
+    assert hints["p"] == typing.Union[str, os.PathLike[str]]
+
+    py_typed = repo_root / "python" / "dibs" / "py.typed"
+    assert py_typed.is_file()
+    assert py_typed.read_bytes() == b""
+
+    pyi_path = repo_root / "python" / "dibs" / "__init__.pyi"
+    tree = ast.parse(pyi_path.read_text(encoding="utf-8"))
+    stub_fns = {}
+    stub_classes = {}
+    stub_all = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            stub_fns[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            stub_classes[node.name] = node
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__all__":
+                    stub_all = ast.literal_eval(node.value)
+
+    assert stub_all == dibs.__all__
+
+    expected_fns = {
+        "offer",
+        "offer_many",
+        "claim",
+        "claim_next",
+        "renew",
+        "release",
+        "complete",
+        "reset",
+        "board",
+        "ready",
+        "show",
+        "history",
+        "compact",
+    }
+    assert set(stub_fns.keys()) == expected_fns
+
+    for fn_name, fn_node in stub_fns.items():
+        runtime_sig = inspect.signature(getattr(dibs, fn_name))
+        pos_names = [a.arg for a in fn_node.args.args]
+        kwonly_names = [a.arg for a in fn_node.args.kwonlyargs]
+        runtime_pos = [
+            p.name
+            for p in runtime_sig.parameters.values()
+            if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ]
+        runtime_kwonly = [
+            p.name
+            for p in runtime_sig.parameters.values()
+            if p.kind == inspect.Parameter.KEYWORD_ONLY
+        ]
+        assert pos_names == runtime_pos, f"positional mismatch on {fn_name}"
+        assert kwonly_names == runtime_kwonly, f"kwonly mismatch on {fn_name}"
+        pos_defaults = [ast.literal_eval(d) for d in fn_node.args.defaults]
+        runtime_pos_defaults = [
+            p.default
+            for p in runtime_sig.parameters.values()
+            if p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and p.default is not inspect.Parameter.empty
+        ]
+        assert pos_defaults == runtime_pos_defaults, f"defaults mismatch on {fn_name}"
+        kw_defaults = [
+            ast.literal_eval(d) for d in fn_node.args.kw_defaults if d is not None
+        ]
+        runtime_kw_defaults = [
+            p.default
+            for p in runtime_sig.parameters.values()
+            if p.kind == inspect.Parameter.KEYWORD_ONLY
+            and p.default is not inspect.Parameter.empty
+        ]
+        assert kw_defaults == runtime_kw_defaults, f"kw defaults mismatch on {fn_name}"
+
+    def typed_dict_keys(cls_name):
+        cls_node = stub_classes[cls_name]
+        keys = []
+        for base in cls_node.bases:
+            if isinstance(base, ast.Name) and base.id in stub_classes:
+                keys.extend(typed_dict_keys(base.id))
+        for stmt in cls_node.body:
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                keys.append(stmt.target.id)
+        return keys
+
+    reg = tmp_path / "stub-parity.json"
+    arch = tmp_path / "stub-archive.jsonl"
+    dibs.offer(reg, "item-a", T0, priority=1)
+    granted = dibs.claim(reg, "item-a", "alice", 60, T0)
+    renewed = dibs.renew(reg, "item-a", "alice", granted["token"], 1, 30, T0)
+    board_row = dibs.board(reg, T0)[0]
+    detail_row = dibs.show(reg, "item-a", T0)
+    dibs.release(reg, "item-a", "alice", granted["token"], 1, T0)
+    ready_row = dibs.ready(reg, T0)[0]
+    event_row = dibs.history(reg)[0]
+    compact_row = dibs.compact(reg, 2, arch, T1)
+
+    assert set(typed_dict_keys("OfferSpecDict")) == {
+        "id",
+        "note",
+        "priority",
+        "tags",
+        "depends_on",
+        "max_takeovers",
+    }
+    assert typed_dict_keys("ClaimGrantedDict") == list(granted.keys())
+    assert typed_dict_keys("RenewedDict") == list(renewed.keys())
+    assert typed_dict_keys("BoardRowDict") == list(board_row.keys())
+    assert typed_dict_keys("ItemDetailDict") == list(detail_row.keys()) == list(ready_row.keys())
+    assert typed_dict_keys("EventDict") == list(event_row.keys())
+    assert typed_dict_keys("CompactSummaryDict") == list(compact_row.keys())
+
+    import typecheck_dibs  # noqa: F401
