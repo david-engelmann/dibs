@@ -1863,6 +1863,13 @@ fn staged_lock_document(fillers: usize) -> String {
     common::offered_document(&ids)
 }
 
+// DB-S1 gates this POSIX open-file unlink race pin to `#[cfg(unix)]`
+// because Unix permits unlinking a file while a descriptor holds it,
+// exercising the `(dev, ino)` lock-identity verification. On Windows,
+// `DB-16` omits `FILE_SHARE_DELETE` so the operating system refuses
+// deletion at the handle layer, pinned by the `#[cfg(windows)]`
+// counterpart `lock_file_cannot_be_deleted_while_claim_holds_it` below.
+#[cfg(unix)]
 #[test]
 fn lock_file_deleted_mid_claim_aborts_the_claim() {
     let dir = temp_dir("lock-identity");
@@ -1937,6 +1944,75 @@ fn lock_file_deleted_mid_claim_aborts_the_claim() {
         .claim("task-target", "agent-parent", 600, &at(30))
         .unwrap();
     assert_eq!(claimed.epoch, 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn lock_file_cannot_be_deleted_while_claim_holds_it() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = temp_dir("lock-no-share-delete");
+    let registry_path = dir.join("registry.json");
+    std::fs::write(&registry_path, staged_lock_document(100)).unwrap();
+    let lock_path = dir.join("registry.json.lock");
+    // Open a preliminary exclusive lock allowing delete sharing on
+    // this test handle alone so the worker blocks deterministically
+    // after opening lock_path without FILE_SHARE_DELETE.
+    let blocker = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+        .open(&lock_path)
+        .unwrap();
+    blocker.lock().unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let worker_barrier = std::sync::Arc::clone(&barrier);
+    let worker_registry_path = registry_path.clone();
+    let worker = std::thread::spawn(move || {
+        let worker_reg = Registry::new(worker_registry_path);
+        worker_barrier.wait();
+        worker_reg.claim("task-target", "agent-victim", 60, &at(10))
+    });
+
+    // Synchronize immediately before Registry::claim and allow the in-process
+    // thread to open lock_path without any competing DELETE-access handle
+    // before verifying Win32 ERROR_SHARING_VIOLATION (32).
+    barrier.wait();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        match std::fs::OpenOptions::new()
+            .access_mode(0x0001_0000)
+            .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+            .open(&lock_path)
+        {
+            Ok(probe) => drop(probe),
+            Err(err) if err.raw_os_error() == Some(32) => break,
+            Err(err) => panic!("unexpected error probing lock_path delete access: {err:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker never opened lock_path without FILE_SHARE_DELETE"
+        );
+    }
+
+    let del_err = std::fs::remove_file(&lock_path).unwrap_err();
+    assert_eq!(del_err.raw_os_error(), Some(32));
+    assert!(lock_path.exists());
+
+    blocker.unlock().unwrap();
+    drop(blocker);
+    let granted = worker.join().unwrap().unwrap();
+    assert_eq!(granted.holder, "agent-victim");
+    let registry = Registry::new(registry_path);
+    let rows = registry.board(&at(20)).unwrap();
+    let target = rows.iter().find(|row| row.id == "task-target").unwrap();
+    assert_eq!(target.status, "claimed");
+    assert_eq!(target.holder.as_deref(), Some("agent-victim"));
+    assert_eq!(target.epoch, 1);
 }
 
 struct CliOutput {
@@ -2523,46 +2599,85 @@ fn cli_non_unicode_arguments_are_parser_errors_not_panics() {
     assert!(stderr.contains("not valid Unicode text"), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
     // The registry path is the one argument carried
-    // unconverted, so a path holding the same bytes works.
+    // unconverted, so a path holding the same bytes passes
+    // parser conversion in both the spaced and equals forms.
+    // DB-S1 guards `create_dir_all` on filesystems such as
+    // macOS APFS that reject non UTF-8 directory names on
+    // disk, asserting that both forms still carry the raw
+    // OsString past argument parsing without panicking.
     let odd_dir = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
-    std::fs::create_dir_all(&odd_dir).unwrap();
     let odd_path = odd_dir.join("registry.json");
-    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
-        .arg("--registry")
-        .arg(&odd_path)
-        .arg("offer")
-        .arg("task-one")
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr was: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "offered task-one\n"
-    );
-    // The equals form carries the path unconverted too.
     let mut equals = std::ffi::OsString::from("--registry=");
     equals.push(odd_path.as_os_str());
-    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
-        .arg(&equals)
-        .arg("offer")
-        .arg("task-two")
-        .output()
-        .unwrap();
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr was: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "offered task-two\n"
-    );
+    if std::fs::create_dir_all(&odd_dir).is_ok() {
+        let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+            .arg("--registry")
+            .arg(&odd_path)
+            .arg("offer")
+            .arg("task-one")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr was: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "offered task-one\n"
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+            .arg(&equals)
+            .arg("offer")
+            .arg("task-two")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr was: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "offered task-two\n"
+        );
+    } else {
+        for form in [
+            vec![
+                std::ffi::OsString::from("--registry"),
+                odd_path.clone().into(),
+            ],
+            vec![equals],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+                .args(&form)
+                .arg("board")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert_eq!(output.status.code(), Some(0), "{stderr}");
+            assert_eq!(output.stdout, b"");
+            assert!(!stderr.contains("not valid Unicode text"), "{stderr}");
+            assert!(!stderr.contains("panicked"), "{stderr}");
+        }
+        let offer_out = Command::new(env!("CARGO_BIN_EXE_dibs"))
+            .arg("--registry")
+            .arg(&odd_path)
+            .arg("offer")
+            .arg("task-one")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&offer_out.stderr).into_owned();
+        assert_eq!(offer_out.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("the registry directory cannot be created"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("not valid Unicode text"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
 }
 
 #[test]
@@ -2742,6 +2857,10 @@ fn cli_board_with_an_unwritable_stdout_exits_1_without_a_panic() {
     // the hosted gate, which is Linux, the device stands. On
     // the pre-fix binary the same drive dies with a panic
     // message at exit 101.
+    // DB-S1 adds an unconditional closed-reader `std::io::pipe()`
+    // arm so macOS (which lacks `/dev/full`) deterministically
+    // exercises the `EPIPE` stdout write failure too, while keeping
+    // the `/dev/full` check wherever `/dev/full` stands.
     use std::process::Stdio;
 
     let dir = temp_dir("cli-board-full");
@@ -2749,21 +2868,37 @@ fn cli_board_with_an_unwritable_stdout_exits_1_without_a_panic() {
     registry
         .offer("task-one", "a synthetic task", &t0())
         .unwrap();
-    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
-        Ok(file) => file,
-        Err(_) => return,
-    };
-    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let pipe_out = Command::new(env!("CARGO_BIN_EXE_dibs"))
         .arg("--registry")
         .arg(dir.join("registry.json"))
         .arg("board")
-        .stdout(Stdio::from(full))
+        .stdout(Stdio::from(writer))
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(!stderr.contains("panicked"), "{stderr}");
-    assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+    assert_eq!(pipe_out.status.code(), Some(1));
+    let pipe_stderr = String::from_utf8_lossy(&pipe_out.stderr).into_owned();
+    assert!(!pipe_stderr.contains("panicked"), "{pipe_stderr}");
+    assert!(
+        !pipe_stderr.contains("failed printing to stdout"),
+        "{pipe_stderr}"
+    );
+
+    if let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+            .arg("--registry")
+            .arg(dir.join("registry.json"))
+            .arg("board")
+            .stdout(Stdio::from(full))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+    }
 }
 
 #[cfg(unix)]
@@ -2776,38 +2911,72 @@ fn cli_claim_with_an_unwritable_stdout_exits_1_and_the_lease_stands() {
     // where the pre-fix binary panicked at exit 101 over the
     // standing lease. Where /dev/full does not stand the pin
     // does not run, as its sibling above records.
+    // DB-S1 adds an unconditional closed-reader `std::io::pipe()`
+    // arm so macOS exercises the post-publish `EPIPE` stdout write
+    // failure and verifies the standing lease, alongside `/dev/full`
+    // wherever that device stands.
     use std::process::Stdio;
 
     let dir = temp_dir("cli-claim-full");
     let path = dir.join("registry.json");
     let path_text = path.to_str().unwrap();
-    run_cli(&["--registry", path_text, "offer", "task-one"], 0);
-    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
-        Ok(file) => file,
-        Err(_) => return,
-    };
-    let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+    run_cli(&["--registry", path_text, "offer", "task-pipe"], 0);
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let pipe_out = Command::new(env!("CARGO_BIN_EXE_dibs"))
         .arg("--registry")
         .arg(&path)
         .arg("claim")
-        .arg("task-one")
+        .arg("task-pipe")
         .arg("--holder")
         .arg("agent-a")
         .arg("--ttl")
         .arg("3600")
-        .stdout(Stdio::from(full))
+        .stdout(Stdio::from(writer))
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(!stderr.contains("panicked"), "{stderr}");
-    let board = run_cli(&["--registry", path_text, "board"], 0);
+    assert_eq!(pipe_out.status.code(), Some(1));
+    let pipe_stderr = String::from_utf8_lossy(&pipe_out.stderr).into_owned();
+    assert!(!pipe_stderr.contains("panicked"), "{pipe_stderr}");
+    let pipe_board = run_cli(&["--registry", path_text, "board"], 0);
     assert!(
-        board.stdout.contains("task-one claimed holder=agent-a"),
+        pipe_board
+            .stdout
+            .contains("task-pipe claimed holder=agent-a"),
         "{}",
-        board.stdout
+        pipe_board.stdout
     );
-    assert!(board.stdout.contains("epoch=1"), "{}", board.stdout);
+    assert!(
+        pipe_board.stdout.contains("epoch=1"),
+        "{}",
+        pipe_board.stdout
+    );
+
+    if let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        run_cli(&["--registry", path_text, "offer", "task-one"], 0);
+        let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+            .arg("--registry")
+            .arg(&path)
+            .arg("claim")
+            .arg("task-one")
+            .arg("--holder")
+            .arg("agent-a")
+            .arg("--ttl")
+            .arg("3600")
+            .stdout(Stdio::from(full))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        let board = run_cli(&["--registry", path_text, "board"], 0);
+        assert!(
+            board.stdout.contains("task-one claimed holder=agent-a"),
+            "{}",
+            board.stdout
+        );
+        assert!(board.stdout.contains("epoch=1"), "{}", board.stdout);
+    }
 }
 
 #[cfg(unix)]
@@ -3291,5 +3460,379 @@ fn cli_help_bodies_print_their_whole_texts() {
             "options:\n",
             "  -h, --help  show this help message and exit\n",
         )
+    );
+}
+
+#[test]
+fn invalid_registry_paths_refuse_at_exit_2_without_touching_disk() {
+    let dir = temp_dir("invalid-registry-paths");
+    #[cfg(not(windows))]
+    let static_bad = ["", ".", "..", "./.", "/", "sub/", "sub/.", "sub/.."];
+    #[cfg(windows)]
+    let static_bad = [
+        "",
+        ".",
+        "..",
+        "./.",
+        "/",
+        "\\",
+        "C:",
+        "C:\\",
+        "sub/",
+        "sub/.",
+        "sub/..",
+        "sub\\",
+        "sub\\.",
+        "sub\\..",
+        "registry.json.",
+        "registry.json ",
+        "sub\\registry.json.",
+        "sub\\registry.json ",
+    ];
+    let anchored_bad = format!("{}/", dir.join("nested").display());
+    let mut all_bad: Vec<String> = static_bad.iter().map(|s| (*s).to_string()).collect();
+    all_bad.push(anchored_bad);
+
+    for raw in &all_bad {
+        let expected = format!(
+            "invalid registry path {}, the path must name a file",
+            dibs::py_repr(raw)
+        );
+        let registry = Registry::new(PathBuf::from(raw));
+        for error in [
+            expect_error(registry.board(&t0())),
+            expect_error(registry.history(None)),
+            expect_error(registry.offer("task-one", "", &t0())),
+            expect_error(registry.claim("task-one", "agent-a", 60, &t0())),
+            expect_error(registry.renew("task-one", "agent-a", "tok", 1, 60, &t0())),
+            expect_error(registry.release("task-one", "agent-a", "tok", 1, &t0())),
+            expect_error(registry.complete("task-one", "agent-a", "tok", 1, &t0())),
+        ] {
+            assert!(
+                matches!(error, Error::InvalidRequest(_)),
+                "path {raw:?} returned {error:?}"
+            );
+            assert_eq!(error.exit_code(), 2);
+            assert!(error.message().starts_with("invalid registry path "));
+            assert!(error.message().ends_with(", the path must name a file"));
+            assert_eq!(error.message(), expected);
+        }
+
+        for subcmd in [
+            vec!["--registry", raw.as_str(), "board"],
+            vec!["--registry", raw.as_str(), "history"],
+            vec!["--registry", raw.as_str(), "offer", "task-one"],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_dibs"))
+                .current_dir(&dir)
+                .args(&subcmd)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "args {subcmd:?} stderr: {stderr}"
+            );
+            assert_eq!(stderr, format!("error: {expected}\n"));
+        }
+    }
+    // Zero directories, files, or .lock artifacts were created in `dir`
+    // by either the CLI runs or the `dir`-anchored library mutations.
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+    // An existing named directory without a trailing separator still
+    // fails at read/open as Error::Failure at exit 1.
+    let named_dir = dir.join("existing-dir");
+    std::fs::create_dir_all(&named_dir).unwrap();
+    let named_registry = Registry::new(named_dir);
+    let error = expect_error(named_registry.board(&t0()));
+    assert!(matches!(error, Error::Failure(_)), "{error:?}");
+    assert_eq!(error.exit_code(), 1);
+    assert!(error.message().contains("the registry file cannot be read"));
+
+    // Positive dot-adjacent filename edges must succeed rather than
+    // being misclassified as `.` or `..` directory syntax.
+    #[cfg(unix)]
+    let valid_dot_edges = [".registry", "..registry", "registry.", "registry.."];
+    #[cfg(not(unix))]
+    let valid_dot_edges = [".registry", "..registry"];
+    for (idx, valid_name) in valid_dot_edges.iter().enumerate() {
+        let edge_path = dir.join(format!("edge-{idx}")).join(valid_name);
+        let edge_registry = Registry::new(edge_path.clone());
+        edge_registry
+            .offer("task-one", "dot-adjacent filename", &t0())
+            .unwrap();
+        let rows = edge_registry.board(&t0()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "task-one");
+        assert!(
+            edge_path.is_file(),
+            "expected file at {}",
+            edge_path.display()
+        );
+    }
+}
+
+#[test]
+fn board_and_history_never_create_a_lock_file_on_disk() {
+    let dir = temp_dir("read-never-creates-lock");
+    let path = dir.join("registry.json");
+    let lock_path = dir.join("registry.json.lock");
+    let registry = Registry::new(path.clone());
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    assert!(lock_path.is_file());
+    std::fs::remove_file(&lock_path).unwrap();
+    assert!(!lock_path.exists());
+
+    let rows = registry.board(&t0()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "task-one");
+    assert!(!lock_path.exists());
+
+    let events = registry.history(None).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "offered");
+    assert!(!lock_path.exists());
+
+    let path_str = path.to_str().unwrap();
+    let cli_board = run_cli(&["--registry", path_str, "board"], 0);
+    assert_eq!(cli_board.stdout, "task-one open epoch=0\n");
+    assert!(!lock_path.exists());
+    let cli_history = run_cli(&["--registry", path_str, "history"], 0);
+    assert!(cli_history.stdout.contains("1 offered item=task-one"));
+    assert!(!lock_path.exists());
+
+    // When a lock file does stand, holding a shared read lock blocks
+    // an exclusive try_lock while still permitting concurrent reads.
+    registry
+        .offer("task-two", "a second synthetic task", &at(1))
+        .unwrap();
+    assert!(lock_path.is_file());
+    let mut reader_opts = std::fs::OpenOptions::new();
+    reader_opts.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        reader_opts.share_mode(0x0000_0001 | 0x0000_0002);
+    }
+    let held_shared = reader_opts.open(&lock_path).unwrap();
+    held_shared.lock_shared().unwrap();
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let del_probe = std::fs::OpenOptions::new()
+            .access_mode(0x0001_0000)
+            .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+            .open(&lock_path)
+            .unwrap_err();
+        assert_eq!(del_probe.raw_os_error(), Some(32));
+        let del_err = std::fs::remove_file(&lock_path).unwrap_err();
+        assert_eq!(del_err.raw_os_error(), Some(32));
+    }
+
+    let mut writer_opts = std::fs::OpenOptions::new();
+    writer_opts.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        writer_opts.share_mode(0x0000_0001 | 0x0000_0002);
+    }
+    let writer_probe = writer_opts.open(&lock_path).unwrap();
+    assert!(
+        writer_probe.try_lock().is_err(),
+        "shared read lock must block exclusive try_lock"
+    );
+    assert_eq!(registry.board(&at(2)).unwrap().len(), 2);
+    assert_eq!(registry.history(None).unwrap().len(), 2);
+    held_shared.unlock().unwrap();
+    drop(held_shared);
+    writer_probe.try_lock().unwrap();
+    writer_probe.unlock().unwrap();
+    drop(writer_probe);
+
+    // Discriminating concurrency pin: while an exclusive lock is held on
+    // `registry.json.lock` over transient invalid bytes, both `board` and
+    // `history` must block on `lock_shared()` rather than proceeding
+    // lock-free (`Ok(None)`), reading only the valid bytes published
+    // before the exclusive lock releases.
+    let valid_bytes = std::fs::read(&path).unwrap();
+    let mut blocker_opts = std::fs::OpenOptions::new();
+    blocker_opts.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        blocker_opts.share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
+    }
+    let blocker = blocker_opts.open(&lock_path).unwrap();
+    blocker.lock().unwrap();
+    std::fs::write(&path, b"transient pre-publish").unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let b_board = std::sync::Arc::clone(&barrier);
+    let p_board = path.clone();
+    let board_handle = std::thread::spawn(move || {
+        b_board.wait();
+        Registry::new(p_board).board(&at(2))
+    });
+    let b_hist = std::sync::Arc::clone(&barrier);
+    let p_hist = path.clone();
+    let history_handle = std::thread::spawn(move || {
+        b_hist.wait();
+        Registry::new(p_hist).history(None)
+    });
+
+    barrier.wait();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let del_probe = std::fs::OpenOptions::new()
+            .access_mode(0x0001_0000)
+            .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+            .open(&lock_path)
+            .unwrap_err();
+        assert_eq!(del_probe.raw_os_error(), Some(32));
+        let del_err = std::fs::remove_file(&lock_path).unwrap_err();
+        assert_eq!(del_err.raw_os_error(), Some(32));
+    }
+    std::fs::write(&path, &valid_bytes).unwrap();
+    blocker.unlock().unwrap();
+    drop(blocker);
+
+    let board_rows = board_handle.join().unwrap().unwrap();
+    let history_events = history_handle.join().unwrap().unwrap();
+    assert_eq!(board_rows.len(), 2);
+    assert_eq!(history_events.len(), 2);
+}
+
+#[test]
+fn retry_transient_rename_retries_permission_denied_and_sharing_violation_up_to_five_times() {
+    // 5 transient PermissionDenied errors followed by Ok succeeds on call 6.
+    let mut calls = 0usize;
+    dibs::retry_transient_rename(|| {
+        calls += 1;
+        if calls <= 5 {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "transient access denied",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(calls, 6);
+
+    // 5 transient Win32 ERROR_SHARING_VIOLATION (os error 32) errors
+    // followed by Ok succeeds on call 6.
+    let mut calls = 0usize;
+    dibs::retry_transient_rename(|| {
+        calls += 1;
+        if calls <= 5 {
+            Err(std::io::Error::from_raw_os_error(32))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(calls, 6);
+
+    // A 6th consecutive sharing violation exhausts the 5-retry bound and fails.
+    let mut calls = 0usize;
+    let err = dibs::retry_transient_rename(|| {
+        calls += 1;
+        Err(std::io::Error::from_raw_os_error(32))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 6);
+    assert_eq!(err.raw_os_error(), Some(32));
+
+    // A non-transient error (NotFound) fails immediately on attempt 1.
+    let mut calls = 0usize;
+    let err = dibs::retry_transient_rename(|| {
+        calls += 1;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing temp file",
+        ))
+    })
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[cfg(unix)]
+#[test]
+fn board_and_history_succeed_inside_a_read_only_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("readonly-dir-reads");
+    let ro_dir = dir.join("ro");
+    std::fs::create_dir_all(&ro_dir).unwrap();
+    let path = ro_dir.join("registry.json");
+    let lock_path = ro_dir.join("registry.json.lock");
+    let registry = Registry::new(path);
+    registry
+        .offer("task-one", "a synthetic task", &t0())
+        .unwrap();
+    std::fs::remove_file(&lock_path).unwrap();
+
+    // Case 1: mode 0555 directory with no .lock file standing on disk.
+    std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let rows = registry.board(&t0()).unwrap();
+    let events = registry.history(None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "task-one");
+    assert_eq!(events.len(), 1);
+    assert!(!lock_path.exists());
+
+    // Case 2: mode 0555 directory with a readable .lock file standing on disk.
+    std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&lock_path, b"").unwrap();
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert_eq!(registry.board(&t0()).unwrap().len(), 1);
+    assert_eq!(registry.history(None).unwrap().len(), 1);
+
+    // Case 3: unreadable .lock file (0000) falls back lock-free over the registry.
+    std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(registry.board(&t0()).unwrap().len(), 1);
+    assert_eq!(registry.history(None).unwrap().len(), 1);
+
+    // Restore permissions so temp directory cleanup always succeeds.
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn exclusive_lock_creation_honors_a_group_writable_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("umask-group-lock");
+    let path = dir.join("registry.json");
+    let lock_path = dir.join("registry.json.lock");
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("umask 0002 && exec \"$1\" --registry \"$2\" offer task-one")
+        .arg("sh")
+        .arg(env!("CARGO_BIN_EXE_dibs"))
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mode = std::fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o664,
+        "expected group-writable 0o664 under umask 0o002, got {mode:04o}"
     );
 }

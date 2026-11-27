@@ -325,13 +325,12 @@ fn python_int(text: &str) -> Option<Value> {
             }
             previous_underscore = true;
             previous_digit = false;
-        } else if let Some(value) = py_digit_value(ch) {
+        } else {
+            let value = py_digit_value(ch)?;
             digits.push(char::from_digit(value, 10).unwrap());
             previous_digit = true;
             previous_underscore = false;
             seen_digit = true;
-        } else {
-            return None;
         }
     }
     if previous_underscore || !seen_digit {

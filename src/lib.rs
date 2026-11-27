@@ -33,11 +33,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
 pub const FORMAT_NAME: &str = "dibs-registry/1";
@@ -2094,21 +2091,35 @@ pub struct Registry {
 }
 
 /// The lock a command holds, with the path it locked. Holding
-/// the descriptor is not enough on its own, because the file at
-/// the lock path can be deleted and replaced while a command
-/// works, and a later command then locks the replacement and
-/// works concurrently against the same registry. The guard
-/// therefore knows how to check that the file it holds is still
-/// the file at the path, by device and inode.
+/// the descriptor is not enough on its own on Unix, because the
+/// file at the lock path can be deleted and replaced while a
+/// command works, and a later command then locks the replacement
+/// and works concurrently against the same registry. The guard
+/// therefore checks on Unix that the file it holds is still the
+/// file at the path, by device and inode, while on Windows the
+/// lock file is opened without delete sharing so the operating
+/// system refuses deletion while a handle stands open.
 struct LockGuard {
     file: File,
+    #[cfg(unix)]
     lock_path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        // Explicitly release the kernel lock before closing the file
+        // descriptor so a concurrent fork in another thread cannot hold
+        // an inherited open file description locked until execve.
+        let _ = self.file.unlock();
+    }
 }
 
 impl LockGuard {
     /// Whether the file this guard holds is the file standing
     /// at the lock path now.
+    #[cfg(unix)]
     fn identity_holds(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
         let held = match self.file.metadata() {
             Ok(metadata) => metadata,
             Err(_) => return false,
@@ -2120,11 +2131,17 @@ impl LockGuard {
         held.dev() == standing.dev() && held.ino() == standing.ino()
     }
 
+    #[cfg(not(unix))]
+    fn identity_holds(&self) -> bool {
+        true
+    }
+
     /// Refuse to go on when the held lock is not the file at
     /// the lock path, because anything this command published
     /// could then be overwritten by the command that locked the
     /// standing file, and a success of this command could be
     /// erased without a trace.
+    #[cfg(unix)]
     fn verify(&self) -> Result<()> {
         if self.identity_holds() {
             Ok(())
@@ -2136,6 +2153,64 @@ impl LockGuard {
             )))
         }
     }
+
+    #[cfg(not(unix))]
+    fn verify(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn has_trailing_dir_syntax(raw: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = raw.as_bytes();
+    bytes.ends_with(b"/") || bytes.ends_with(b"/.") || bytes.ends_with(b"/..")
+}
+
+#[cfg(windows)]
+fn has_trailing_dir_syntax(raw: &std::ffi::OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let units: Vec<u16> = raw.encode_wide().collect();
+    let is_sep = |u: u16| u == b'/' as u16 || u == b'\\' as u16;
+    matches!(
+        units.as_slice(),
+        [.., last] if is_sep(*last) || *last == b'.' as u16 || *last == b' ' as u16
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn has_trailing_dir_syntax(raw: &std::ffi::OsStr) -> bool {
+    let lossy = raw.to_string_lossy();
+    lossy.ends_with('/') || lossy.ends_with("/.") || lossy.ends_with("/..")
+}
+
+#[doc(hidden)]
+pub fn retry_transient_rename<F: FnMut() -> std::io::Result<()>>(mut op: F) -> std::io::Result<()> {
+    let mut attempt = 0u64;
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if (err.kind() == std::io::ErrorKind::PermissionDenied
+                    || err.raw_os_error() == Some(32))
+                    && attempt < 5 =>
+            {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(attempt * 5));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_temp_over_registry(temp: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn rename_temp_over_registry(temp: &Path, target: &Path) -> std::io::Result<()> {
+    retry_transient_rename(|| std::fs::rename(temp, target))
 }
 
 impl Registry {
@@ -2155,38 +2230,99 @@ impl Registry {
         Registry { path, lock_path }
     }
 
-    fn locked(&self, exclusive: bool) -> Result<LockGuard> {
-        // The identity of the locked file is checked as soon as
-        // the lock stands. A mismatch means the file at the path
-        // was deleted and replaced under this command, so the
-        // command locks the standing file on a bounded retry
-        // instead of working under a file no other command can
-        // see, and refuses when the path will not settle.
+    /// Validate that the registry path names a file component and
+    /// carries no trailing directory syntax (DB-15).
+    pub fn validate_registry_path(&self) -> Result<()> {
+        let raw = self.path.as_os_str();
+        if raw.is_empty() || self.path.file_name().is_none() || has_trailing_dir_syntax(raw) {
+            let rendered = py_repr(&self.path.to_string_lossy());
+            return Err(Error::InvalidRequest(format!(
+                "invalid registry path {rendered}, the path must name a file"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Take a shared read lock when the sibling lock file stands
+    /// readable, or proceed lock free over the atomic rename
+    /// registry file when no lock file stands or the directory
+    /// or filesystem is read only (DB-16).
+    fn lock_shared_read(&self) -> Result<Option<LockGuard>> {
         for attempt in 1..=5 {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o644)
-                .open(&self.lock_path)
-                .map_err(|err| {
-                    Error::Failure(format!(
+            let mut options = OpenOptions::new();
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.share_mode(0x0000_0001 | 0x0000_0002);
+            }
+            let file = match options.open(&self.lock_path) {
+                Ok(file) => file,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::ReadOnlyFilesystem
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(err) => {
+                    return Err(Error::Failure(format!(
                         "the lock file beside the registry cannot be opened, {err}"
-                    ))
-                })?;
-            let result = if exclusive {
-                file.lock_exclusive()
-            } else {
-                file.lock_shared()
+                    )));
+                }
             };
-            result.map_err(|err| {
+            file.lock_shared().map_err(|err| {
                 Error::Failure(format!(
                     "the lock file beside the registry cannot be locked, {err}"
                 ))
             })?;
             let guard = LockGuard {
                 file,
+                #[cfg(unix)]
+                lock_path: self.lock_path.clone(),
+            };
+            if guard.identity_holds() {
+                return Ok(Some(guard));
+            }
+            if attempt == 5 {
+                return Err(Error::Failure(format!(
+                    "the lock file at {} is not the file this command locked, \
+                     so the registry was left unchanged",
+                    self.lock_path.display()
+                )));
+            }
+        }
+        unreachable!()
+    }
+
+    /// Take an exclusive lock on the sibling lock file, creating
+    /// it under the process umask with no hardcoded mode override
+    /// so shared group directories stay writable by peers (DB-16).
+    fn lock_exclusive_mut(&self) -> Result<LockGuard> {
+        for attempt in 1..=5 {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                options.share_mode(0x0000_0001 | 0x0000_0002);
+            }
+            let file = options.open(&self.lock_path).map_err(|err| {
+                Error::Failure(format!(
+                    "the lock file beside the registry cannot be opened, {err}"
+                ))
+            })?;
+            file.lock().map_err(|err| {
+                Error::Failure(format!(
+                    "the lock file beside the registry cannot be locked, {err}"
+                ))
+            })?;
+            let guard = LockGuard {
+                file,
+                #[cfg(unix)]
                 lock_path: self.lock_path.clone(),
             };
             if guard.identity_holds() {
@@ -2260,7 +2396,8 @@ impl Registry {
         let staged = (|| -> std::io::Result<()> {
             handle.write_all(text.as_bytes())?;
             handle.sync_all()?;
-            std::fs::rename(&temp, &self.path)?;
+            drop(handle);
+            rename_temp_over_registry(&temp, &self.path)?;
             Ok(())
         })();
         if let Err(err) = staged {
@@ -2272,6 +2409,7 @@ impl Registry {
                 "the registry could not be published, {err}"
             )));
         }
+        #[cfg(unix)]
         if let Some(dir) = self.parent_dir() {
             if let Ok(handle) = File::open(&dir) {
                 let _ = handle.sync_all();
@@ -2281,12 +2419,13 @@ impl Registry {
     }
 
     fn mutate<T>(&self, action: impl FnOnce(&mut Document) -> Result<T>) -> Result<T> {
+        self.validate_registry_path()?;
         if let Some(parent) = self.parent_dir() {
             std::fs::create_dir_all(&parent).map_err(|err| {
                 Error::Failure(format!("the registry directory cannot be created, {err}"))
             })?;
         }
-        let guard = self.locked(true)?;
+        let guard = self.lock_exclusive_mut()?;
         let mut document = self.read_document()?;
         let result = action(&mut document)?;
         // The publish is the one state change, and it happens
@@ -2298,6 +2437,7 @@ impl Registry {
     }
 
     fn read<T>(&self, action: impl FnOnce(&Document) -> Result<T>) -> Result<T> {
+        self.validate_registry_path()?;
         // A missing registry reads as the empty document and
         // the read creates nothing, so absence is established
         // from the metadata before any lock is taken (DB-12).
@@ -2309,6 +2449,25 @@ impl Registry {
         match std::fs::metadata(&self.path) {
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                for ancestor in self.path.ancestors().skip(1) {
+                    if ancestor.as_os_str().is_empty() {
+                        break;
+                    }
+                    match std::fs::metadata(ancestor) {
+                        Ok(meta) if meta.is_dir() => break,
+                        Ok(_) => {
+                            return Err(Error::Failure(format!(
+                                "the registry file cannot be read, {err}"
+                            )));
+                        }
+                        Err(anc_err) if anc_err.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(anc_err) => {
+                            return Err(Error::Failure(format!(
+                                "the registry file cannot be read, {anc_err}"
+                            )));
+                        }
+                    }
+                }
                 return action(&empty_document());
             }
             Err(err) => {
@@ -2317,7 +2476,7 @@ impl Registry {
                 )));
             }
         }
-        let _guard = self.locked(false)?;
+        let _guard = self.lock_shared_read()?;
         let document = self.read_document()?;
         action(&document)
     }
@@ -2720,7 +2879,6 @@ pub fn check_possession(item: &Item, holder: &str, token: &str, epoch: &Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     #[test]
     fn parent_dir_names_the_current_directory_for_a_bare_name() {
@@ -2745,8 +2903,16 @@ mod tests {
     /// publish will choose and plant a file at it. The open the
     /// publish uses is pinned here instead, at the helper the
     /// publish itself calls.
+    ///
+    /// DB-S1 gates this pin to Unix targets (and scopes `Read`
+    /// inside it) because it stages a symlink via
+    /// `std::os::unix::fs::symlink`, which does not exist on the
+    /// Windows CI target.
+    #[cfg(unix)]
     #[test]
     fn publish_temp_open_refuses_a_planted_symlink() {
+        use std::io::Read;
+
         let dir = std::env::temp_dir().join(format!("dibs-unit-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
