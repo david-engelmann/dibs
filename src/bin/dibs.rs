@@ -954,6 +954,10 @@ fn epoch_argument(value: &Value) -> i128 {
     }
 }
 
+fn stdin_read_error(err: std::io::Error) -> Error {
+    Error::Failure(format!("standard input cannot be read, {err}"))
+}
+
 fn read_stdin_token() -> Result<String, Error> {
     use std::io::Read;
     let stdin = std::io::stdin();
@@ -962,7 +966,7 @@ fn read_stdin_token() -> Result<String, Error> {
         .lock()
         .take(257)
         .read_to_end(&mut buf)
-        .map_err(|err| Error::Failure(format!("standard input cannot be read, {err}")))?;
+        .map_err(stdin_read_error)?;
     if buf.len() > 256 {
         return Err(Error::InvalidRequest(
             "stdin token exceeds 256 bytes".to_string(),
@@ -1000,26 +1004,17 @@ fn resolve_token(args: &SubArgs) -> Result<String, Error> {
 
 fn read_offer_batch_input(file_arg: Option<&OsString>) -> Result<String, Error> {
     let bytes = match file_arg {
-        None => {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .lock()
-                .read_to_end(&mut buf)
-                .map_err(|err| Error::Failure(format!("standard input cannot be read, {err}")))?;
-            buf
-        }
-        Some(path) if path.to_str() == Some("-") => {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .lock()
-                .read_to_end(&mut buf)
-                .map_err(|err| Error::Failure(format!("standard input cannot be read, {err}")))?;
-            buf
-        }
-        Some(path) => std::fs::read(PathBuf::from(path))
+        Some(path) if path.to_str() != Some("-") => std::fs::read(PathBuf::from(path))
             .map_err(|err| Error::Failure(format!("the offer batch file cannot be read, {err}")))?,
+        _ => {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .lock()
+                .read_to_end(&mut buf)
+                .map_err(stdin_read_error)?;
+            buf
+        }
     };
     String::from_utf8(bytes).map_err(|err| {
         Error::InvalidRequest(format!("offer batch input is not valid UTF-8, {err}"))

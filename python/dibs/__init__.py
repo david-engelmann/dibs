@@ -23,6 +23,9 @@ return of claim and claim_next, and neither a token nor its hash
 appears in board, ready, show, history, compact, or an exception.
 """
 
+import os
+from typing import Iterable, List, Optional, TypedDict, Union
+
 from ._dibs import (
     CorruptError,
     DibsError,
@@ -46,6 +49,74 @@ from ._dibs import (
     reset,
     show,
 )
+
+StrPath = Union[str, os.PathLike[str]]
+
+
+class _OfferSpecRequired(TypedDict):
+    id: str
+
+
+class OfferSpecDict(_OfferSpecRequired, total=False):
+    note: Optional[str]
+    priority: int
+    tags: Iterable[str]
+    depends_on: Iterable[str]
+    max_takeovers: Optional[int]
+
+
+class ClaimGrantedDict(TypedDict):
+    item: str
+    holder: str
+    token: str
+    epoch: int
+    expires_at: str
+
+
+class RenewedDict(TypedDict):
+    expires_at: str
+
+
+class BoardRowDict(TypedDict):
+    id: str
+    note: str
+    status: str
+    holder: Optional[str]
+    expires_at: Optional[str]
+    epoch: int
+
+
+class ItemDetailDict(TypedDict):
+    id: str
+    note: str
+    status: str
+    effective_status: str
+    priority: int
+    tags: List[str]
+    depends_on: List[str]
+    holder: Optional[str]
+    expires_at: Optional[str]
+    epoch: int
+    takeover_count: int
+    max_takeovers: Optional[int]
+
+
+class EventDict(TypedDict):
+    seq: int
+    kind: str
+    item: str
+    holder: Optional[str]
+    at: str
+    epoch: int
+    previous_holder: Optional[str]
+
+
+class CompactSummaryDict(TypedDict):
+    through_seq: int
+    archived_count: int
+    remaining_count: int
+    archived_events_sha256: str
+    archive_path: str
 
 
 def offer(
@@ -73,14 +144,23 @@ def offer(
 
 
 __all__ = [
+    "BoardRowDict",
+    "ClaimGrantedDict",
+    "CompactSummaryDict",
     "CorruptError",
     "DibsError",
+    "EventDict",
     "FailureError",
     "InvalidNameError",
     "InvalidRequestError",
     "InvalidTtlError",
+    "ItemDetailDict",
     "NotFoundError",
+    "OfferSpecDict",
     "RefusalError",
+    "RenewedDict",
+    "StrPath",
+    "__version__",
     "board",
     "claim",
     "claim_next",
@@ -96,4 +176,4 @@ __all__ = [
     "show",
 ]
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

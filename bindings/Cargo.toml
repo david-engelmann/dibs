@@ -1,16 +1,19 @@
 [package]
 name = "dibs-bindings"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.89"
+publish = false
 description = "The thin Python binding over the dibs crate, carrying no logic of its own"
 license = "MIT"
+repository = "https://github.com/david-engelmann/dibs"
 
 [lib]
-name = "dibs"
-crate-type = ["cdylib", "rlib"]
+name = "_dibs"
+crate-type = ["cdylib"]
 
 [dependencies]
-dibs-core = { package = "dibs", path = ".." }
+dibs-core = { package = "dibs-ai", path = ".." }
 pyo3 = { version = "0.30", features = ["abi3-py39"] }
 
 [features]

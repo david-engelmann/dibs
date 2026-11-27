@@ -3821,6 +3821,13 @@ fn lock_path_for(path: &Path) -> PathBuf {
     }
 }
 
+fn already_standing_error(id: &str) -> Error {
+    Error::Refusal(format!(
+        "item {} already stands in the backlog",
+        py_repr(id)
+    ))
+}
+
 impl Registry {
     pub fn new(path: PathBuf) -> Registry {
         let lock_path = lock_path_for(&path);
@@ -4038,10 +4045,10 @@ impl Registry {
         Ok(result)
     }
 
-    /// Check whether neither the registry file nor its lock file
-    /// stands on disk, while still reporting ancestor non-directory
-    /// or permission errors as Error::Failure.
-    fn both_registry_and_lock_absent(&self) -> Result<bool> {
+    /// Check whether the registry file is absent on disk, while
+    /// still reporting ancestor non-directory or permission errors
+    /// as Error::Failure.
+    fn registry_is_absent(&self) -> std::result::Result<bool, Error> {
         match std::fs::metadata(&self.path) {
             Ok(_) => Ok(false),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -4064,9 +4071,7 @@ impl Registry {
                         }
                     }
                 }
-                Ok(std::fs::metadata(&self.lock_path)
-                    .err()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+                Ok(true)
             }
             Err(err) => Err(Error::Failure(format!(
                 "the registry file cannot be read, {err}"
@@ -4074,37 +4079,19 @@ impl Registry {
         }
     }
 
+    fn both_registry_and_lock_absent(&self) -> Result<bool> {
+        if !self.registry_is_absent()? {
+            return Ok(false);
+        }
+        Ok(std::fs::metadata(&self.lock_path)
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+    }
+
     fn read<T>(&self, action: impl FnOnce(&RegistryDoc) -> Result<T>) -> Result<T> {
         self.validate_registry_path()?;
-        match std::fs::metadata(&self.path) {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                for ancestor in self.path.ancestors().skip(1) {
-                    if ancestor.as_os_str().is_empty() {
-                        break;
-                    }
-                    match std::fs::metadata(ancestor) {
-                        Ok(meta) if meta.is_dir() => break,
-                        Ok(_) => {
-                            return Err(Error::Failure(format!(
-                                "the registry file cannot be read, {err}"
-                            )));
-                        }
-                        Err(anc_err) if anc_err.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(anc_err) => {
-                            return Err(Error::Failure(format!(
-                                "the registry file cannot be read, {anc_err}"
-                            )));
-                        }
-                    }
-                }
-                return action(&empty_registry_doc());
-            }
-            Err(err) => {
-                return Err(Error::Failure(format!(
-                    "the registry file cannot be read, {err}"
-                )));
-            }
+        if self.registry_is_absent()? {
+            return action(&empty_registry_doc());
         }
         let _guard = self.lock_shared_read()?;
         let document = self.read_document()?;
@@ -4306,10 +4293,7 @@ impl Registry {
         }
         for (offset, spec) in normalized_specs.iter().enumerate() {
             if index_by_id.contains_key(spec.id.as_str()) {
-                return Err(Error::Refusal(format!(
-                    "item {} already stands in the backlog",
-                    py_repr(&spec.id)
-                )));
+                return Err(already_standing_error(&spec.id));
             }
             index_by_id.insert(spec.id.as_str(), standing_items.len() + offset);
         }
@@ -4356,6 +4340,13 @@ impl Registry {
         let normalized = Self::validate_and_normalize_spec(spec)?;
         validate_now(now)?;
         self.mutate(|document| {
+            if document
+                .items
+                .iter()
+                .any(|item| item.core.id == normalized.id)
+            {
+                return Err(already_standing_error(&normalized.id));
+            }
             Self::verify_offer_batch_dag(&document.items, std::slice::from_ref(&normalized))?;
             Self::ensure_seq_capacity(document, 1)?;
             let id = normalized.id.clone();
