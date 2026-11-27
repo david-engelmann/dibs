@@ -7,18 +7,24 @@
 //! hygiene pin. Two facts changed with the Rust conversion and the
 //! change is stated where it lands. The CI gate commands are the
 //! Rust gate commands of amended obligation S2, and the contract
-//! substance pin asserts the amended S2 phrases.
+//! substance pin asserts the amended S2 phrases. Slice DB-S4 amends
+//! S2 and adds DB-25, moving codepoint_scan and its binary pins into
+//! crates/codepoint_scan and adding workspace packaging, version
+//! parity, PEP 561 stub, Docker, and release workflow pins here.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 mod common;
 
 const MARKER: &str = "<!-- repo annex below this line -->";
 const GATE_COMMAND: &str = "cargo test";
-const SCAN_COMMAND: &str = "cargo run --bin codepoint_scan";
+// DB-S4 mechanical update (amended Obligation S2, DB-25): codepoint_scan
+// now lives in the isolated workspace crate `crates/codepoint_scan` and
+// runs through `-p codepoint_scan`.
+const SCAN_COMMAND: &str = "cargo run -p codepoint_scan";
 const FMT_COMMAND: &str = "cargo fmt --check";
 const CLIPPY_COMMAND: &str = "cargo clippy --all-targets -- -D warnings";
+const PACKAGE_COMMAND: &str = "cargo package --locked -p dibs-ai";
 
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -26,10 +32,6 @@ fn root() -> PathBuf {
 
 fn read(name: &str) -> String {
     std::fs::read_to_string(root().join(name)).unwrap()
-}
-
-fn temp_dir(tag: &str) -> PathBuf {
-    common::temp_dir("dibs-setup-test-", tag)
 }
 
 #[test]
@@ -210,11 +212,21 @@ fn run_commands(ci_text: &str) -> Vec<String> {
 
 #[test]
 fn ci_runs_the_local_gate_commands() {
-    let commands = run_commands(&read(".github/workflows/ci.yml"));
+    let text = read(".github/workflows/ci.yml");
+    let commands = run_commands(&text);
     assert!(commands.iter().any(|c| c == GATE_COMMAND));
     assert!(commands.iter().any(|c| c == SCAN_COMMAND));
     assert!(commands.iter().any(|c| c == FMT_COMMAND));
     assert!(commands.iter().any(|c| c == CLIPPY_COMMAND));
+    assert!(commands.iter().any(|c| c == PACKAGE_COMMAND));
+
+    let msrv_sec = job_section(&text, "msrv");
+    assert!(!msrv_sec.is_empty(), "the workflow carries no msrv job");
+    assert!(msrv_sec.contains("toolchain: \"1.89.0\""));
+    let msrv_cmds = run_commands_for_job(&text, "msrv");
+    assert!(msrv_cmds
+        .iter()
+        .any(|c| c == "cargo check --workspace --locked --all-targets"));
 }
 
 #[test]
@@ -244,22 +256,22 @@ fn ci_runs_the_cross_platform_gate_matrix() {
 #[test]
 fn ci_runs_the_binding_smoke_test() {
     let text = read(".github/workflows/ci.yml");
-    // Read the binding job alone, from its job line to the next
-    // job line or the end of the file. The job builds the
-    // binding and runs the smoke suite against it, and the
-    // binding check is a required check, so a workflow that
-    // dropped the smoke command, or disabled the job or one of
-    // its steps with if false, would leave that check green
-    // over a suite that never ran. A command that stands
-    // commented out does not count as standing, and a step
-    // condition is read wherever it stands in its step.
-    // DB-S1 factors the job-boundary slice into `job_section` so
-    // `test`, `cross-platform`, and `binding` share one parser.
     let section = job_section(&text, "binding");
     assert!(!section.is_empty(), "the workflow carries no binding job");
+    // DB-S4 extends the binding job pin under DB-25 to assert static
+    // typechecking, wheel/sdist packaging, and Python 3.9/3.13 matrix
+    // coverage alongside the smoke suite.
     for needle in [
         "maturin develop --manifest-path bindings/Cargo.toml",
         "python -m pytest tests/test_binding_smoke.py",
+        "mypy --strict python/dibs tests/typecheck_dibs.py",
+        "pyright python/dibs tests/typecheck_dibs.py",
+        "maturin build --release --locked --out dist --manifest-path bindings/Cargo.toml",
+        "maturin sdist --out dist --manifest-path bindings/Cargo.toml",
+        "dibs/py.typed",
+        "dibs/__init__.pyi",
+        "python/dibs/py.typed",
+        "python/dibs/__init__.pyi",
     ] {
         let stands = section.lines().any(|line| {
             let stripped = line.trim();
@@ -278,34 +290,26 @@ fn ci_runs_the_binding_smoke_test() {
         })
     });
     assert!(!disabled, "the binding job is disabled with if: false");
+
+    let matrix_sec = job_section(&text, "binding-matrix");
+    assert!(
+        !matrix_sec.is_empty(),
+        "the workflow carries no binding-matrix job"
+    );
+    assert!(matrix_sec.contains("runs-on: ubuntu-24.04"));
+    assert!(matrix_sec.contains("python-version: [\"3.9\", \"3.13\"]"));
+    assert!(matrix_sec.contains("maturin develop --manifest-path bindings/Cargo.toml"));
+    assert!(matrix_sec.contains("python -m pytest tests/test_binding_smoke.py"));
 }
 
-fn ci_hygiene_holds(text: &str) -> Result<(), String> {
-    let active_lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect();
-    if !active_lines.contains(&"permissions:") || !active_lines.contains(&"contents: read") {
-        return Err("missing read-only contents permission".to_string());
-    }
-    for line in &active_lines {
-        if line.contains(": write") || line.contains("write-all") {
-            return Err(format!("elevated permission line: {line}"));
-        }
-        let unbulleted = line.strip_prefix("- ").unwrap_or(line);
-        if let Some(rest) = unbulleted.strip_prefix("if:") {
-            let normalized = rest
-                .trim()
-                .trim_matches(|c| c == '\'' || c == '"')
-                .to_lowercase();
-            if normalized == "false" {
-                return Err(format!("disabled job or step: {line}"));
-            }
-        }
-    }
+fn verify_job_checkouts(
+    text: &str,
+    jobs: &[&str],
+    min_checkouts: usize,
+    required_ref: Option<&str>,
+) -> Result<(), String> {
     let mut checkout_total = 0usize;
-    for job in ["test", "cross-platform", "binding"] {
+    for job in jobs {
         let section = job_section(text, job);
         if section.is_empty() {
             return Err(format!("missing job {job}"));
@@ -322,6 +326,11 @@ fn ci_hygiene_holds(text: &str) -> Result<(), String> {
                     return Err(format!(
                         "checkout step in job {job} lacks persist-credentials: false"
                     ));
+                }
+                if let Some(expected_ref) = required_ref {
+                    if !step.iter().any(|line| line == expected_ref) {
+                        return Err(format!("checkout step in job {job} lacks {expected_ref}"));
+                    }
                 }
             }
             Ok(())
@@ -347,32 +356,66 @@ fn ci_hygiene_holds(text: &str) -> Result<(), String> {
         }
         verify_step(&current_step, &mut checkout_total)?;
     }
-    if checkout_total < 3 {
+    if checkout_total < min_checkouts {
         return Err(format!(
-            "expected at least 3 checkouts, saw {checkout_total}"
+            "expected at least {min_checkouts} checkouts, saw {checkout_total}"
         ));
     }
     Ok(())
 }
 
+fn ci_hygiene_holds(text: &str) -> Result<(), String> {
+    let Some((header, _)) = text.split_once("\njobs:\n") else {
+        return Err("missing jobs: section".to_string());
+    };
+    let header_lines: Vec<&str> = header
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    if !header_lines.contains(&"permissions:") || !header_lines.contains(&"contents: read") {
+        return Err("missing top-level read-only contents permission".to_string());
+    }
+    let active_lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    for line in &active_lines {
+        if line.contains(": write") || line.contains("write-all") {
+            return Err(format!("elevated permission line: {line}"));
+        }
+        let unbulleted = line.strip_prefix("- ").unwrap_or(line);
+        if let Some(rest) = unbulleted.strip_prefix("if:") {
+            let normalized = rest
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_lowercase();
+            if normalized == "false" {
+                return Err(format!("disabled job or step: {line}"));
+            }
+        }
+    }
+    verify_job_checkouts(
+        text,
+        &[
+            "test",
+            "cross-platform",
+            "msrv",
+            "binding",
+            "binding-matrix",
+        ],
+        5,
+        None,
+    )
+}
+
 #[test]
 fn ci_carries_the_fleet_credential_hygiene() {
     let text = read(".github/workflows/ci.yml");
-    // The workflow asks for no more than it uses. Its token
-    // is limited to reading the repository, the checkout
-    // leaves no credential behind for later steps, and every
-    // toolchain step is pinned to a full commit SHA rather
-    // than a moving branch name.
-    // DB-S1 strengthens this pin from file-wide substring checks
-    // to verify `persist-credentials: false` on every checkout
-    // step across `test`, `cross-platform`, and `binding`, zero
-    // `if: false` guards, and zero `: write` or `write-all` lines.
     if let Err(reason) = ci_hygiene_holds(&text) {
         panic!("CI hygiene failed, {reason}");
     }
-    // Verify the hygiene check itself discriminates on one missing
-    // persist-credentials setting, on a write permission, and on an
-    // if: false guard in any job.
     let stripped_once = text.replacen("          persist-credentials: false\n", "", 1);
     assert!(ci_hygiene_holds(&stripped_once).is_err());
     let elevated = text.replace("contents: read", "contents: write");
@@ -389,7 +432,7 @@ fn ci_carries_the_fleet_credential_hygiene() {
         .collect();
     assert_eq!(
         toolchain_lines.len(),
-        3,
+        5,
         "every job must pin dtolnay/rust-toolchain"
     );
     for toolchain_line in toolchain_lines {
@@ -446,99 +489,6 @@ fn ci_gate_parser_rejects_a_job_disabled_with_if_false() {
     assert!(commands.iter().any(|c| c == CLIPPY_COMMAND));
 }
 
-struct ScanOutput {
-    status: i32,
-    stdout: String,
-    stderr: String,
-}
-
-fn scan_tree(root: &Path) -> ScanOutput {
-    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
-        .arg(root)
-        .output()
-        .unwrap();
-    ScanOutput {
-        status: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-fn scan_tree_with_surplus(root: &Path, surplus: &Path) -> ScanOutput {
-    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
-        .arg(root)
-        .arg(surplus)
-        .output()
-        .unwrap();
-    ScanOutput {
-        status: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-#[test]
-fn codepoint_scan_reports_zero_for_the_repo() {
-    let result = scan_tree(&root());
-    assert_eq!(result.status, 0, "{}", result.stdout);
-    assert!(result.stdout.contains("em dash U+2014 count 0"));
-    assert!(result.stdout.contains("en dash U+2013 count 0"));
-}
-
-#[test]
-fn codepoint_scan_refuses_an_argument_after_the_root() {
-    let dir = temp_dir("surplus-argument");
-    std::fs::write(dir.join("clean.md"), "clean").unwrap();
-    let surplus = temp_dir("surplus-other");
-    let result = scan_tree_with_surplus(&dir, &surplus);
-    assert_eq!(result.status, 2, "{}", result.stdout);
-    assert!(
-        result
-            .stderr
-            .contains("scan error, the scan takes at most one argument, the scan root"),
-        "{}",
-        result.stderr
-    );
-}
-
-#[test]
-fn codepoint_scan_refuses_an_extra_argument_before_scanning() {
-    let dir = temp_dir("surplus-before-scan");
-    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
-    let surplus = temp_dir("surplus-before-scan-other");
-    let result = scan_tree_with_surplus(&dir, &surplus);
-    assert_eq!(result.status, 2, "{}", result.stdout);
-    assert!(
-        result
-            .stderr
-            .contains("scan error, the scan takes at most one argument, the scan root"),
-        "{}",
-        result.stderr
-    );
-    assert!(!result.stdout.contains("em dash U+2014 count"));
-}
-
-fn scan_current_dir(root: &Path) -> ScanOutput {
-    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
-        .current_dir(root)
-        .output()
-        .unwrap();
-    ScanOutput {
-        status: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
-
-#[test]
-fn codepoint_scan_with_no_argument_scans_the_current_directory() {
-    let dir = temp_dir("no-argument");
-    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
-    let result = scan_current_dir(&dir);
-    assert_eq!(result.status, 1);
-    assert!(result.stdout.contains("em dash U+2014 count 1"));
-}
-
 const CANONICAL_ABOVE_MARKER_SHA256: &str =
     "bb3e2fc1790b13729da3495c3f0902b968577f4e45ceb27e48e90b489f36e1a7";
 
@@ -566,47 +516,6 @@ fn readme_carries_no_wrong_arc_label() {
 }
 
 #[test]
-fn codepoint_scan_counts_an_em_dash() {
-    let dir = temp_dir("em-dash");
-    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
-    let result = scan_tree(&dir);
-    assert_eq!(result.status, 1);
-    assert!(result.stdout.contains("em dash U+2014 count 1"));
-    assert!(result.stdout.contains("note.md"));
-}
-
-#[test]
-fn codepoint_scan_counts_an_en_dash() {
-    let dir = temp_dir("en-dash");
-    std::fs::write(dir.join("note.md"), "a\u{2013}b").unwrap();
-    let result = scan_tree(&dir);
-    assert_eq!(result.status, 1);
-    assert!(result.stdout.contains("en dash U+2013 count 1"));
-}
-
-#[test]
-fn codepoint_scan_scans_a_root_under_an_excluded_ancestor() {
-    let dir = temp_dir("excluded-ancestor").join("venv").join("tree");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("note.md"), "a\u{2014}b").unwrap();
-    let result = scan_tree(&dir);
-    assert_eq!(result.status, 1);
-    assert!(result.stdout.contains("em dash U+2014 count 1"));
-}
-
-#[test]
-fn codepoint_scan_skips_excluded_dirs_below_the_root() {
-    let dir = temp_dir("excluded-dirs");
-    let cache = dir.join("build");
-    std::fs::create_dir_all(&cache).unwrap();
-    std::fs::write(cache.join("note.md"), "a\u{2014}b").unwrap();
-    std::fs::write(dir.join("clean.md"), "clean").unwrap();
-    let result = scan_tree(&dir);
-    assert_eq!(result.status, 0);
-    assert!(result.stdout.contains("em dash U+2014 count 0"));
-}
-
-#[test]
 fn contract_obligations_carry_their_substance() {
     let text = read("CONTRACT.md");
     for phrase in [
@@ -617,96 +526,10 @@ fn contract_obligations_carry_their_substance() {
         "0 of 100 until a full cycle",
         "no file carries a real trace or a real transcript or a real name",
         "SHA-256 digest of the part above the marked line",
+        "Obligation DB-25 covers",
     ] {
         assert!(text.contains(phrase), "{phrase}");
     }
-}
-
-#[test]
-fn codepoint_scan_fails_loudly_on_undecodable_input() {
-    let dir = temp_dir("undecodable");
-    std::fs::write(dir.join("note.md"), b"\xff\xfe not utf-8").unwrap();
-    let result = scan_tree(&dir);
-    assert_eq!(result.status, 2);
-    assert!(result.stderr.contains("note.md"));
-}
-
-#[test]
-fn codepoint_scan_counts_a_dash_in_a_file_with_no_suffix() {
-    let dir = temp_dir("no-suffix");
-    std::fs::write(dir.join("LICENSE"), "a\u{2014}b").unwrap();
-    let result = scan_tree(&dir);
-    assert_eq!(result.status, 1);
-    assert!(result.stdout.contains("em dash U+2014 count 1"));
-}
-
-#[test]
-fn codepoint_scan_counts_a_dash_in_an_uppercase_suffix_file() {
-    let dir = temp_dir("upper-suffix");
-    std::fs::write(dir.join("UPPER.MD"), "a\u{2014}b").unwrap();
-    let result = scan_tree(&dir);
-    assert_eq!(result.status, 1);
-    assert!(result.stdout.contains("em dash U+2014 count 1"));
-}
-
-#[test]
-fn codepoint_scan_skips_a_file_with_an_uppercase_binary_suffix() {
-    let dir = temp_dir("upper-binary");
-    std::fs::write(dir.join("FAKE.PNG"), "a\u{2014}b").unwrap();
-    let result = scan_tree(&dir);
-    assert_eq!(result.status, 0);
-    assert!(result.stdout.contains("em dash U+2014 count 0"));
-    assert!(result.stdout.contains("en dash U+2013 count 0"));
-}
-
-#[cfg(unix)]
-#[test]
-fn codepoint_scan_takes_a_non_unicode_root_without_panicking() {
-    use std::os::unix::ffi::OsStringExt;
-
-    // The scanner read its root through std::env::args as
-    // first built, which panics on an argument that is not
-    // valid Unicode, where the root is a path and stands
-    // carried unconverted, the shape the command line's
-    // registry path takes. DB-S1 guards `create_dir_all` on
-    // filesystems such as macOS APFS that reject non UTF-8
-    // directory entries on disk, skipping only the staged
-    // directory while still exercising the raw OsString scan
-    // root error path below.
-    let dir = temp_dir("non-unicode-root");
-    let odd_dir = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
-    if std::fs::create_dir_all(&odd_dir).is_ok() {
-        std::fs::write(odd_dir.join("clean.md"), "clean").unwrap();
-        let result = scan_tree(&odd_dir);
-        assert_eq!(result.status, 0, "{}", result.stderr);
-        assert!(result.stdout.contains("em dash U+2014 count 0"));
-        assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
-    }
-    let missing = dir.join(std::ffi::OsString::from_vec(vec![0xfe]));
-    let result = scan_tree(&missing);
-    assert_eq!(result.status, 2, "{}", result.stderr);
-    assert!(result.stderr.contains("scan error"), "{}", result.stderr);
-    assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
-}
-
-#[cfg(unix)]
-#[test]
-fn codepoint_scan_with_a_closed_stdout_pipe_exits_2_without_a_panic() {
-    use std::process::Stdio;
-
-    let dir = temp_dir("scan-epipe");
-    std::fs::write(dir.join("clean.md"), "clean").unwrap();
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
-    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
-        .arg(&dir)
-        .stdout(Stdio::from(writer))
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(!stderr.contains("panicked"), "{stderr}");
-    assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
 }
 
 #[test]
@@ -726,11 +549,36 @@ fn roadmap_and_manifest_versions_and_python_smoke_count_stay_in_sync() {
             })
             .expect("manifest must declare version")
     };
+    // DB-S4 mechanical update (DB-25): pyproject.toml now lives at the
+    // repository root and bindings/pyproject.toml is removed; all four
+    // public version declarations stand at 1.0.0.
+    assert!(!root().join("bindings/pyproject.toml").exists());
     let root_version = extract_version(&read("Cargo.toml"));
     let bindings_version = extract_version(&read("bindings/Cargo.toml"));
-    let pyproject_version = extract_version(&read("bindings/pyproject.toml"));
+    let pyproject_version = extract_version(&read("pyproject.toml"));
+    let init_py = read("python/dibs/__init__.py");
+    let py_version = init_py
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("__version__ = \"")?;
+            rest.strip_suffix('"').map(str::to_string)
+        })
+        .expect("python/dibs/__init__.py must declare __version__");
+    assert_eq!(root_version, "1.0.0");
     assert_eq!(root_version, bindings_version);
     assert_eq!(root_version, pyproject_version);
+    assert_eq!(root_version, py_version);
+
+    let scan_tests = read("crates/codepoint_scan/tests/scan.rs")
+        .lines()
+        .filter(|line| line.trim() == "#[test]")
+        .count();
+    assert_eq!(scan_tests, 15);
+    let setup_tests = read("tests/setup.rs")
+        .lines()
+        .filter(|line| line.trim() == "#[test]")
+        .count();
+    assert_eq!(setup_tests, 21);
 
     let py_smoke = read("tests/test_binding_smoke.py");
     let py_count = py_smoke
@@ -739,43 +587,497 @@ fn roadmap_and_manifest_versions_and_python_smoke_count_stay_in_sync() {
         .count();
     let readme = read("README.md");
     let status = status_section(&readme);
+    let expected_census = format!(
+        "The Rust workspace suite carries 204 tests across 189 root `dibs-ai` tests and \
+         {scan_tests} `codepoint_scan` tests, running 203 on Unix (188 root and 15 scanner) \
+         and 192 on Windows (180 root and 12 scanner), and the Python binding smoke test \
+         carries {py_count},"
+    );
     assert!(
-        status.contains(&format!(
-            "and the Python binding smoke test carries {py_count},"
-        )),
-        "README.md Python smoke test count drifted from {py_count}"
+        status.contains(&expected_census),
+        "README.md test census drifted from {expected_census}"
     );
 }
 
-#[cfg(unix)]
 #[test]
-fn codepoint_scan_with_an_unwritable_stdout_exits_2_without_a_panic() {
-    // The scanner prints through a checked writer (DB-A24),
-    // so a stream that refuses the write ends the scan at its
-    // error exit 2 with no panic. /dev/full stands in for the
-    // closed pipe of the finding's probe, because a pipe whose
-    // reader closes early cannot be staged deterministically
-    // from inside the suite, and /dev/full refuses the write
-    // the same way. Where /dev/full does not stand the staged
-    // failure cannot be produced and the pin does not run; on
-    // the hosted gate, which is Linux, the device stands. On
-    // the pre-fix binary the same drive dies with a panic
-    // message at exit 101.
-    use std::process::Stdio;
+fn workspace_and_package_manifests_satisfy_db25() {
+    let root_cargo = read("Cargo.toml");
+    for needle in [
+        "members = [\".\", \"crates/codepoint_scan\", \"bindings\"]",
+        "default-members = [\".\", \"crates/codepoint_scan\"]",
+        "resolver = \"2\"",
+        "name = \"dibs-ai\"",
+        "version = \"1.0.0\"",
+        "rust-version = \"1.89\"",
+        "default-run = \"dibs\"",
+        "readme = \"README.md\"",
+        "repository = \"https://github.com/david-engelmann/dibs\"",
+        "homepage = \"https://github.com/david-engelmann/dibs\"",
+        "documentation = \"https://docs.rs/dibs-ai\"",
+        "[lib]\nname = \"dibs\"\npath = \"src/lib.rs\"",
+        "[[bin]]\nname = \"dibs\"\npath = \"src/bin/dibs.rs\"",
+        "[profile.release]\nstrip = \"symbols\"",
+        "[package.metadata.binstall]",
+        "pkg-url = \"{ repo }/releases/download/v{ version }/dibs-v{ version }-{ target }{ archive-suffix }\"",
+        "bin-dir = \"{ bin }{ binary-ext }\"",
+        "pkg-fmt = \"tgz\"",
+        "[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]",
+        "pkg-fmt = \"zip\"",
+    ] {
+        assert!(root_cargo.contains(needle), "Cargo.toml missing {needle}");
+    }
+    assert_eq!(
+        root_cargo.matches("[[bin]]").count(),
+        1,
+        "root Cargo.toml must declare only the dibs binary"
+    );
+    assert!(!root_cargo.contains("src/bin/codepoint_scan.rs"));
+    assert!(!root().join("src/bin/codepoint_scan.rs").exists());
+    for excluded in [
+        "\"AGENTS.md\"",
+        "\"CONTRACT.md\"",
+        "\"ROADMAP.md\"",
+        "\"CHANGELOG.md\"",
+        "\"Dockerfile\"",
+        "\".dockerignore\"",
+        "\"pyproject.toml\"",
+        "\"bindings/**\"",
+        "\"crates/**\"",
+        "\"python/**\"",
+        "\"tests/**\"",
+        "\".github/**\"",
+    ] {
+        assert!(
+            root_cargo.contains(excluded),
+            "Cargo.toml exclude missing {excluded}"
+        );
+    }
 
-    let dir = temp_dir("scan-full");
-    std::fs::write(dir.join("clean.md"), "clean").unwrap();
-    let full = match std::fs::OpenOptions::new().write(true).open("/dev/full") {
-        Ok(file) => file,
-        Err(_) => return,
+    let gitignore = read(".gitignore");
+    for entry in [".mypy_cache/", ".pytest_cache/", ".venv-binding/"] {
+        assert!(
+            gitignore.lines().any(|line| line.trim() == entry),
+            ".gitignore missing {entry}"
+        );
+    }
+
+    let scan_cargo = read("crates/codepoint_scan/Cargo.toml");
+    assert!(scan_cargo.contains("name = \"codepoint_scan\""));
+    assert!(scan_cargo.contains("publish = false"));
+    assert!(root().join("crates/codepoint_scan/src/main.rs").is_file());
+    assert!(root().join("crates/codepoint_scan/tests/scan.rs").is_file());
+
+    let bind_cargo = read("bindings/Cargo.toml");
+    assert!(bind_cargo.contains("publish = false"));
+    assert!(bind_cargo.contains("rust-version = \"1.89\""));
+    assert!(bind_cargo.contains("[lib]\nname = \"_dibs\"\ncrate-type = [\"cdylib\"]"));
+    assert!(bind_cargo.contains("dibs-core = { package = \"dibs-ai\", path = \"..\" }"));
+
+    let pyproject = read("pyproject.toml");
+    for needle in [
+        "name = \"dibs-ai\"",
+        "version = \"1.0.0\"",
+        "requires-python = \">=3.9\"",
+        "\"Typing :: Typed\"",
+        "manifest-path = \"bindings/Cargo.toml\"",
+        "module-name = \"dibs._dibs\"",
+        "python-source = \"python\"",
+        "features = [\"extension-module\"]",
+        "include = [{ path = \"LICENSE\", format = [\"sdist\", \"wheel\"] }]",
+    ] {
+        assert!(
+            pyproject.contains(needle),
+            "pyproject.toml missing {needle}"
+        );
+    }
+}
+
+#[test]
+fn pep561_type_stubs_cover_public_python_surface() {
+    let py_typed = root().join("python/dibs/py.typed");
+    assert!(py_typed.is_file(), "python/dibs/py.typed missing");
+    assert_eq!(std::fs::read(&py_typed).unwrap().len(), 0);
+    assert!(root().join("tests/typecheck_dibs.py").is_file());
+
+    let pyi = read("python/dibs/__init__.pyi");
+    let init_py = read("python/dibs/__init__.py");
+    assert!(pyi.contains("StrPath: TypeAlias = str | os.PathLike[str]"));
+    assert!(init_py.contains("StrPath = Union[str, os.PathLike[str]]"));
+    assert!(pyi.contains("__version__: str"));
+
+    for fn_name in [
+        "offer",
+        "offer_many",
+        "claim",
+        "claim_next",
+        "renew",
+        "release",
+        "complete",
+        "reset",
+        "board",
+        "ready",
+        "show",
+        "history",
+        "compact",
+    ] {
+        assert!(
+            pyi.contains(&format!("def {fn_name}(")),
+            "__init__.pyi missing def {fn_name}"
+        );
+    }
+    for td_name in [
+        "OfferSpecDict",
+        "ClaimGrantedDict",
+        "RenewedDict",
+        "BoardRowDict",
+        "ItemDetailDict",
+        "EventDict",
+        "CompactSummaryDict",
+    ] {
+        assert!(
+            pyi.contains(&format!("class {td_name}(")),
+            "__init__.pyi missing TypedDict {td_name}"
+        );
+        assert!(
+            init_py.contains(&format!("class {td_name}(")),
+            "__init__.py missing TypedDict {td_name}"
+        );
+    }
+    for exc_name in [
+        "DibsError",
+        "InvalidNameError",
+        "InvalidTtlError",
+        "InvalidRequestError",
+        "NotFoundError",
+        "RefusalError",
+        "CorruptError",
+        "FailureError",
+    ] {
+        assert!(
+            pyi.contains(&format!("class {exc_name}(")),
+            "__init__.pyi missing exception {exc_name}"
+        );
+    }
+}
+
+#[test]
+fn dockerfile_and_changelog_satisfy_db25() {
+    let dockerfile = read("Dockerfile");
+    for needle in [
+        "FROM rust:1.91.1-bookworm AS builder",
+        "cargo build --release --locked --bin dibs",
+        "strip /src/target/release/dibs",
+        "FROM debian:bookworm-slim",
+        "ca-certificates",
+        "useradd --uid 65532",
+        "USER 65532:65532",
+        "WORKDIR /work",
+        "ENTRYPOINT [\"dibs\"]",
+    ] {
+        assert!(dockerfile.contains(needle), "Dockerfile missing {needle}");
+    }
+    let dockerignore = read(".dockerignore");
+    for entry in [
+        "target",
+        ".git",
+        ".venv*",
+        "dist",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+    ] {
+        assert!(
+            dockerignore.lines().any(|line| line.trim() == entry),
+            ".dockerignore missing {entry}"
+        );
+    }
+    let changelog = read("CHANGELOG.md");
+    assert!(changelog.starts_with("# Changelog\n"));
+    assert!(changelog.contains("1.0.0"));
+}
+
+fn release_workflow_holds(text: &str) -> Result<(), String> {
+    let Some((header, _)) = text.split_once("\njobs:\n") else {
+        return Err("missing jobs: section".to_string());
     };
-    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
-        .arg(&dir)
-        .stdout(Stdio::from(full))
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(!stderr.contains("panicked"), "{stderr}");
-    assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+    let header_lines: Vec<&str> = header
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    if !header_lines.contains(&"permissions:") || !header_lines.contains(&"contents: read") {
+        return Err("missing top-level read-only contents permission".to_string());
+    }
+    if !header_lines.contains(&"concurrency:")
+        || !header_lines.contains(&"group: release-${{ inputs.tag || github.ref_name }}")
+        || !header_lines.contains(&"cancel-in-progress: false")
+    {
+        return Err("missing tag-scoped non-cancelling concurrency group".to_string());
+    }
+    for line in &header_lines {
+        if line.contains(": write") || line.contains("write-all") {
+            return Err(format!("elevated top-level permission line: {line}"));
+        }
+    }
+    for req_trigger in ["tags:", "- \"v*\"", "workflow_dispatch:", "tag:"] {
+        if !header_lines.contains(&req_trigger) {
+            return Err(format!("missing trigger element {req_trigger}"));
+        }
+    }
+
+    let active_lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let mut pinned_third_party = 0usize;
+    for line in &active_lines {
+        if line.contains("write-all") {
+            return Err(format!("write-all permission forbidden: {line}"));
+        }
+        let unbulleted = line.strip_prefix("- ").unwrap_or(line);
+        if let Some(rest) = unbulleted.strip_prefix("if:") {
+            let normalized = rest
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_lowercase();
+            if normalized == "false" {
+                return Err(format!("disabled job or step: {line}"));
+            }
+        }
+        if let Some(raw_uses) = unbulleted.strip_prefix("uses:") {
+            let spec = raw_uses.split('#').next().unwrap_or("").trim();
+            if !spec.starts_with("actions/") {
+                let Some((_, pin)) = spec.split_once('@') else {
+                    return Err(format!("unpinned third-party action: {line}"));
+                };
+                if pin.len() != 40
+                    || !pin
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(format!(
+                        "third-party action must pin 40-char commit SHA: {line}"
+                    ));
+                }
+                pinned_third_party += 1;
+            }
+        }
+    }
+    if pinned_third_party < 12 {
+        return Err(format!(
+            "expected at least 12 SHA-pinned third-party uses, saw {pinned_third_party}"
+        ));
+    }
+
+    let required_jobs = [
+        "verify",
+        "binaries",
+        "wheels",
+        "sdist",
+        "publish-docker",
+        "github-release",
+        "publish-crates",
+        "publish-pypi",
+    ];
+    for job in &required_jobs {
+        if job_section(text, job).is_empty() {
+            return Err(format!("missing job {job}"));
+        }
+    }
+    for ro_job in ["verify", "binaries", "wheels", "sdist", "publish-crates"] {
+        let sec = job_section(text, ro_job);
+        let ro_lines: Vec<&str> = sec
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        if !ro_lines.contains(&"permissions:") || !ro_lines.contains(&"contents: read") {
+            return Err(format!("read-only job {ro_job} missing contents: read"));
+        }
+        for line in &ro_lines {
+            if line.contains(": write") {
+                return Err(format!(
+                    "read-only job {ro_job} carries write permission: {line}"
+                ));
+            }
+        }
+    }
+
+    let verify_sec = job_section(text, "verify");
+    if !verify_sec.contains("outputs:")
+        || !verify_sec.contains("commit_sha: ${{ steps.verify_meta.outputs.commit_sha }}")
+    {
+        return Err("verify job must export steps.verify_meta.outputs.commit_sha".to_string());
+    }
+    let verify_ref = "ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}";
+    verify_job_checkouts(text, &["verify"], 1, Some(verify_ref))?;
+
+    // Verify all 7 downstream jobs check out the tag ref (avoiding CodeQL workflow_dispatch
+    // cache-poisoning on untrusted job outputs) and immediately assert checked-out HEAD
+    // equals the immutable commit_sha emitted by verify.
+    let downstream_jobs = [
+        "binaries",
+        "wheels",
+        "sdist",
+        "publish-docker",
+        "github-release",
+        "publish-crates",
+        "publish-pypi",
+    ];
+    verify_job_checkouts(text, &downstream_jobs, 5, Some(verify_ref))?;
+    for checkout_job in [
+        "binaries",
+        "wheels",
+        "sdist",
+        "publish-docker",
+        "publish-crates",
+    ] {
+        let sec = job_section(text, checkout_job);
+        if !sec.contains("EXPECTED_SHA: ${{ needs.verify.outputs.commit_sha }}")
+            || !sec.contains("test \"$(git rev-parse --verify HEAD)\" = \"$EXPECTED_SHA\"")
+        {
+            return Err(format!(
+                "downstream job {checkout_job} must verify HEAD against needs.verify.outputs.commit_sha"
+            ));
+        }
+    }
+
+    let bin_sec = job_section(text, "binaries");
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+    ] {
+        if !bin_sec.contains(target) {
+            return Err(format!("binaries matrix missing {target}"));
+        }
+    }
+    if !bin_sec.contains("newline=\"\\n\"") {
+        return Err("binaries .sha256 write must enforce LF newline".to_string());
+    }
+
+    let wheels_sec = job_section(text, "wheels");
+    let wheel_targets = wheels_sec
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("target: ") && !line.contains("${{"))
+        .count();
+    if wheel_targets != 5
+        || !wheels_sec.contains("target: x86_64")
+        || !wheels_sec.contains("target: aarch64")
+        || !wheels_sec.contains("target: x64")
+    {
+        return Err(format!(
+            "expected 5 wheel matrix targets, saw {wheel_targets}"
+        ));
+    }
+
+    let sdist_sec = job_section(text, "sdist");
+    if !sdist_sec.contains("python/dibs/py.typed")
+        || !sdist_sec.contains("python/dibs/__init__.pyi")
+    {
+        return Err("sdist job must verify py.typed and __init__.pyi in archive".to_string());
+    }
+
+    let docker_sec = job_section(text, "publish-docker");
+    if !docker_sec.contains("needs: [verify]") {
+        return Err("publish-docker must depend only on [verify]".to_string());
+    }
+    if docker_sec.contains("publish-crates") || docker_sec.contains("publish-pypi") {
+        return Err("publish-docker must not depend on crates or pypi".to_string());
+    }
+    let gh_sec = job_section(text, "github-release");
+    if !gh_sec.contains("needs: [verify, binaries, wheels, sdist]") {
+        return Err(
+            "github-release must depend only on [verify, binaries, wheels, sdist]".to_string(),
+        );
+    }
+    if gh_sec.contains("publish-crates") || gh_sec.contains("publish-pypi") {
+        return Err("github-release must not depend on crates or pypi".to_string());
+    }
+    if !gh_sec.contains("SHA256SUMS.txt") || !gh_sec.contains("newline=\"\\n\"") {
+        return Err("github-release must generate LF-terminated SHA256SUMS.txt".to_string());
+    }
+    let pypi_sec = job_section(text, "publish-pypi");
+    if !pypi_sec.contains("skip-existing: true") {
+        return Err("publish-pypi must enable skip-existing: true".to_string());
+    }
+    Ok(())
+}
+
+#[test]
+fn release_workflow_carries_db25_jobs_and_credential_hygiene() {
+    let text = read(".github/workflows/release.yml");
+    if let Err(reason) = release_workflow_holds(&text) {
+        panic!("release.yml failed DB-25 check, {reason}");
+    }
+    // Prove the validator discriminates against top-level permission deletion or elevation,
+    // read-only job elevation, missing persist-credentials, job-graph coupling, unpinned
+    // third-party actions, and dropped release targets.
+    let no_top_perms = text.replacen("permissions:\n  contents: read\n\n", "", 1);
+    assert!(release_workflow_holds(&no_top_perms).is_err());
+    let no_concurrency = text.replacen(
+        "concurrency:\n  group: release-${{ inputs.tag || github.ref_name }}\n  cancel-in-progress: false\n\n",
+        "",
+        1,
+    );
+    assert!(release_workflow_holds(&no_concurrency).is_err());
+    let cancelling_concurrency =
+        text.replacen("cancel-in-progress: false", "cancel-in-progress: true", 1);
+    assert!(release_workflow_holds(&cancelling_concurrency).is_err());
+    let unpinned_checkout_ref = text.replacen(
+        "          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}\n",
+        "",
+        1,
+    );
+    assert!(release_workflow_holds(&unpinned_checkout_ref).is_err());
+    let missing_sha_guard = text.replacen(
+        "          EXPECTED_SHA: ${{ needs.verify.outputs.commit_sha }}\n",
+        "",
+        1,
+    );
+    assert!(release_workflow_holds(&missing_sha_guard).is_err());
+    let write_top_perms = text.replacen(
+        "permissions:\n  contents: read",
+        "permissions:\n  contents: write",
+        1,
+    );
+    assert!(release_workflow_holds(&write_top_perms).is_err());
+    let elevated_verify = text.replacen(
+        "  verify:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read",
+        "  verify:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: write",
+        1,
+    );
+    assert!(release_workflow_holds(&elevated_verify).is_err());
+    let missing_persist = text.replacen("          persist-credentials: false\n", "", 1);
+    assert!(release_workflow_holds(&missing_persist).is_err());
+    let coupled_gh = text.replace(
+        "  github-release:\n    needs: [verify, binaries, wheels, sdist]",
+        "  github-release:\n    needs: [verify, binaries, wheels, sdist, publish-crates]",
+    );
+    assert!(release_workflow_holds(&coupled_gh).is_err());
+    let unpinned_rust = text.replacen(
+        "dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8",
+        "dtolnay/rust-toolchain@stable",
+        1,
+    );
+    assert!(release_workflow_holds(&unpinned_rust).is_err());
+    let unpinned_maturin = text.replacen(
+        "PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b",
+        "PyO3/maturin-action@v1",
+        1,
+    );
+    assert!(release_workflow_holds(&unpinned_maturin).is_err());
+    let dropped_intel_mac = text.replace("x86_64-apple-darwin", "removed-target");
+    assert!(release_workflow_holds(&dropped_intel_mac).is_err());
+
+    assert!(job_section(&text, "verify").contains("refs/tags/{target_tag}^{{commit}}"));
+    assert!(job_section(&text, "publish-docker").contains("ghcr.io/david-engelmann/dibs"));
+    assert!(job_section(&text, "publish-docker").contains("linux/amd64,linux/arm64"));
+    assert!(job_section(&text, "publish-crates").contains("cargo publish --locked -p dibs-ai"));
+    assert!(job_section(&text, "publish-pypi")
+        .contains("pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086"));
 }

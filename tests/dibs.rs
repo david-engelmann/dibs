@@ -2689,12 +2689,14 @@ fn cli_non_unicode_arguments_are_parser_errors_not_panics() {
 
 #[test]
 fn cli_surface_carries_no_time_override_flag() {
+    // DB-S4 (DB-P142): also drive --at alongside --now and assert neither
+    // creates the registry file on disk.
     let help = run_cli(&["--help"], 0);
     assert!(!help.stdout.contains("--now"));
     assert!(!help.stdout.contains("--at"));
     let dir = temp_dir("cli-no-override");
-    let path = dir.join("registry.json");
-    let path = path.to_str().unwrap();
+    let reg_path = dir.join("registry.json");
+    let path = reg_path.to_str().unwrap();
     run_cli(
         &[
             "--registry",
@@ -2706,6 +2708,19 @@ fn cli_surface_carries_no_time_override_flag() {
         ],
         2,
     );
+    assert!(!reg_path.exists());
+    run_cli(
+        &[
+            "--registry",
+            path,
+            "offer",
+            "task-one",
+            "--at",
+            "2031-01-01",
+        ],
+        2,
+    );
+    assert!(!reg_path.exists());
 }
 
 #[test]

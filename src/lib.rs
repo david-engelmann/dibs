@@ -5476,10 +5476,19 @@ mod tests {
     /// inside the crate because the constants are private.
     #[test]
     fn contract_field_table_matches_the_key_constants() {
-        let text = std::fs::read_to_string(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("CONTRACT.md"),
-        )
-        .unwrap();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let contract_path = root.join("CONTRACT.md");
+        if !contract_path.exists() {
+            // DB-S4 mechanical update (DB-25): crates.io packages exclude
+            // CONTRACT.md and AGENTS.md; require AGENTS.md to be absent as
+            // well so deleting CONTRACT.md in the repository still fails.
+            assert!(
+                !root.join("AGENTS.md").exists(),
+                "CONTRACT.md missing from repository tree"
+            );
+            return;
+        }
+        let text = std::fs::read_to_string(contract_path).unwrap();
         let start = text.find("Obligation DB-14 covers").unwrap();
         let after = &text[start..];
         let end = after.find("The cost of working a registry").unwrap();
