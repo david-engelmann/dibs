@@ -2879,7 +2879,6 @@ pub fn check_possession(item: &Item, holder: &str, token: &str, epoch: &Value) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     #[test]
     fn parent_dir_names_the_current_directory_for_a_bare_name() {
@@ -2904,8 +2903,16 @@ mod tests {
     /// publish will choose and plant a file at it. The open the
     /// publish uses is pinned here instead, at the helper the
     /// publish itself calls.
+    ///
+    /// DB-S1 gates this pin to Unix targets (and scopes `Read`
+    /// inside it) because it stages a symlink via
+    /// `std::os::unix::fs::symlink`, which does not exist on the
+    /// Windows CI target.
+    #[cfg(unix)]
     #[test]
     fn publish_temp_open_refuses_a_planted_symlink() {
+        use std::io::Read;
+
         let dir = std::env::temp_dir().join(format!("dibs-unit-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

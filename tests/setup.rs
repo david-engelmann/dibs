@@ -124,22 +124,54 @@ fn flush_step(step_lines: &mut Vec<String>, commands: &mut Vec<String>) {
     step_lines.clear();
 }
 
-fn run_commands(ci_text: &str) -> Vec<String> {
+fn job_section(ci_text: &str, target_job: &str) -> String {
+    let mut section = String::new();
+    let mut in_target = false;
+    let target_header = format!("{target_job}:");
+    for line in ci_text.lines() {
+        let head = line.split(" #").next().unwrap_or("");
+        let top_level = !head.is_empty()
+            && !head.starts_with(' ')
+            && !head.starts_with('#')
+            && head.trim_end().ends_with(':');
+        if top_level {
+            if in_target {
+                break;
+            }
+            continue;
+        }
+        let job_line =
+            head.starts_with("  ") && !head.starts_with("   ") && head.trim_end().ends_with(':');
+        if job_line {
+            if in_target {
+                break;
+            }
+            in_target = head.trim() == target_header;
+            continue;
+        }
+        if in_target {
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    section
+}
+
+fn run_commands_for_job(ci_text: &str, target_job: &str) -> Vec<String> {
+    let section = job_section(ci_text, target_job);
+    if section.is_empty() {
+        return Vec::new();
+    }
     let mut commands = Vec::new();
     let mut step_lines: Vec<String> = Vec::new();
     let mut in_steps = false;
-    let mut in_test_job = false;
     let mut job_disabled = false;
-    for line in ci_text.lines() {
+    for line in section.lines() {
         let stripped = line.trim();
         if stripped.starts_with('#') {
             continue;
         }
-        if stripped == "test:" {
-            in_test_job = true;
-            continue;
-        }
-        if in_test_job && !in_steps && stripped.starts_with("if:") {
+        if !in_steps && stripped.starts_with("if:") {
             let value = stripped
                 .split_once(':')
                 .map(|(_, rest)| rest)
@@ -172,9 +204,37 @@ fn run_commands(ci_text: &str) -> Vec<String> {
     commands
 }
 
+fn run_commands(ci_text: &str) -> Vec<String> {
+    run_commands_for_job(ci_text, "test")
+}
+
 #[test]
 fn ci_runs_the_local_gate_commands() {
     let commands = run_commands(&read(".github/workflows/ci.yml"));
+    assert!(commands.iter().any(|c| c == GATE_COMMAND));
+    assert!(commands.iter().any(|c| c == SCAN_COMMAND));
+    assert!(commands.iter().any(|c| c == FMT_COMMAND));
+    assert!(commands.iter().any(|c| c == CLIPPY_COMMAND));
+}
+
+#[test]
+fn ci_runs_the_cross_platform_gate_matrix() {
+    let text = read(".github/workflows/ci.yml");
+    let section = job_section(&text, "cross-platform");
+    assert!(
+        !section.is_empty(),
+        "the workflow carries no cross-platform job"
+    );
+    let active: Vec<&str> = section
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert!(active.contains(&"fail-fast: false"));
+    assert!(active.iter().any(|line| line.contains("macos-latest")));
+    assert!(active.iter().any(|line| line.contains("windows-latest")));
+    assert!(active.contains(&"runs-on: ${{ matrix.os }}"));
+    let commands = run_commands_for_job(&text, "cross-platform");
     assert!(commands.iter().any(|c| c == GATE_COMMAND));
     assert!(commands.iter().any(|c| c == SCAN_COMMAND));
     assert!(commands.iter().any(|c| c == FMT_COMMAND));
@@ -193,23 +253,9 @@ fn ci_runs_the_binding_smoke_test() {
     // over a suite that never ran. A command that stands
     // commented out does not count as standing, and a step
     // condition is read wherever it stands in its step.
-    let mut section = String::new();
-    let mut in_binding = false;
-    for line in text.lines() {
-        // A job line stands at two spaces of indent and ends
-        // with a colon, allowing a trailing comment after it.
-        let head = line.split(" #").next().unwrap_or("");
-        let job_line =
-            head.starts_with("  ") && !head.starts_with("   ") && head.trim_end().ends_with(':');
-        if job_line {
-            in_binding = head.trim() == "binding:";
-            continue;
-        }
-        if in_binding {
-            section.push_str(line);
-            section.push('\n');
-        }
-    }
+    // DB-S1 factors the job-boundary slice into `job_section` so
+    // `test`, `cross-platform`, and `binding` share one parser.
+    let section = job_section(&text, "binding");
     assert!(!section.is_empty(), "the workflow carries no binding job");
     for needle in [
         "maturin develop --manifest-path bindings/Cargo.toml",
@@ -234,6 +280,81 @@ fn ci_runs_the_binding_smoke_test() {
     assert!(!disabled, "the binding job is disabled with if: false");
 }
 
+fn ci_hygiene_holds(text: &str) -> Result<(), String> {
+    let active_lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    if !active_lines.contains(&"permissions:") || !active_lines.contains(&"contents: read") {
+        return Err("missing read-only contents permission".to_string());
+    }
+    for line in &active_lines {
+        if line.contains(": write") || line.contains("write-all") {
+            return Err(format!("elevated permission line: {line}"));
+        }
+        let unbulleted = line.strip_prefix("- ").unwrap_or(line);
+        if let Some(rest) = unbulleted.strip_prefix("if:") {
+            let normalized = rest
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_lowercase();
+            if normalized == "false" {
+                return Err(format!("disabled job or step: {line}"));
+            }
+        }
+    }
+    let mut checkout_total = 0usize;
+    for job in ["test", "cross-platform", "binding"] {
+        let section = job_section(text, job);
+        if section.is_empty() {
+            return Err(format!("missing job {job}"));
+        }
+        let mut in_steps = false;
+        let mut current_step: Vec<String> = Vec::new();
+        let verify_step = |step: &[String], count: &mut usize| -> Result<(), String> {
+            let is_checkout = step
+                .iter()
+                .any(|line| line.starts_with("uses:") && line.contains("actions/checkout@"));
+            if is_checkout {
+                *count += 1;
+                if !step.iter().any(|line| line == "persist-credentials: false") {
+                    return Err(format!(
+                        "checkout step in job {job} lacks persist-credentials: false"
+                    ));
+                }
+            }
+            Ok(())
+        };
+        for raw_line in section.lines() {
+            let stripped = raw_line.trim();
+            if stripped.starts_with('#') || stripped.is_empty() {
+                continue;
+            }
+            if stripped == "steps:" {
+                in_steps = true;
+                continue;
+            }
+            if in_steps && stripped.starts_with("- ") {
+                verify_step(&current_step, &mut checkout_total)?;
+                current_step.clear();
+                current_step.push(stripped[2..].trim().to_string());
+                continue;
+            }
+            if in_steps {
+                current_step.push(stripped.to_string());
+            }
+        }
+        verify_step(&current_step, &mut checkout_total)?;
+    }
+    if checkout_total < 3 {
+        return Err(format!(
+            "expected at least 3 checkouts, saw {checkout_total}"
+        ));
+    }
+    Ok(())
+}
+
 #[test]
 fn ci_carries_the_fleet_credential_hygiene() {
     let text = read(".github/workflows/ci.yml");
@@ -242,17 +363,34 @@ fn ci_carries_the_fleet_credential_hygiene() {
     // leaves no credential behind for later steps, and every
     // toolchain step is pinned to a full commit SHA rather
     // than a moving branch name.
-    assert!(text.contains("permissions:"));
-    assert!(text.contains("contents: read"));
-    assert!(text.contains("persist-credentials: false"));
+    // DB-S1 strengthens this pin from file-wide substring checks
+    // to verify `persist-credentials: false` on every checkout
+    // step across `test`, `cross-platform`, and `binding`, zero
+    // `if: false` guards, and zero `: write` or `write-all` lines.
+    if let Err(reason) = ci_hygiene_holds(&text) {
+        panic!("CI hygiene failed, {reason}");
+    }
+    // Verify the hygiene check itself discriminates on one missing
+    // persist-credentials setting, on a write permission, and on an
+    // if: false guard in any job.
+    let stripped_once = text.replacen("          persist-credentials: false\n", "", 1);
+    assert!(ci_hygiene_holds(&stripped_once).is_err());
+    let elevated = text.replace("contents: read", "contents: write");
+    assert!(ci_hygiene_holds(&elevated).is_err());
+    let write_all = text.replace("permissions:\n  contents: read", "permissions: write-all");
+    assert!(ci_hygiene_holds(&write_all).is_err());
+    let disabled_cross = text.replace("  cross-platform:\n", "  cross-platform:\n    if: false\n");
+    assert!(ci_hygiene_holds(&disabled_cross).is_err());
+
     assert!(!text.contains("rust-toolchain@master"));
     let toolchain_lines: Vec<&str> = text
         .lines()
         .filter(|line| line.contains("dtolnay/rust-toolchain@"))
         .collect();
-    assert!(
-        !toolchain_lines.is_empty(),
-        "the workflow carries no toolchain step"
+    assert_eq!(
+        toolchain_lines.len(),
+        3,
+        "every job must pin dtolnay/rust-toolchain"
     );
     for toolchain_line in toolchain_lines {
         let pin = toolchain_line
@@ -530,22 +668,83 @@ fn codepoint_scan_takes_a_non_unicode_root_without_panicking() {
     // first built, which panics on an argument that is not
     // valid Unicode, where the root is a path and stands
     // carried unconverted, the shape the command line's
-    // registry path takes. A root naming a real directory
-    // scans clean, a root that does not stand refuses with
-    // the scan error line, and neither case panics.
+    // registry path takes. DB-S1 guards `create_dir_all` on
+    // filesystems such as macOS APFS that reject non UTF-8
+    // directory entries on disk, skipping only the staged
+    // directory while still exercising the raw OsString scan
+    // root error path below.
     let dir = temp_dir("non-unicode-root");
     let odd_dir = dir.join(std::ffi::OsString::from_vec(vec![0xff]));
-    std::fs::create_dir_all(&odd_dir).unwrap();
-    std::fs::write(odd_dir.join("clean.md"), "clean").unwrap();
-    let result = scan_tree(&odd_dir);
-    assert_eq!(result.status, 0, "{}", result.stderr);
-    assert!(result.stdout.contains("em dash U+2014 count 0"));
-    assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
+    if std::fs::create_dir_all(&odd_dir).is_ok() {
+        std::fs::write(odd_dir.join("clean.md"), "clean").unwrap();
+        let result = scan_tree(&odd_dir);
+        assert_eq!(result.status, 0, "{}", result.stderr);
+        assert!(result.stdout.contains("em dash U+2014 count 0"));
+        assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
+    }
     let missing = dir.join(std::ffi::OsString::from_vec(vec![0xfe]));
     let result = scan_tree(&missing);
     assert_eq!(result.status, 2, "{}", result.stderr);
     assert!(result.stderr.contains("scan error"), "{}", result.stderr);
     assert!(!result.stderr.contains("panicked"), "{}", result.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn codepoint_scan_with_a_closed_stdout_pipe_exits_2_without_a_panic() {
+    use std::process::Stdio;
+
+    let dir = temp_dir("scan-epipe");
+    std::fs::write(dir.join("clean.md"), "clean").unwrap();
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_codepoint_scan"))
+        .arg(&dir)
+        .stdout(Stdio::from(writer))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("failed printing to stdout"), "{stderr}");
+}
+
+#[test]
+fn roadmap_and_manifest_versions_and_python_smoke_count_stay_in_sync() {
+    let roadmap = read("ROADMAP.md");
+    assert!(roadmap.starts_with("# Roadmap\n"));
+    for slice in ["DB-S1", "DB-S2", "DB-S3", "DB-S4"] {
+        assert!(roadmap.contains(slice), "ROADMAP.md missing {slice}");
+    }
+
+    let extract_version = |manifest: &str| -> String {
+        manifest
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix("version = \"")?;
+                rest.strip_suffix('"').map(str::to_string)
+            })
+            .expect("manifest must declare version")
+    };
+    let root_version = extract_version(&read("Cargo.toml"));
+    let bindings_version = extract_version(&read("bindings/Cargo.toml"));
+    let pyproject_version = extract_version(&read("bindings/pyproject.toml"));
+    assert_eq!(root_version, bindings_version);
+    assert_eq!(root_version, pyproject_version);
+
+    let py_smoke = read("tests/test_binding_smoke.py");
+    let py_count = py_smoke
+        .lines()
+        .filter(|line| line.starts_with("def test_"))
+        .count();
+    let readme = read("README.md");
+    let status = status_section(&readme);
+    assert!(
+        status.contains(&format!(
+            "and the Python binding smoke test carries {py_count},"
+        )),
+        "README.md Python smoke test count drifted from {py_count}"
+    );
 }
 
 #[cfg(unix)]
