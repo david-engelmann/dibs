@@ -277,3 +277,161 @@ def test_a_registry_path_that_is_a_directory_raises_failure_error(tmp_path):
     with pytest.raises(dibs.FailureError) as failure:
         dibs.board(str(tmp_path), T0)
     assert str(failure.value).startswith("the registry file cannot be read")
+
+
+def test_default_wall_clock_now_none_lifecycle(tmp_path):
+    registry = str(tmp_path / "registry.json")
+
+    dibs.offer(registry, "task-zero", None, note="zero note")
+    offered = dibs.offer_many(
+        registry,
+        ["task-one", {"id": "task-two", "note": "second note"}],
+        now=None,
+    )
+    assert offered == ["task-one", "task-two"]
+
+    first = dibs.claim(registry, "task-zero", "alice", 3600, now=None)
+    assert set(first.keys()) == {"item", "holder", "token", "epoch", "expires_at"}
+    assert first["item"] == "task-zero"
+    assert first["epoch"] == 1
+
+    second = dibs.claim_next(registry, "bob", 3600)
+    assert set(second.keys()) == {"item", "holder", "token", "epoch", "expires_at"}
+    assert second["item"] == "task-one"
+    assert second["holder"] == "bob"
+    assert second["epoch"] == 1
+
+    renewed = dibs.renew(registry, "task-zero", "alice", first["token"], 1, 600)
+    assert "expires_at" in renewed
+
+    rows = dibs.board(registry, now=None)
+    assert len(rows) == 3
+    for row in rows:
+        assert list(row.keys()) == [
+            "id",
+            "note",
+            "status",
+            "holder",
+            "expires_at",
+            "epoch",
+        ]
+
+    detail = dibs.show(registry, "task-zero", now=None)
+    assert list(detail.keys()) == [
+        "id",
+        "note",
+        "status",
+        "effective_status",
+        "priority",
+        "tags",
+        "depends_on",
+        "holder",
+        "expires_at",
+        "epoch",
+        "takeover_count",
+        "max_takeovers",
+    ]
+    assert detail["status"] == "claimed"
+    assert detail["effective_status"] == "claimed"
+    assert detail["priority"] == 2
+    assert detail["tags"] == []
+    assert detail["depends_on"] == []
+    assert detail["holder"] == "alice"
+    assert detail["epoch"] == 1
+    assert detail["takeover_count"] == 0
+    assert detail["max_takeovers"] is None
+
+    dibs.release(registry, "task-one", "bob", second["token"], 1)
+    dibs.complete(registry, "task-zero", "alice", first["token"], 1)
+    done_detail = dibs.show(registry, "task-zero")
+    assert done_detail["status"] == "completed"
+    assert done_detail["effective_status"] == "completed"
+    assert done_detail["holder"] is None
+    assert done_detail["expires_at"] is None
+
+
+def test_offer_many_atomicity_and_validation(tmp_path):
+    registry_path = tmp_path / "registry.json"
+    registry = str(registry_path)
+
+    for bare in [
+        "task-bare-string",
+        b"task-bare-bytes",
+        bytearray(b"task-one"),
+        {"id": "task-one", "note": "x"},
+    ]:
+        with pytest.raises(TypeError):
+            dibs.offer_many(registry, bare, T0)
+        assert not registry_path.exists()
+
+    with pytest.raises(dibs.InvalidRequestError):
+        dibs.offer_many(registry, [], T0)
+    assert not registry_path.exists()
+
+    with pytest.raises(dibs.InvalidNameError):
+        dibs.offer_many(registry, ["Bad Name"], T0)
+    assert not registry_path.exists()
+
+    with pytest.raises(dibs.InvalidRequestError):
+        dibs.offer_many(registry, ["task-one"], "2031-05-04T12:00:00")
+    assert not registry_path.exists()
+
+    with pytest.raises(dibs.InvalidRequestError):
+        dibs.offer_many(registry, ["dup-item", "dup-item"], T0)
+    assert not registry_path.exists()
+
+    with pytest.raises(dibs.InvalidRequestError):
+        dibs.offer_many(registry, [{"id": "task-one", "extra": 1}], T0)
+    assert not registry_path.exists()
+
+    dibs.offer(registry, "standing-item", T0)
+    with pytest.raises(dibs.RefusalError) as dup_refusal:
+        dibs.offer_many(
+            registry,
+            ["fresh-a", "fresh-b", "standing-item", "fresh-c"],
+            T0,
+        )
+    assert str(dup_refusal.value) == "item 'standing-item' already stands in the backlog"
+    assert [r["id"] for r in dibs.board(registry, T0)] == ["standing-item"]
+
+
+def test_claim_next_and_show_lazy_expiry_and_takeover(tmp_path):
+    registry = str(tmp_path / "registry.json")
+
+    with pytest.raises(TypeError) as bool_ttl:
+        dibs.claim_next(registry, "alice", True, T0)
+    assert "ttl" in str(bool_ttl.value)
+
+    with pytest.raises(dibs.RefusalError) as empty_refusal:
+        dibs.claim_next(registry, "alice", 60, T0)
+    assert str(empty_refusal.value) == "no ready item stands in the backlog"
+
+    with pytest.raises(dibs.NotFoundError):
+        dibs.show(registry, "missing-item", T0)
+
+    dibs.offer_many(registry, [{"id": "task-a", "note": "n"}], T0)
+    g1 = dibs.claim_next(registry, "alice", 60, T0)
+    digest1 = hashlib.sha256(g1["token"].encode()).hexdigest()
+
+    with pytest.raises(dibs.RefusalError):
+        dibs.claim_next(registry, "bob", 60, "2031-05-04T12:00:59+00:00")
+
+    at_expiry_detail = dibs.show(registry, "task-a", "2031-05-04T12:01:00+00:00")
+    assert at_expiry_detail["status"] == "open"
+    assert at_expiry_detail["effective_status"] == "open"
+    assert at_expiry_detail["holder"] is None
+    assert at_expiry_detail["expires_at"] is None
+    assert at_expiry_detail["takeover_count"] == 0
+    assert g1["token"] not in repr(at_expiry_detail)
+    assert digest1 not in repr(at_expiry_detail)
+
+    g2 = dibs.claim_next(registry, "bob", 60, "2031-05-04T12:01:00+00:00")
+    assert g2["item"] == "task-a"
+    assert g2["epoch"] == 2
+    after_detail = dibs.show(registry, "task-a", "2031-05-04T12:01:01+00:00")
+    assert after_detail["status"] == "claimed"
+    assert after_detail["effective_status"] == "claimed"
+    assert after_detail["holder"] == "bob"
+    assert after_detail["epoch"] == 2
+    assert after_detail["takeover_count"] == 1
+
